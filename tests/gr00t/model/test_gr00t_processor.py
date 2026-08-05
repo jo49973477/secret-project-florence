@@ -30,6 +30,7 @@ from gr00t.data.types import MessageType, ModalityConfig, VLAStepData
 import numpy as np
 from PIL import Image
 import pytest
+import torch
 
 
 FIXTURE_DIR = Path(__file__).parent.parent.parent / "fixtures" / "processor_config"
@@ -180,6 +181,7 @@ class TestProcessorCall:
         result = processor(messages)
         assert isinstance(result["embodiment_id"], (int, np.integer))
 
+<<<<<<< HEAD
     def test_multimodal_values_reach_processor_output(self, processor, proc_config):
         processor.modality_configs[EMBODIMENT]["pointcloud"] = ModalityConfig(
             delta_indices=[0], modality_keys=["xyz"]
@@ -208,6 +210,38 @@ class TestProcessorCall:
         )["inputs"]
         assert batch["points"].shape == (2, 32, 3)
         assert batch["tactile"].shape == (2, 3, 24, 32)
+=======
+    def test_inference_action_mask_covers_horizon_and_dimension(self, processor, proc_config):
+        mc = proc_config["modality_configs"][EMBODIMENT]
+        with open(FIXTURE_DIR / "statistics.json") as f:
+            statistics = json.load(f)
+
+        batch_size = 1
+        observation = {
+            f"state.{key}": np.zeros(
+                (batch_size, len(statistics[EMBODIMENT]["state"][key]["min"])),
+                dtype=np.float32,
+            )
+            for key in mc["state"]["modality_keys"]
+        }
+        for key in mc["video"]["modality_keys"]:
+            observation[f"video.{key}"] = np.zeros((batch_size, 1, 256, 256, 3), dtype=np.uint8)
+        observation[mc["language"]["modality_keys"][0]] = ["pick up the apple"]
+
+        result = processor.process_observation(observation, EmbodimentTag(EMBODIMENT))
+
+        action_horizon = len(mc["action"]["delta_indices"])
+        action_dim = processor.state_action_processor.get_action_dim(EMBODIMENT)
+        action_mask = result["action_mask"]
+        assert action_mask.shape == (
+            batch_size,
+            proc_config["max_action_horizon"],
+            proc_config["max_action_dim"],
+        )
+        assert torch.all(action_mask[:, :action_horizon, :action_dim] == 1)
+        assert torch.all(action_mask[:, action_horizon:, :] == 0)
+        assert torch.all(action_mask[:, :, action_dim:] == 0)
+>>>>>>> aa03419 (Fix padded action leakage in GR00T N1.7)
 
 
 class TestProcessorVLMInputs:
