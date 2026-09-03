@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=1,2 USE_WANDB=0 NUM_GPUS=2 MAX_STEPS=100 GLOBAL_BATCH_SIZE=1 uv run bash examples/finetune.sh --base-model-path nvidia/GR00T-N1.7-3B --dataset-path /home/yeongyoo/03_Dataset/07_UnivTac/univtac_gr00t --embodiment-tag NEW_EMBODIMENT --modality-config-path examples/UniVTAC/univtac_config.py  --output-dir outputs
