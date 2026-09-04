@@ -25,6 +25,9 @@ from transformers.feature_extraction_utils import BatchFeature
 import tree
 
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
+from gr00t.model.extension.multimodal_dit import MultiModalConditionedDiT
+from gr00t.model.extension.point_encoder import build_point_encoder
+from gr00t.model.extension.tactile_encoder import TactileEncoder
 from gr00t.model.modules.dit import AlternateVLDiT, DiT, SelfAttentionTransformer
 from gr00t.model.modules.embodiment_conditioned_mlp import (
     CategorySpecificMLP,
@@ -46,19 +49,29 @@ class Gr00tN1d7ActionHead(nn.Module):
         self.hidden_size = config.hidden_size
         self.input_embedding_dim = config.input_embedding_dim
 
-        if config.use_alternate_vl_dit:
+        if config.dit_type == "alternate_vl_dit":
             self.model = AlternateVLDiT(
                 **config.diffusion_model_cfg,
                 cross_attention_dim=config.backbone_embedding_dim,
                 attend_text_every_n_blocks=config.attend_text_every_n_blocks,
             )
             logger.info("Using AlternateVLDiT for diffusion model")
-        else:
+        elif config.dit_type == "multimodal_conditioned_dit":
+            self.model = MultiModalConditionedDiT(
+                **config.diffusion_model_cfg,
+                cross_attention_dim=config.backbone_embedding_dim,
+                attend_text_every_n_blocks=config.attend_text_every_n_blocks,
+            )
+            logger.info("Using MultiModalConditionedDiT for diffusion model")
+        elif config.dit_type == "dit":
             self.model = DiT(
                 **config.diffusion_model_cfg,
                 cross_attention_dim=config.backbone_embedding_dim,
             )
             logger.info("Using DiT for diffusion model")
+        else:
+            raise ValueError(f"Unsupported dit_type: {config.dit_type!r}")
+
         self.action_dim = config.max_action_dim
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
@@ -80,6 +93,20 @@ class Gr00tN1d7ActionHead(nn.Module):
             hidden_dim=self.hidden_size,
             output_dim=self.action_dim,
         )
+        self.point_encoder = None
+        self.tactile_encoder = None
+        if config.dit_type == "multimodal_conditioned_dit":
+            if config.use_point_conditioning:
+                self.point_encoder = build_point_encoder(
+                    config.point_encoder_cfg,
+                    input_dim=config.point_input_dim,
+                    point_dim=self.model.inner_dim,
+                )
+            if config.use_tactile_conditioning:
+                self.tactile_encoder = TactileEncoder(
+                    input_channels=config.tactile_input_channels,
+                    token_dim=self.model.inner_dim,
+                )
 
         self.vlln = (
             nn.LayerNorm(config.backbone_embedding_dim) if config.use_vlln else nn.Identity()
@@ -115,15 +142,42 @@ class Gr00tN1d7ActionHead(nn.Module):
         )
         self.num_timestep_buckets = config.num_timestep_buckets
         self.set_trainable_parameters(
-            config.tune_projector, config.tune_diffusion_model, config.tune_vlln
+            tune_projector=config.tune_projector,
+            tune_diffusion_model=config.tune_diffusion_model,
+            tune_vlln=config.tune_vlln,
+            tune_point_encoder=config.tune_point_encoder,
+            tune_tactile_encoder=config.tune_tactile_encoder,
+            tune_multimodal_adapter=config.tune_multimodal_adapter,
         )
 
     def set_trainable_parameters(
-        self, tune_projector: bool, tune_diffusion_model: bool, tune_vlln: bool
-    ):
+        self,
+        tune_projector: bool,
+        tune_diffusion_model: bool,
+        tune_vlln: bool,
+        tune_point_encoder: bool | None = None,
+        tune_tactile_encoder: bool | None = None,
+        tune_multimodal_adapter: bool | None = None,
+    ) -> None:
+        tune_point_encoder = (
+            self.config.tune_point_encoder if tune_point_encoder is None else tune_point_encoder
+        )
+        tune_tactile_encoder = (
+            self.config.tune_tactile_encoder
+            if tune_tactile_encoder is None
+            else tune_tactile_encoder
+        )
+        tune_multimodal_adapter = (
+            self.config.tune_multimodal_adapter
+            if tune_multimodal_adapter is None
+            else tune_multimodal_adapter
+        )
         self.tune_projector = tune_projector
         self.tune_diffusion_model = tune_diffusion_model
         self.tune_vlln = tune_vlln
+        self.tune_point_encoder = tune_point_encoder
+        self.tune_tactile_encoder = tune_tactile_encoder
+        self.tune_multimodal_adapter = tune_multimodal_adapter
         for p in self.parameters():
             p.requires_grad = True
         if not tune_projector:
@@ -134,12 +188,22 @@ class Gr00tN1d7ActionHead(nn.Module):
                 self.position_embedding.requires_grad_(False)
         if not tune_diffusion_model:
             self.model.requires_grad_(False)
+        if isinstance(self.model, MultiModalConditionedDiT):
+            # The base DiT can remain frozen while the new residual adapters train.
+            self.model.set_multimodal_adapter_trainable(tune_multimodal_adapter)
+        if self.point_encoder is not None:
+            self.point_encoder.requires_grad_(tune_point_encoder)
+        if self.tactile_encoder is not None:
+            self.tactile_encoder.requires_grad_(tune_tactile_encoder)
         if not tune_vlln:
             self.vlln.requires_grad_(False)
             self.vl_self_attention.requires_grad_(False)
         logger.debug(f"Tune action head projector: {self.tune_projector}")
         logger.debug(f"Tune action head diffusion model: {self.tune_diffusion_model}")
         logger.debug(f"Tune action head vlln: {self.tune_vlln}")
+        logger.debug(f"Tune point encoder: {self.tune_point_encoder}")
+        logger.debug(f"Tune tactile encoder: {self.tune_tactile_encoder}")
+        logger.debug(f"Tune multimodal adapter: {self.tune_multimodal_adapter}")
         # Check if any parameters are still trainable. If not, log a warning.
         if not tune_projector and not tune_diffusion_model and not tune_vlln:
             for name, p in self.named_parameters():
@@ -163,6 +227,17 @@ class Gr00tN1d7ActionHead(nn.Module):
                     self.position_embedding.eval()
             if not self.tune_diffusion_model:
                 self.model.eval()
+                if isinstance(self.model, MultiModalConditionedDiT):
+                    self.model.set_multimodal_adapter_mode(self.tune_multimodal_adapter)
+            elif (
+                isinstance(self.model, MultiModalConditionedDiT)
+                and not self.tune_multimodal_adapter
+            ):
+                self.model.set_multimodal_adapter_mode(False)
+            if self.point_encoder is not None and not self.tune_point_encoder:
+                self.point_encoder.eval()
+            if self.tactile_encoder is not None and not self.tune_tactile_encoder:
+                self.tactile_encoder.eval()
             if not self.tune_vlln:
                 self.vlln.eval()
                 self.vl_self_attention.eval()
@@ -179,6 +254,30 @@ class Gr00tN1d7ActionHead(nn.Module):
         backbone_output["backbone_features"] = backbone_features
         return backbone_output
 
+    def _encode_multimodal_inputs(
+        self, action_input: BatchFeature
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """Encode static sensor observations once per action-head invocation."""
+        point_tokens = None
+        point_attention_mask = None
+        if self.point_encoder is not None:
+            if "points" not in action_input:
+                raise KeyError("Point conditioning is enabled but action_input.points is missing")
+            point_tokens, point_attention_mask = self.point_encoder(
+                action_input.points,
+                return_mask=True,
+            )
+
+        tactile_tokens = None
+        if self.tactile_encoder is not None:
+            if "tactile" not in action_input:
+                raise KeyError(
+                    "Tactile conditioning is enabled but action_input.tactile is missing"
+                )
+            tactile_tokens = self.tactile_encoder(action_input.tactile)
+
+        return point_tokens, point_attention_mask, tactile_tokens
+
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         """
         Forward pass through the action head.
@@ -192,6 +291,8 @@ class Gr00tN1d7ActionHead(nn.Module):
                 - action: [B, action_horizon, action_dim] (during training)
                 - embodiment_id: [B] (embodiment IDs)
                 - action_mask: [B, action_horizon, action_dim]
+                - points: optional [B, N, point_input_dim]
+                - tactile: optional [B, C, H, W]
 
         Returns:
             BatchFeature containing:
@@ -248,7 +349,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         sa_embs = torch.cat((state_features, action_features), dim=1)
         vl_attn_mask = backbone_output.backbone_attention_mask
 
-        if self.config.use_alternate_vl_dit:
+        if self.config.dit_type == "alternate_vl_dit":
             image_mask = backbone_output.image_mask
             backbone_attention_mask = backbone_output.backbone_attention_mask
             model_output, _ = self.model(
@@ -259,6 +360,23 @@ class Gr00tN1d7ActionHead(nn.Module):
                 return_all_hidden_states=True,
                 image_mask=image_mask,
                 backbone_attention_mask=backbone_attention_mask,
+            )
+        elif self.config.dit_type == "multimodal_conditioned_dit":
+            point_tokens, point_attention_mask, tactile_tokens = self._encode_multimodal_inputs(
+                action_input
+            )
+
+            model_output, _ = self.model(
+                hidden_states=sa_embs,
+                encoder_hidden_states=vl_embeds,
+                encoder_attention_mask=vl_attn_mask,
+                timestep=t_discretized,
+                point_tokens=point_tokens,
+                point_attention_mask=point_attention_mask,
+                tactile_tokens=tactile_tokens,
+                image_mask=backbone_output.image_mask,
+                backbone_attention_mask=backbone_output.backbone_attention_mask,
+                return_all_hidden_states=True,
             )
         else:
             model_output, _ = self.model(
@@ -393,6 +511,14 @@ class Gr00tN1d7ActionHead(nn.Module):
                 :,
             ] = ramp[None, :, None].to(device)
 
+        point_tokens = None
+        point_attention_mask = None
+        tactile_tokens = None
+        if self.config.dit_type == "multimodal_conditioned_dit":
+            point_tokens, point_attention_mask, tactile_tokens = self._encode_multimodal_inputs(
+                action_input
+            )
+
         # Run denoising steps.
         for t in range(self.num_inference_timesteps):
             t_cont = t / float(self.num_inference_timesteps)  # e.g. goes 0, 1/N, 2/N, ...
@@ -413,11 +539,22 @@ class Gr00tN1d7ActionHead(nn.Module):
             sa_embs = torch.cat((state_features, action_features), dim=1)
 
             # Run model forward.
-            if self.config.use_alternate_vl_dit:
+            if self.config.dit_type == "alternate_vl_dit":
                 model_output = self.model(
                     hidden_states=sa_embs,
                     encoder_hidden_states=vl_embeds,
                     timestep=timesteps_tensor,
+                    image_mask=backbone_output.image_mask,
+                    backbone_attention_mask=backbone_output.backbone_attention_mask,
+                )
+            elif self.config.dit_type == "multimodal_conditioned_dit":
+                model_output = self.model(
+                    hidden_states=sa_embs,
+                    encoder_hidden_states=vl_embeds,
+                    timestep=timesteps_tensor,
+                    point_tokens=point_tokens,
+                    point_attention_mask=point_attention_mask,
+                    tactile_tokens=tactile_tokens,
                     image_mask=backbone_output.image_mask,
                     backbone_attention_mask=backbone_output.backbone_attention_mask,
                 )

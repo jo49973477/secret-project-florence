@@ -21,6 +21,7 @@ and feed it synthetic backbone output tensors.
 """
 
 import math
+from unittest.mock import patch
 
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
 from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7ActionHead
@@ -44,6 +45,7 @@ def _small_config(**overrides) -> Gr00tN1d7Config:
         use_vlln=True,
         max_seq_len=32,
         use_alternate_vl_dit=False,
+        dit_type="dit",
         attend_text_every_n_blocks=2,
         tune_projector=True,
         tune_diffusion_model=True,
@@ -79,23 +81,38 @@ def action_head():
 
 
 def _make_backbone_output(config, batch_size=2, seq_len=8):
+    image_mask = torch.zeros(batch_size, seq_len, dtype=torch.bool)
+    image_mask[:, seq_len // 2 :] = True
     return BatchFeature(
         data={
             "backbone_features": torch.randn(batch_size, seq_len, config.backbone_embedding_dim),
             "backbone_attention_mask": torch.ones(batch_size, seq_len, dtype=torch.long),
-            "image_mask": torch.ones(batch_size, seq_len, dtype=torch.bool),
+            "image_mask": image_mask,
         }
     )
 
 
 def _make_action_input(config, batch_size=2):
-    return BatchFeature(
-        data={
-            "state": torch.randn(batch_size, config.state_history_length, config.max_state_dim),
-            "action": torch.randn(batch_size, config.action_horizon, config.max_action_dim),
-            "embodiment_id": torch.zeros(batch_size, dtype=torch.long),
-            "action_mask": torch.ones(batch_size, config.action_horizon, config.max_action_dim),
-        }
+    data = {
+        "state": torch.randn(batch_size, config.state_history_length, config.max_state_dim),
+        "action": torch.randn(batch_size, config.action_horizon, config.max_action_dim),
+        "embodiment_id": torch.zeros(batch_size, dtype=torch.long),
+        "action_mask": torch.ones(batch_size, config.action_horizon, config.max_action_dim),
+    }
+    if config.dit_type == "multimodal_conditioned_dit" and config.use_point_conditioning:
+        data["points"] = torch.randn(batch_size, 16, config.point_input_dim)
+    if config.dit_type == "multimodal_conditioned_dit" and config.use_tactile_conditioning:
+        data["tactile"] = torch.randn(batch_size, config.tactile_input_channels, 32, 32)
+    return BatchFeature(data=data)
+
+
+def _small_multimodal_config(**overrides) -> Gr00tN1d7Config:
+    return _small_config(
+        dit_type="multimodal_conditioned_dit",
+        point_encoder_cfg="point_transformer",
+        point_input_dim=3,
+        tactile_input_channels=3,
+        **overrides,
     )
 
 
@@ -151,6 +168,114 @@ class TestActionHeadGetAction:
             action_input,
         )
         assert out["action_pred"].shape[0] == 1
+
+
+class TestMultimodalActionHead:
+    @pytest.mark.parametrize("dit_type", ["alternate_vl_dit", "dit"])
+    def test_original_modes_do_not_instantiate_sensor_encoders(self, dit_type):
+        head = Gr00tN1d7ActionHead(_small_config(dit_type=dit_type))
+
+        assert head.point_encoder is None
+        assert head.tactile_encoder is None
+
+    @pytest.mark.parametrize(
+        "use_points,use_tactile",
+        [(True, False), (False, True), (True, True)],
+    )
+    def test_enabled_modality_combinations_run(self, use_points, use_tactile):
+        config = _small_multimodal_config(
+            use_point_conditioning=use_points,
+            use_tactile_conditioning=use_tactile,
+        )
+        head = Gr00tN1d7ActionHead(config).eval()
+        output = head(_make_backbone_output(config), _make_action_input(config))
+
+        assert torch.isfinite(output["loss"])
+        assert (head.point_encoder is not None) is use_points
+        assert (head.tactile_encoder is not None) is use_tactile
+
+    def test_multimodal_adapters_can_train_with_frozen_base_dit(self):
+        config = _small_multimodal_config(
+            tune_diffusion_model=False,
+            tune_point_encoder=True,
+            tune_tactile_encoder=True,
+            tune_multimodal_adapter=True,
+        )
+        head = Gr00tN1d7ActionHead(config)
+
+        frozen_base_modules = (
+            head.model.timestep_encoder,
+            head.model.transformer_blocks,
+            head.model.proj_out_1,
+            head.model.proj_out_2,
+        )
+        assert not any(
+            parameter.requires_grad
+            for module in frozen_base_modules
+            for parameter in module.parameters()
+        )
+        assert all(parameter.requires_grad for parameter in head.point_encoder.parameters())
+        assert all(parameter.requires_grad for parameter in head.tactile_encoder.parameters())
+        assert all(
+            parameter.requires_grad for parameter in head.model.point_cross_attention.parameters()
+        )
+        assert all(
+            parameter.requires_grad for parameter in head.model.tactile_cross_attention.parameters()
+        )
+        assert head.model.point_gates.requires_grad
+        assert head.model.tactile_gates.requires_grad
+
+    def test_multimodal_adapters_can_freeze_with_trainable_base_dit(self):
+        config = _small_multimodal_config(
+            tune_diffusion_model=True,
+            tune_multimodal_adapter=False,
+        )
+        head = Gr00tN1d7ActionHead(config)
+
+        assert all(
+            parameter.requires_grad for parameter in head.model.transformer_blocks.parameters()
+        )
+        assert not any(
+            parameter.requires_grad for parameter in head.model.point_cross_attention.parameters()
+        )
+        assert not any(
+            parameter.requires_grad for parameter in head.model.tactile_cross_attention.parameters()
+        )
+        assert not head.model.point_gates.requires_grad
+        assert not head.model.tactile_gates.requires_grad
+
+    def test_frozen_sensor_encoders_stay_in_eval_mode(self):
+        config = _small_multimodal_config(
+            tune_point_encoder=False,
+            tune_tactile_encoder=False,
+        )
+        head = Gr00tN1d7ActionHead(config)
+        head.train()
+        head.set_frozen_modules_to_eval_mode()
+
+        assert not head.point_encoder.training
+        assert not head.tactile_encoder.training
+
+    def test_inference_encodes_static_modalities_once(self):
+        config = _small_multimodal_config(num_inference_timesteps=3)
+        head = Gr00tN1d7ActionHead(config).eval()
+        action_input = _make_action_input(config)
+        del action_input["action"]
+
+        with (
+            patch.object(
+                head.point_encoder, "forward", wraps=head.point_encoder.forward
+            ) as point_forward,
+            patch.object(
+                head.tactile_encoder,
+                "forward",
+                wraps=head.tactile_encoder.forward,
+            ) as tactile_forward,
+        ):
+            head.get_action(_make_backbone_output(config), action_input)
+
+        assert point_forward.call_count == 1
+        assert tactile_forward.call_count == 1
 
 
 class TestActionHeadEncodeFeatures:

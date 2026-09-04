@@ -26,7 +26,7 @@ import tempfile
 from unittest.mock import MagicMock, patch
 
 from gr00t.data.embodiment_tags import EmbodimentTag
-from gr00t.data.types import MessageType, VLAStepData
+from gr00t.data.types import MessageType, ModalityConfig, VLAStepData
 import numpy as np
 from PIL import Image
 import pytest
@@ -179,6 +179,35 @@ class TestProcessorCall:
         messages = [{"type": MessageType.EPISODE_STEP.value, "content": step_data}]
         result = processor(messages)
         assert isinstance(result["embodiment_id"], (int, np.integer))
+
+    def test_multimodal_values_reach_processor_output(self, processor, proc_config):
+        processor.modality_configs[EMBODIMENT]["pointcloud"] = ModalityConfig(
+            delta_indices=[0], modality_keys=["xyz"]
+        )
+        processor.modality_configs[EMBODIMENT]["tactile"] = ModalityConfig(
+            delta_indices=[0], modality_keys=["rgb"]
+        )
+        step_data = _make_step_data(proc_config)
+        step_data.pointclouds = {"xyz": np.random.randn(1, 32, 3).astype(np.float32)}
+        step_data.tactile = {"rgb": [np.random.randint(0, 256, (24, 32, 3), dtype=np.uint8)]}
+
+        result = processor([{"type": MessageType.EPISODE_STEP.value, "content": step_data}])
+
+        assert result["points"].shape == (32, 3)
+        assert result["points"].dtype.is_floating_point
+        assert result["tactile"].shape == (3, 24, 32)
+        assert result["tactile"].dtype.is_floating_point
+        assert 0.0 <= result["tactile"].min() <= result["tactile"].max() <= 1.0
+
+        collator = object.__new__(processor.data_collator_class)
+        batch = collator(
+            [
+                {"points": result["points"].numpy(), "tactile": result["tactile"].numpy()},
+                {"points": result["points"].numpy(), "tactile": result["tactile"].numpy()},
+            ]
+        )["inputs"]
+        assert batch["points"].shape == (2, 32, 3)
+        assert batch["tactile"].shape == (2, 3, 24, 32)
 
 
 class TestProcessorVLMInputs:

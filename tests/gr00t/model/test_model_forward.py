@@ -47,6 +47,7 @@ def _make_small_config(**overrides) -> Gr00tN1d7Config:
         use_vlln=True,
         max_seq_len=32,
         use_alternate_vl_dit=False,
+        dit_type="dit",
         select_layer=1,
         reproject_vision=False,
         use_flash_attention=False,
@@ -150,6 +151,21 @@ class TestGr00tN1d7Forward:
         assert output["loss"].dim() == 0, "loss should be scalar"
         assert torch.isfinite(output["loss"]), "loss should be finite"
 
+    def test_prepare_input_preserves_multimodal_tensors(self, small_model):
+        model, config = small_model
+        inputs = _make_dummy_inputs(config)
+        inputs["points"] = torch.randn(2, 16, 3, dtype=torch.float64)
+        inputs["tactile"] = torch.randn(2, 3, 24, 32, dtype=torch.float64)
+
+        _, action_input = model.prepare_input(inputs)
+
+        assert action_input.points.shape == (2, 16, 3)
+        assert action_input.tactile.shape == (2, 3, 24, 32)
+        assert action_input.points.device == model.device
+        assert action_input.tactile.device == model.device
+        assert action_input.points.dtype == model.dtype
+        assert action_input.tactile.dtype == model.dtype
+
     def test_forward_returns_action_loss_and_mask(self, small_model):
         model, config = small_model
         inputs = _make_dummy_inputs(config)
@@ -200,6 +216,10 @@ class TestGr00tN1d7Config:
         assert config.model_type == "Gr00tN1d7"
         assert config.max_state_dim == 132
         assert config.action_horizon == 40
+
+    def test_legacy_dit_selector_is_preserved(self):
+        assert Gr00tN1d7Config(use_alternate_vl_dit=True).dit_type == "alternate_vl_dit"
+        assert Gr00tN1d7Config(use_alternate_vl_dit=False).dit_type == "dit"
 
     def test_custom_config(self):
         config = Gr00tN1d7Config(max_state_dim=10, action_horizon=8)

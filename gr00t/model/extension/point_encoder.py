@@ -324,7 +324,7 @@ def build_point_encoder(
 ) -> PointNet2Encoder | PointTransformerEncoder:
     """Build one of the lightweight point encoder backends."""
     normalized_type = encoder_type.lower().replace("-", "_")
-    if normalized_type in {"pointnet2", "pointnet++"}:
+    if normalized_type in {"pointnet", "pointnet2", "pointnet++"}:
         return PointNet2Encoder(**encoder_kwargs)
     if normalized_type in {"point_transformer", "transformer"}:
         return PointTransformerEncoder(**encoder_kwargs)

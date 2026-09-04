@@ -72,6 +72,12 @@ class VLAStepData:
     # Flexible metadata that can be extended by users
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    # Transport-only modalities are appended to preserve positional compatibility.
+    tactile: dict[str, list[np.ndarray]] | None = None
+    """Tactile view name -> temporal list of uint8 HWC images."""
+    pointclouds: dict[str, np.ndarray] | None = None
+    """Point-cloud name -> float32 array shaped (temporal_horizon, num_points, 3)."""
+
 
 @dataclass
 class ActionConfig:

@@ -194,6 +194,11 @@ class Gr00tPolicy(BasePolicy):
                 "state": {k: v[i] for k, v in value["state"].items()},
                 "language": {k: v[i] for k, v in value["language"].items()},
             }
+            for modality in ("pointcloud", "tactile"):
+                if modality in value:
+                    unbatched_value[modality] = {
+                        key: modality_value[i] for key, modality_value in value[modality].items()
+                    }
             unbatched_obs.append(unbatched_value)
         return unbatched_obs
 
@@ -212,6 +217,8 @@ class Gr00tPolicy(BasePolicy):
             actions={},  # No ground truth actions during inference
             text=observation["language"][self.language_key][0],
             embodiment=self.embodiment_tag,
+            tactile=observation.get("tactile"),
+            pointclouds=observation.get("pointcloud"),
         )
 
     def check_observation(self, observation: dict[str, Any]) -> None:
@@ -233,6 +240,8 @@ class Gr00tPolicy(BasePolicy):
             - language: dict[str, list[list[str]]]
                 - Shape: (B, T) where each element is a string
                 - T: temporal horizon (typically 1 for language)
+            - pointcloud: optional dict[str, np.ndarray[np.float32, (B, T, N, D)]]
+            - tactile: optional dict[str, np.ndarray[np.uint8, (B, T, H, W, C)]]
 
         Args:
             observation: Dictionary containing video, state, and language modalities
@@ -246,6 +255,16 @@ class Gr00tPolicy(BasePolicy):
             assert isinstance(observation[modality], dict), (
                 f"Observation '{modality}' must be a dictionary. Got {type(observation[modality])}: {observation[modality]}"
             )
+
+        for modality in ("pointcloud", "tactile"):
+            if modality in self.modality_configs:
+                assert modality in observation, (
+                    f"Observation must contain a '{modality}' key when it is configured"
+                )
+                assert isinstance(observation[modality], dict), (
+                    f"Observation '{modality}' must be a dictionary. "
+                    f"Got {type(observation[modality])}: {observation[modality]}"
+                )
 
         # Track batch size across modalities to ensure consistency
         bs = -1
@@ -330,6 +349,52 @@ class Gr00tPolicy(BasePolicy):
             assert batched_state.shape[1] == len(self.modality_configs["state"].delta_indices), (
                 f"State key '{state_key}'s horizon must be {len(self.modality_configs['state'].delta_indices)}. Got {batched_state.shape[1]}"
             )
+
+        # ===== OPTIONAL SENSOR VALIDATION =====
+        if "pointcloud" in self.modality_configs:
+            for pointcloud_key in self.modality_configs["pointcloud"].modality_keys:
+                assert pointcloud_key in observation["pointcloud"], (
+                    f"Point-cloud key '{pointcloud_key}' must be in observation"
+                )
+                points = observation["pointcloud"][pointcloud_key]
+                assert isinstance(points, np.ndarray) and points.dtype == np.float32, (
+                    f"Point-cloud key '{pointcloud_key}' must be a float32 numpy array"
+                )
+                assert points.ndim == 4, (
+                    f"Point-cloud key '{pointcloud_key}' must have shape (B, T, N, D), "
+                    f"got {points.shape}"
+                )
+                assert points.shape[0] == bs, (
+                    f"Point-cloud key '{pointcloud_key}' must have batch size {bs}. "
+                    f"Got {points.shape[0]}"
+                )
+                expected_horizon = len(self.modality_configs["pointcloud"].delta_indices)
+                assert points.shape[1] == expected_horizon, (
+                    f"Point-cloud key '{pointcloud_key}'s horizon must be {expected_horizon}. "
+                    f"Got {points.shape[1]}"
+                )
+
+        if "tactile" in self.modality_configs:
+            for tactile_key in self.modality_configs["tactile"].modality_keys:
+                assert tactile_key in observation["tactile"], (
+                    f"Tactile key '{tactile_key}' must be in observation"
+                )
+                tactile = observation["tactile"][tactile_key]
+                assert isinstance(tactile, np.ndarray) and tactile.dtype == np.uint8, (
+                    f"Tactile key '{tactile_key}' must be a uint8 numpy array"
+                )
+                assert tactile.ndim == 5 and tactile.shape[-1] == 3, (
+                    f"Tactile key '{tactile_key}' must have shape (B, T, H, W, 3), "
+                    f"got {tactile.shape}"
+                )
+                assert tactile.shape[0] == bs, (
+                    f"Tactile key '{tactile_key}' must have batch size {bs}. Got {tactile.shape[0]}"
+                )
+                expected_horizon = len(self.modality_configs["tactile"].delta_indices)
+                assert tactile.shape[1] == expected_horizon, (
+                    f"Tactile key '{tactile_key}'s horizon must be {expected_horizon}. "
+                    f"Got {tactile.shape[1]}"
+                )
 
         # ===== LANGUAGE VALIDATION =====
         # Validate each language stream defined in the modality config

@@ -1,34 +1,23 @@
-# UniVTAC baseline for GR00T N1.7
+# UniVTAC data for GR00T N1.7
 
-This example converts raw [UniVTAC](https://github.com/univtac/UniVTAC) HDF5 episodes into the GR00T-flavored LeRobot v2 format. The baseline deliberately contains only:
+## Overview
 
-- head RGB
-- wrist RGB
+The UniVTAC converter produces a GR00T-flavored LeRobot v2 dataset with the existing:
+
+- head RGB and wrist RGB
 - the first eight Franka joint coordinates
 - the next-timestep eight-dimensional absolute joint target
-- one task-language annotation
+- task language
 
-Tactile images, depth, point clouds, and end-effector values are not converted.
+It can now optionally add one tactile RGB stream and a fixed-size point cloud. These values are transported through `LeRobotEpisodeLoader`, `extract_step_data()`, explicit `VLAStepData.tactile` / `VLAStepData.pointclouds` fields, the N1.7 processor/collator, and the optional `MultiModalConditionedDiT` action-head path.
+
+The maintained UniVTAC alignment is unchanged: `joint[:-1, :8]` is state, `joint[1:, :8]` is action, and all observation streams use their first `T-1` samples. The stored action is still an absolute target. `ActionRepresentation.RELATIVE` in the config performs the relative transform inside GR00T.
 
 ## Expected input
 
-The official dataset download uses this layout:
+The official download is arranged as task directories containing HDF5 episodes. The converter also accepts freshly collected `data/<task>/<config>/hdf5/*.hdf5` trees because it searches recursively.
 
-```text
-UniVTAC/
-├── lift_bottle/
-│   └── clean/
-│       ├── 0.hdf5
-│       └── 1.hdf5
-├── insert_HDMI/
-│   └── clean/
-│       └── 0.hdf5
-└── ...
-```
-
-Freshly collected data may instead contain `data/<task>/<config>/hdf5/*.hdf5`. Both layouts are accepted because the converter searches a directory recursively.
-
-Each raw episode must contain:
+The RGB baseline requires:
 
 ```text
 embodiment/joint          [T, >=8]
@@ -36,21 +25,28 @@ observation/head/rgb      [T] JPEG byte streams
 observation/wrist/rgb     [T] JPEG byte streams
 ```
 
-UniVTAC's maintained preprocessing uses `joint[:-1, :8]` as state, `joint[1:, :8]` as action, and the first `T-1` camera frames. The converted `action` remains an absolute joint target. `ActionRepresentation.RELATIVE` in [univtac_config.py](univtac_config.py) performs the relative transform inside GR00T.
+Multimodal conversion additionally resolves one unmarked tactile RGB stream and one depth stream:
 
-## Install conversion dependencies
+```text
+tactile/<sensor>/rgb          [T] JPEG byte streams
+tactile/<sensor>/depth        [T, 240, 320] float32
+```
 
-`h5py` is needed only for UniVTAC conversion and is not a core GR00T dependency:
+The semantic output is always `tactile.rgb`; the raw HDF5 path is only source provenance. If an input file contains multiple `tactile/*/rgb` datasets, select one with `--tactile-rgb-key`. When that option is omitted but `--pointcloud-depth-key` is present, the converter selects the sibling `rgb` dataset. `rgb_marker` is not silently substituted for raw `rgb`.
+
+Install conversion dependencies with:
 
 ```bash
 uv pip install h5py imageio-ffmpeg
 ```
 
-The converter uses H.264 (`libx264`) in an MP4 container. It first looks for `ffmpeg` and can fall back to the executable bundled by `imageio-ffmpeg`. An explicit executable can be supplied with `--ffmpeg /path/to/ffmpeg`.
+The converter uses H.264 (`libx264`) in MP4. It first tries `ffmpeg`, then the self-contained `imageio-ffmpeg` executable. An explicit executable can be supplied with `--ffmpeg /path/to/ffmpeg`.
 
-## Convert
+## Dataset Conversion
 
-Convert a directory tree:
+### RGB-only baseline
+
+Omit the opt-in modality flags to retain the prior dataset layout and behavior:
 
 ```bash
 uv run python examples/UniVTAC/convert_univtac_to_lerobot.py \
@@ -60,55 +56,122 @@ uv run python examples/UniVTAC/convert_univtac_to_lerobot.py \
   --verbose
 ```
 
-Convert one episode for debugging:
+### Tactile and point cloud
+
+The inspected downloaded episode did not embed camera intrinsics or a depth-unit attribute. Therefore the source RGB/depth paths, pinhole calibration, and millimetre-to-metre scale are explicit in this example. The legacy `left_gsmini` text below is the real raw HDF5 group name; it does not create a `left` semantic modality:
 
 ```bash
 uv run python examples/UniVTAC/convert_univtac_to_lerobot.py \
-  --input /path/to/lift_bottle/clean/0.hdf5 \
-  --output /tmp/univtac_gr00t_test \
-  --task "lift the bottle" \
-  --max-episodes 1
+  --input /path/to/UniVTAC \
+  --output /path/to/univtac_gr00t_multimodal \
+  --fps 10 \
+  --include-tactile \
+  --tactile-rgb-key tactile/left_gsmini/rgb \
+  --include-pointcloud \
+  --pointcloud-depth-key tactile/left_gsmini/depth \
+  --pointcloud-intrinsics 340.45112782 324.97607656 160 120 \
+  --pointcloud-depth-scale 0.001 \
+  --pointcloud-num-points 1024 \
+  --verbose
 ```
 
-The output path must not exist. Pass `--overwrite` to replace an existing dataset after the newly converted staging dataset passes validation. Conversion fails on malformed episodes by default; `--skip-invalid` is available for a large tree containing known corrupt files.
+Those calibration values come from the current UniVTAC GS Mini configuration: resolution `(320, 240)`, camera-to-surface distance `0.0283 m`, and real size `(0.0266, 0.0209) m`. Confirm them against the configuration that produced custom data. When an HDF5 depth dataset/group/file contains `intrinsics`, `camera_intrinsics`, `intrinsic_matrix`, `depth_scale`, `unit`, or equivalent supported metadata, the converter uses it and the corresponding override can be omitted. It never guesses missing calibration.
 
-## Inspect
+`--pointcloud-depth-key` selects one camera stream, so the example point cloud is in that selected tactile camera's OpenCV frame (`+x` right, `+y` down, `+z` along depth). It is not transformed into robot/world coordinates. Choose another depth stream and its matching intrinsics when a different frame is desired.
 
-The converter records each original HDF5 path in `meta/episodes.jsonl`, allowing the inspector to verify the first converted state/action pair against its source:
+The output path must not exist. `--overwrite` replaces it only after a staging conversion validates. `--skip-invalid` skips malformed episodes; the default fails instead of silently dropping data.
 
-```bash
-uv run python examples/UniVTAC/inspect_converted_dataset.py \
-  --dataset /path/to/univtac_gr00t \
-  --episode-index 0
+## Output Dataset Structure
+
+```text
+univtac_gr00t_multimodal/
+├── data/
+│   └── chunk-000/episode_000000.parquet
+├── videos/
+│   └── chunk-000/
+│       ├── observation.images.head/episode_000000.mp4
+│       ├── observation.images.wrist/episode_000000.mp4
+│       └── observation.tactile.rgb/episode_000000.mp4
+├── pointclouds/
+│   └── chunk-000/
+│       └── observation.pointcloud.xyz/episode_000000.npz
+└── meta/
+    ├── info.json
+    ├── modality.json
+    ├── episodes.jsonl
+    └── tasks.jsonl
 ```
 
-If the source dataset moved, pass `--source-hdf5 /new/path/to/0.hdf5`. Use `--skip-source-comparison` only when the source is intentionally unavailable.
+Tactile RGB is physically H.264 video but remains semantically `tactile.rgb`. H.264 is lossy; decoded arrays are `uint8 [T,H,W,3]`, but pixel values need not exactly equal the source JPEG decode.
+
+Each point-cloud NPZ contains `xyz` as `float32 [T,1024,3]`. Conversion filters non-finite and non-positive scaled depth. Valid pixels are traversed in row-major order and deterministically sampled at uniform positions. When fewer than 1024 valid pixels exist, valid points repeat deterministically; a frame with no valid point fails conversion.
+
+## Modality Configuration
+
+The unchanged RGB baseline remains [univtac_config.py](univtac_config.py). The experimental model-ready sensor config is [univtac_multimodal_config.py](univtac_multimodal_config.py), which adds:
+
+```python
+"tactile": ModalityConfig(
+    delta_indices=[0],
+    modality_keys=["rgb"],
+),
+"pointcloud": ModalityConfig(
+    delta_indices=[0],
+    modality_keys=["xyz"],
+),
+```
+
+Both modalities honor their own `delta_indices` in the dataset loader. The current action-head encoders intentionally accept one observation timestep, so model training uses `[0]`; a future multi-frame encoder/aggregator is required before changing this to values such as `[-2, -1, 0]` for training.
 
 ## Generate GR00T statistics
 
-The current statistics entry point uses Tyro and accepts these exact flags:
+Statistics remain state/action-oriented. External point-cloud NPZ features are excluded from parquet statistics.
 
 ```bash
 uv run python gr00t/data/stats.py \
-  --dataset-path /path/to/univtac_gr00t \
+  --dataset-path /path/to/univtac_gr00t_multimodal \
   --embodiment-tag NEW_EMBODIMENT \
-  --modality-config-path examples/UniVTAC/univtac_config.py
+  --modality-config-path examples/UniVTAC/univtac_multimodal_config.py
 ```
 
-This writes `meta/stats.json` and `meta/relative_stats.json`. Because the dataset stores absolute `q_(t+1)` targets, relative statistics are computed by GR00T using the current `q_t` state.
+For the RGB baseline, use `examples/UniVTAC/univtac_config.py` instead.
 
-After generating statistics, exercise dataset initialization, both videos, language resolution, and one action chunk through the actual GR00T loader:
+## Inspect / Verify Converted Dataset
+
+The existing lightweight inspector validates files on disk, checks `state[0] == joint[0]` and `action[0] == joint[1]`, initializes `ShardedSingleStepDataset`, and traces one sample through `extract_step_data()` without loading model weights:
 
 ```bash
 uv run python examples/UniVTAC/inspect_converted_dataset.py \
-  --dataset /path/to/univtac_gr00t \
+  --dataset /path/to/univtac_gr00t_multimodal \
   --episode-index 0 \
-  --check-gr00t-loader
+  --check-gr00t-loader \
+  --modality-config examples/UniVTAC/univtac_multimodal_config.py
 ```
 
-## Minimal fine-tuning
+Expected sample values include:
 
-The N1.7 base checkpoint has a 40-step action horizon. Accordingly, `univtac_config.py` uses `range(40)`, even though UniVTAC's ACT baseline uses chunks of 50; the current N1.7 processor rejects a 50-step modality horizon before training.
+```text
+images.head           [1, 270, 480, 3] uint8
+images.wrist          [1, 270, 480, 3] uint8
+tactile.rgb           [1, 240, 320, 3] uint8
+pointclouds.xyz       [1, 1024, 3] float32
+states.joint          [1, 8] float32
+actions.joint         [40, 8] float32
+```
+
+To check an existing baseline dataset in the same run, add:
+
+```bash
+  --rgb-only-dataset /path/to/existing_univtac_gr00t
+```
+
+If the original HDF5 moved, use `--source-hdf5 /new/path/to/episode.hdf5`; use `--skip-source-comparison` only when it is intentionally unavailable.
+
+## Fine-tuning
+
+### RGB baseline
+
+Only the RGB baseline config is supported for current N1.7 fine-tuning:
 
 ```bash
 USE_WANDB=0 NUM_GPUS=1 MAX_STEPS=100 GLOBAL_BATCH_SIZE=4 \
@@ -120,16 +183,39 @@ uv run bash examples/finetune.sh \
   --output-dir /tmp/gr00t_univtac_baseline
 ```
 
-Each converted episode needs at least 40 aligned rows (`T >= 41`) to contribute a training sample with this configuration.
+The N1.7 action horizon is 40, so a converted episode needs at least 40 aligned rows (`T >= 41`) to contribute a training sample.
 
-## Common failures
+### Experimental tactile + point-cloud conditioning
 
-- **Missing `h5py`:** run `uv pip install h5py` in the environment used for conversion and inspection.
-- **FFmpeg is missing or lacks `libx264`:** install a full FFmpeg build, install `imageio-ffmpeg`, or pass `--ffmpeg` explicitly.
-- **Missing head or wrist stream:** this baseline requires both cameras and fails instead of silently substituting a view.
-- **Length mismatch:** `embodiment/joint`, head RGB, and wrist RGB must all contain exactly `T` samples. The converter will not truncate mismatched data silently.
-- **Odd image dimensions:** H.264 `yuv420p` requires even width and height. Resize the source deliberately rather than allowing an implicit geometry change.
-- **No usable training samples:** with a 40-step action horizon, an episode must have at least 40 converted frames.
-- **Loader says statistics are missing:** run `gr00t/data/stats.py` before `--check-gr00t-loader` or fine-tuning.
-- **Source comparison fails after moving data:** pass the matching raw episode through `--source-hdf5`.
-- **Gated backbone access fails during fine-tuning:** request access to `nvidia/Cosmos-Reason2-2B` and authenticate with `hf auth login`.
+Select the multimodal dataset config and DiT explicitly. This example freezes the pre-existing VLM, projector/action path, VLM normalization, and base DiT while training only the point/tactile encoders, sensor cross-attention branches, and residual gates:
+
+```bash
+uv run python gr00t/experiment/launch_finetune.py \
+  --base-model-path nvidia/GR00T-N1.7-3B \
+  --dataset-path /path/to/univtac_gr00t_multimodal \
+  --embodiment-tag NEW_EMBODIMENT \
+  --modality-config-path examples/UniVTAC/univtac_multimodal_config.py \
+  --dit-type multimodal_conditioned_dit \
+  --point-input-dim 3 \
+  --no-tune-llm \
+  --no-tune-visual \
+  --no-tune-projector \
+  --no-tune-vlln \
+  --no-tune-diffusion-model \
+  --tune-point-encoder \
+  --tune-tactile-encoder \
+  --tune-multimodal-adapter \
+  --output-dir /tmp/gr00t_univtac_multimodal
+```
+
+Use `--no-use-point-conditioning` or `--no-use-tactile-conditioning` for a single-sensor ablation. The UniVTAC conversion currently provides XYZ only, hence `--point-input-dim 3`; a dataset/config containing aligned XYZ and RGB point features can use 6.
+
+## Current Limitations
+
+The extension includes a ResNet-18 tactile encoder, lightweight PointNet++/point-transformer choices, and gated action-token cross-attention. It does **not** include PTv3, PointACT-style fusion, a production-scale point-cloud architecture, cross-modal fusion beyond the existing independent residual branches, trained multimodal weights, or multimodal open-loop evaluation. Tactile input is scaled to `[0, 1]`; point coordinates remain in the selected depth camera frame and receive no dataset-statistics normalization.
+
+## Backward Compatibility
+
+Existing RGB + state + action + language datasets do not need `tactile`, `pointcloud`, or `pointcloud_path` metadata. Conversion without `--include-tactile` and `--include-pointcloud` produces the prior layout. Continue using [univtac_config.py](univtac_config.py) with the default `alternate_vl_dit`; only use [univtac_multimodal_config.py](univtac_multimodal_config.py) with matching converted modalities and `--dit-type multimodal_conditioned_dit`.
+
+Common failures remain fail-fast: missing head/wrist/tactile streams, temporal-length mismatches, odd H.264 dimensions, invalid/missing depth calibration, a frame with no valid depth, or a point-cloud NPZ whose row count differs from the episode DataFrame.

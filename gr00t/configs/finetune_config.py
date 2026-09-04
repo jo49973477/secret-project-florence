@@ -15,6 +15,7 @@
 
 # Finetune config used for single node post-training.
 from dataclasses import dataclass
+from typing import Literal
 import warnings
 
 
@@ -45,6 +46,26 @@ class FinetuneConfig:
     If None, use the pre-registered modality config in `gr00t/configs/data/embodiment_configs.py`. 
     """
 
+    dit_type: Literal["alternate_vl_dit", "multimodal_conditioned_dit", "dit"] = "alternate_vl_dit"
+    """Action-head DiT implementation; use multimodal_conditioned_dit for sensor inputs."""
+
+    use_point_conditioning: bool = True
+    """Enable point-cloud conditioning when using multimodal_conditioned_dit."""
+
+    use_tactile_conditioning: bool = True
+    """Enable tactile conditioning when using multimodal_conditioned_dit."""
+
+    point_input_dim: int = 3
+    """Number of values per input point (3 for XYZ, 6 for XYZRGB)."""
+
+    tactile_input_channels: int = 3
+    """Number of tactile image input channels."""
+
+    point_encoder_cfg: Literal[
+        "pointnet2", "pointnet", "point_transformer", "pointnet++", "transformer"
+    ] = "pointnet2"
+    """Point encoder backend used by multimodal_conditioned_dit."""
+
     # --- Model Tuning Flags ---
     tune_llm: bool = False
     """If True, fine-tune the language model (LLM) backbone during training."""
@@ -57,6 +78,18 @@ class FinetuneConfig:
 
     tune_diffusion_model: bool = True
     """If True, fine-tune the diffusion-based action decoder (if present in the model)."""
+
+    tune_vlln: bool = True
+    """If True, fine-tune the VLM feature normalization/self-attention projection."""
+
+    tune_point_encoder: bool = True
+    """If True, fine-tune the optional point-cloud encoder."""
+
+    tune_tactile_encoder: bool = True
+    """If True, fine-tune the optional tactile image encoder."""
+
+    tune_multimodal_adapter: bool = True
+    """If True, fine-tune point/tactile cross-attention branches and residual gates."""
 
     state_dropout_prob: float = 0.2
     """

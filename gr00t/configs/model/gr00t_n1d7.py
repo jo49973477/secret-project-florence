@@ -17,6 +17,7 @@ from dataclasses import MISSING, asdict, dataclass, field, is_dataclass
 from enum import Enum
 import json
 from pathlib import Path
+from typing import Literal
 
 import torch
 from transformers import PretrainedConfig
@@ -85,8 +86,18 @@ class Gr00tN1d7Config(PretrainedConfig):
     attn_dropout: float = 0.2
     use_vlln: bool = True
     max_seq_len: int = 1024
-    use_alternate_vl_dit: bool = True  # True for AlternateVLDiT, False for DiT
+    use_alternate_vl_dit: bool = True  # Legacy selector retained for checkpoint compatibility.
     attend_text_every_n_blocks: int = 2
+
+    # Optional action-head sensor conditioning.
+    dit_type: Literal["alternate_vl_dit", "multimodal_conditioned_dit", "dit"] = "alternate_vl_dit"
+    use_point_conditioning: bool = True
+    use_tactile_conditioning: bool = True
+    point_input_dim: int = 3
+    tactile_input_channels: int = 3
+    point_encoder_cfg: Literal[
+        "pointnet2", "pointnet", "point_transformer", "pointnet++", "transformer"
+    ] = "pointnet2"
 
     diffusion_model_cfg: dict = field(
         default_factory=lambda: {
@@ -113,6 +124,9 @@ class Gr00tN1d7Config(PretrainedConfig):
     tune_projector: bool = True
     tune_diffusion_model: bool = True
     tune_vlln: bool = True
+    tune_point_encoder: bool = True
+    tune_tactile_encoder: bool = True
+    tune_multimodal_adapter: bool = True
 
     # State augmentation parameters
     state_dropout_prob: float = 0.8  # State dropout probability
@@ -123,6 +137,11 @@ class Gr00tN1d7Config(PretrainedConfig):
     max_num_embodiments: int = 32
 
     def __init__(self, **kwargs):
+        # Honor the legacy selector when loading checkpoints without the explicit DiT type.
+        if "dit_type" not in kwargs:
+            kwargs["dit_type"] = (
+                "alternate_vl_dit" if kwargs.get("use_alternate_vl_dit", True) else "dit"
+            )
         super().__init__(**kwargs)
         for key, value in kwargs.items():
             setattr(self, key, value)

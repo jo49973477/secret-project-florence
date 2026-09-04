@@ -28,6 +28,8 @@ providing episode-level data access with support for multi-modal data including:
 - Proprioceptive state information
 - Action sequences
 - Language instructions/annotations
+- Video-backed tactile images
+- Numeric point-cloud episode arrays
 
 Returns messages with VLAStepData as defined in types.py.
 """
@@ -56,7 +58,7 @@ LEROBOT_MODALITY_FILENAME = "modality.json"
 LEROBOT_STATS_FILE_NAME = "stats.json"
 LEROBOT_RELATIVE_STATS_FILE_NAME = "relative_stats.json"
 
-ALLOWED_MODALITIES = ["video", "state", "action", "language", "mask"]
+ALLOWED_MODALITIES = ["video", "state", "action", "language", "mask", "tactile", "pointcloud"]
 DEFAULT_COLUMN_NAMES = {
     "state": "observation.state",
     "action": "action",
@@ -83,7 +85,8 @@ class LeRobotEpisodeLoader:
 
     This class handles the loading and preprocessing of individual episodes from LeRobot datasets.
     It manages metadata parsing, video decoding, and data extraction across multiple modalities
-    (video, state, action, language) while maintaining compatibility with the VLA training pipeline.
+    (video, state, action, language, tactile, pointcloud) while maintaining compatibility with the
+    VLA training pipeline.
 
     Key responsibilities:
     - Parse LeRobot metadata files (info.json, episodes.jsonl, etc.)
@@ -198,6 +201,7 @@ class LeRobotEpisodeLoader:
         self.data_path_pattern = self.info_meta["data_path"]
         self.video_path_pattern = self.info_meta.get("video_path")
         self.mask_path_pattern = self.info_meta.get("mask_path")
+        self.pointcloud_path_pattern = self.info_meta.get("pointcloud_path")
         self.chunk_size = self.info_meta["chunks_size"]
         self.fps = self.info_meta.get("fps", 30)
 
@@ -397,6 +401,64 @@ class LeRobotEpisodeLoader:
 
         return loaded_df
 
+    def _load_video_backed_data(
+        self,
+        modality_type: str,
+        episode_index: int,
+        indices: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        """Decode a configured video-backed modality without changing its semantics."""
+        if modality_type not in self.modality_configs:
+            return {}
+        if not self.video_path_pattern:
+            raise ValueError(
+                f"Dataset requests {modality_type!r} but info.json has no video_path pattern"
+            )
+
+        modality_meta = self.modality_meta.get(modality_type, {})
+        default_prefix = "observation.images" if modality_type == "video" else "observation.tactile"
+        chunk_idx = episode_index // self.chunk_size
+        decoded_data = {}
+
+        for key in self.modality_configs[modality_type].modality_keys:
+            meta_key = self._video_key_mapping.get(key, key) if modality_type == "video" else key
+            if meta_key not in modality_meta:
+                raise KeyError(
+                    f"{modality_type}.{meta_key} not found in dataset modality metadata; "
+                    f"available keys: {list(modality_meta)}"
+                )
+            original_key = modality_meta[meta_key].get(
+                "original_key", f"{default_prefix}.{meta_key}"
+            )
+            if original_key not in self.feature_config:
+                raise KeyError(f"Original key {original_key} not found in feature config")
+
+            video_filename = self.video_path_pattern.format(
+                episode_chunk=chunk_idx,
+                video_key=original_key,
+                tactile_key=original_key,
+                episode_index=episode_index,
+            )
+            video_path = self.dataset_path / video_filename
+            frames = get_frames_by_indices(
+                str(video_path),
+                indices,
+                decoder_kwargs=self.decoder_kwargs or {},
+            )
+            if modality_type == "tactile":
+                if frames.dtype != np.uint8:
+                    raise TypeError(
+                        f"Decoded tactile video {video_path} has dtype {frames.dtype}; expected uint8"
+                    )
+                if frames.ndim != 4 or frames.shape[-1] != 3:
+                    raise ValueError(
+                        f"Decoded tactile video {video_path} must have shape [T, H, W, 3], "
+                        f"got {frames.shape}"
+                    )
+            decoded_data[key] = frames
+
+        return decoded_data
+
     def _load_video_data(self, episode_index: int, indices: np.ndarray) -> dict[str, np.ndarray]:
         """
         Load video data for all configured camera views at specified indices.
@@ -411,41 +473,101 @@ class LeRobotEpisodeLoader:
         Returns:
             Dictionary mapping camera view names to arrays of decoded frames
         """
-        video_data = {}
+        return self._load_video_backed_data("video", episode_index, indices)
 
-        if not self.video_path_pattern or "video" not in self.modality_configs:
-            return video_data
+    def _load_tactile_data(self, episode_index: int, indices: np.ndarray) -> dict[str, np.ndarray]:
+        """Decode tactile MP4s while retaining the ``tactile`` modality prefix."""
+        return self._load_video_backed_data("tactile", episode_index, indices)
 
+    @staticmethod
+    def _load_numeric_array(path: Path, array_key: str) -> np.ndarray:
+        """Load one non-pickle numeric array from an NPY or NPZ episode file."""
+        if not path.exists():
+            raise FileNotFoundError(f"Numeric modality file does not exist: {path}")
+        suffix = path.suffix.lower()
+        if suffix == ".npy":
+            return np.load(path, allow_pickle=False, mmap_mode="r")
+        if suffix != ".npz":
+            raise ValueError(f"Only .npz or .npy numeric modality files are supported: {path}")
+
+        with np.load(path, allow_pickle=False) as archive:
+            if array_key in archive:
+                return np.asarray(archive[array_key])
+            if "arr_0" in archive:
+                return np.asarray(archive["arr_0"])
+            if len(archive.files) == 1:
+                return np.asarray(archive[archive.files[0]])
+            raise ValueError(
+                f"NPZ {path} has no {array_key!r} array and contains multiple arrays: "
+                f"{archive.files}"
+            )
+
+    def _load_pointcloud_data(
+        self,
+        episode_index: int,
+        indices: np.ndarray,
+        *,
+        expected_length: int,
+    ) -> dict[str, np.ndarray]:
+        """Load synchronized fixed-size point clouds from numeric episode files."""
+        if "pointcloud" not in self.modality_configs:
+            return {}
+        if not self.pointcloud_path_pattern:
+            raise ValueError(
+                "Dataset requests 'pointcloud' but info.json has no pointcloud_path pattern"
+            )
+
+        pointcloud_meta = self.modality_meta.get("pointcloud", {})
         chunk_idx = episode_index // self.chunk_size
-        image_keys = self.modality_configs["video"].modality_keys
-
-        for image_key in image_keys:
-            # Resolve the original key used in video file naming.
-            # Use the video key mapping if the config key differs from the dataset meta key.
-            meta_key = self._video_key_mapping.get(image_key, image_key)
-            original_key = self.modality_meta["video"][meta_key].get(
-                "original_key", f"observation.images.{meta_key}"
-            )
-            assert original_key in self.feature_config, (
-                f"Original key {original_key} not found in feature config"
-            )
-
-            # Construct video file path using pattern
-            video_filename = self.video_path_pattern.format(
+        pointcloud_data = {}
+        for key in self.modality_configs["pointcloud"].modality_keys:
+            if key not in pointcloud_meta:
+                raise KeyError(
+                    f"pointcloud.{key} not found in dataset modality metadata; "
+                    f"available keys: {list(pointcloud_meta)}"
+                )
+            key_meta = pointcloud_meta[key]
+            original_key = key_meta.get("original_key", f"observation.pointcloud.{key}")
+            if original_key not in self.feature_config:
+                raise KeyError(f"Original key {original_key} not found in feature config")
+            pointcloud_filename = self.pointcloud_path_pattern.format(
                 episode_chunk=chunk_idx,
-                video_key=original_key,
                 episode_index=episode_index,
+                pointcloud_key=original_key,
             )
-            video_path = self.dataset_path / video_filename
-
-            # Decode video frames at specified timestamps
-            video_data[image_key] = get_frames_by_indices(
-                str(video_path),
-                indices,
-                decoder_kwargs=self.decoder_kwargs or {},
+            pointcloud_path = self.dataset_path / pointcloud_filename
+            array_key = key_meta.get("array_key", key)
+            points = self._load_numeric_array(pointcloud_path, array_key)
+            if points.ndim != 3 or points.shape[-1] != 3:
+                raise ValueError(
+                    f"Point cloud {pointcloud_path}:{array_key} must have shape [T, N, 3], "
+                    f"got {points.shape}"
+                )
+            feature_shape = self.feature_config[original_key].get("shape", [])
+            expected_num_points = key_meta.get(
+                "num_points", feature_shape[0] if len(feature_shape) == 2 else None
             )
+            if expected_num_points is not None and points.shape[1] != expected_num_points:
+                raise ValueError(
+                    f"Point cloud {pointcloud_path}:{array_key} has {points.shape[1]} points; "
+                    f"metadata declares {expected_num_points}"
+                )
+            if points.shape[0] != expected_length:
+                raise ValueError(
+                    f"Point cloud {pointcloud_path}:{array_key} has {points.shape[0]} frames; "
+                    f"episode dataframe has {expected_length} rows"
+                )
+            if points.dtype != np.float32:
+                raise TypeError(
+                    f"Point cloud {pointcloud_path}:{array_key} has dtype {points.dtype}; "
+                    "expected float32"
+                )
+            selected_points = np.asarray(points[indices], dtype=np.float32)
+            if not np.isfinite(selected_points).all():
+                raise ValueError(f"Point cloud {pointcloud_path}:{array_key} contains NaN or Inf")
+            pointcloud_data[key] = selected_points
 
-        return video_data
+        return pointcloud_data
 
     def _load_mask_file(self, mask_path: Path, indices: np.ndarray) -> np.ndarray:
         """Load masks from npz/npy file at specified indices."""
@@ -609,6 +731,27 @@ class LeRobotEpisodeLoader:
                 f"Video data for {key} has length {len(video_data[key])} but dataframe has length {len(df)}"
             )
             df[f"video.{key}"] = [frame for frame in video_data[key]]
+
+        # Tactile images use the video decoder but remain a distinct semantic modality.
+        tactile_data = self._load_tactile_data(episode_id, np.arange(actual_length))
+        for key in tactile_data.keys():
+            assert len(tactile_data[key]) == len(df), (
+                f"Tactile data for {key} has length {len(tactile_data[key])} "
+                f"but dataframe has length {len(df)}"
+            )
+            df[f"tactile.{key}"] = [frame for frame in tactile_data[key]]
+
+        pointcloud_data = self._load_pointcloud_data(
+            episode_id,
+            np.arange(actual_length),
+            expected_length=len(df),
+        )
+        for key in pointcloud_data.keys():
+            assert len(pointcloud_data[key]) == len(df), (
+                f"Point-cloud data for {key} has length {len(pointcloud_data[key])} "
+                f"but dataframe has length {len(df)}"
+            )
+            df[f"pointcloud.{key}"] = [points for points in pointcloud_data[key]]
 
         # Load synchronized mask data
         mask_data = self._load_mask_data(episode_id, np.arange(actual_length))

@@ -155,6 +155,38 @@ class TestGr00tPolicyCheckObservation:
         with pytest.raises(AssertionError):
             policy.check_observation(obs)
 
+    def test_multimodal_observation_reaches_vla_step_data(self, policy):
+        policy.modality_configs.update(
+            {
+                "pointcloud": ModalityConfig(delta_indices=[0], modality_keys=["xyz"]),
+                "tactile": ModalityConfig(delta_indices=[0], modality_keys=["rgb"]),
+            }
+        )
+        obs = _make_observation(batch_size=2)
+        obs["pointcloud"] = {
+            "xyz": np.random.randn(2, 1, 32, 3).astype(np.float32),
+        }
+        obs["tactile"] = {
+            "rgb": np.random.randint(0, 256, (2, 1, 24, 32, 3), dtype=np.uint8),
+        }
+
+        policy.check_observation(obs)
+        unbatched = policy._unbatch_observation(obs)
+        sample = policy._to_vla_step_data(unbatched[1])
+
+        np.testing.assert_array_equal(sample.pointclouds["xyz"], obs["pointcloud"]["xyz"][1])
+        np.testing.assert_array_equal(sample.tactile["rgb"], obs["tactile"]["rgb"][1])
+
+    def test_multimodal_observation_rejects_wrong_dtype(self, policy):
+        policy.modality_configs["pointcloud"] = ModalityConfig(
+            delta_indices=[0], modality_keys=["xyz"]
+        )
+        obs = _make_observation()
+        obs["pointcloud"] = {"xyz": np.zeros((1, 1, 32, 3), dtype=np.float64)}
+
+        with pytest.raises(AssertionError, match="float32"):
+            policy.check_observation(obs)
+
 
 class TestGr00tPolicyGetAction:
     def test_get_action_returns_tuple(self, policy):

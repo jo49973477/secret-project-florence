@@ -214,6 +214,41 @@ class Gr00tN1d7DataCollator:
 class Gr00tN1d7Processor(BaseProcessor):
     data_collator_class = Gr00tN1d7DataCollator
 
+    @staticmethod
+    def _normalize_tactile_images(images: torch.Tensor) -> torch.Tensor:
+        """Convert uint8 HWC tactile images to contiguous float32 CHW tensors."""
+        images = images.permute(*range(images.ndim - 3), -1, -3, -2).contiguous()
+        if images.dtype == torch.uint8:
+            return images.to(torch.float32).div_(255.0)
+        return images.to(torch.float32)
+
+    @staticmethod
+    def _training_pointcloud(content, modality_config: dict[str, ModalityConfig]) -> torch.Tensor:
+        pointcloud_config = modality_config["pointcloud"]
+        point_arrays = [
+            np.asarray(content.pointclouds[key], dtype=np.float32)
+            for key in pointcloud_config.modality_keys
+        ]
+        if any(array.ndim != 3 for array in point_arrays):
+            raise ValueError("Training point clouds must have shape [T, N, D]")
+        if any(array.shape[:2] != point_arrays[0].shape[:2] for array in point_arrays[1:]):
+            raise ValueError("Configured point-cloud fields must share temporal and point axes")
+        if point_arrays[0].shape[0] != 1:
+            raise ValueError("The current point encoder expects one point-cloud timestep")
+        points = np.concatenate(point_arrays, axis=-1)[0]
+        return torch.from_numpy(np.ascontiguousarray(points))
+
+    @classmethod
+    def _training_tactile(cls, content, modality_config: dict[str, ModalityConfig]) -> torch.Tensor:
+        tactile_config = modality_config["tactile"]
+        if len(tactile_config.modality_keys) != 1:
+            raise ValueError("The current tactile encoder expects exactly one tactile image key")
+        tactile_key = tactile_config.modality_keys[0]
+        tactile_images = torch.from_numpy(np.asarray(content.tactile[tactile_key]))
+        if tactile_images.ndim != 4 or tactile_images.shape[0] != 1:
+            raise ValueError("Training tactile images must have shape [1, H, W, C]")
+        return cls._normalize_tactile_images(tactile_images)[0]
+
     def __init__(
         self,
         modality_configs: dict[str, dict[str, ModalityConfig]],
@@ -484,6 +519,40 @@ class Gr00tN1d7Processor(BaseProcessor):
         normalized_states = torch.cat([normalized_states, torch.zeros(padding_shape)], dim=-1)
         transformed_observation["state"] = normalized_states
 
+        if "pointcloud" in modality_config:
+            point_arrays = [
+                np.asarray(observation[f"pointcloud.{key}"], dtype=np.float32)
+                for key in modality_config["pointcloud"].modality_keys
+            ]
+            point_ranks = {array.ndim for array in point_arrays}
+            if point_ranks == {3}:
+                point_arrays = [array[:, None] for array in point_arrays]
+            elif point_ranks != {4}:
+                raise ValueError("Inference point clouds must have shape [B, T, N, D]")
+            if any(array.shape[:3] != point_arrays[0].shape[:3] for array in point_arrays[1:]):
+                raise ValueError(
+                    "Configured point-cloud fields must share batch, time, and point axes"
+                )
+            if point_arrays[0].shape[1] != 1:
+                raise ValueError("The current point encoder expects one point-cloud timestep")
+            points = np.concatenate(point_arrays, axis=-1)[:, 0]
+            transformed_observation["points"] = torch.from_numpy(np.ascontiguousarray(points))
+
+        if "tactile" in modality_config:
+            tactile_keys = modality_config["tactile"].modality_keys
+            if len(tactile_keys) != 1:
+                raise ValueError(
+                    "The current tactile encoder expects exactly one tactile image key"
+                )
+            tactile_images = torch.from_numpy(np.asarray(observation[f"tactile.{tactile_keys[0]}"]))
+            if tactile_images.ndim == 4:
+                tactile_images = tactile_images[:, None]
+            if tactile_images.ndim != 5 or tactile_images.shape[1] != 1:
+                raise ValueError("Inference tactile images must have shape [B, 1, H, W, C]")
+            transformed_observation["tactile"] = self._normalize_tactile_images(tactile_images)[
+                :, 0
+            ]
+
         # Process images: observation values are (B, T, H, W, C) numpy arrays
         image_keys = modality_config["video"].modality_keys
         images_dict = {view: torch.from_numpy(observation[f"video.{view}"]) for view in image_keys}
@@ -691,6 +760,20 @@ class Gr00tN1d7Processor(BaseProcessor):
         transformed_inputs = {
             "state": normalized_states.to(torch.get_default_dtype()),
         }
+        if "pointcloud" in self.modality_configs[embodiment_tag.value]:
+            if content.pointclouds is None:
+                raise ValueError("Point-cloud modality is configured but VLAStepData has no data")
+            transformed_inputs["points"] = self._training_pointcloud(
+                content,
+                self.modality_configs[embodiment_tag.value],
+            )
+        if "tactile" in self.modality_configs[embodiment_tag.value]:
+            if content.tactile is None:
+                raise ValueError("Tactile modality is configured but VLAStepData has no data")
+            transformed_inputs["tactile"] = self._training_tactile(
+                content,
+                self.modality_configs[embodiment_tag.value],
+            )
         if normalized_actions is not None:
             transformed_inputs["action"] = normalized_actions.to(torch.get_default_dtype())
         # Add VLM inputs

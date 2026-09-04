@@ -55,8 +55,15 @@ def extract_step_data(
                         for i in range(len(modality_data))
                     ]
                 )
+            elif modality == "pointcloud":
+                step_data[modality][key] = np.stack(
+                    [
+                        np.asarray(modality_data.iloc[i], dtype=np.float32)
+                        for i in range(len(modality_data))
+                    ]
+                )
             else:
-                # Keep as lists for other modalities (video, language)
+                # Keep temporal image, mask, tactile, and language values as lists.
                 step_data[modality][key] = modality_data.tolist()
 
     # Parse extracted data into VLAStepData structure
@@ -64,6 +71,8 @@ def extract_step_data(
     mask_data = step_data.get("mask", {})
     state_data = step_data.get("state", {})
     action_data = step_data.get("action", {})
+    tactile_data = step_data.get("tactile", {})
+    pointcloud_data = step_data.get("pointcloud", {})
     language_data = step_data.get("language", {})
     assert len(language_data) == 1, f"Expected 1 language, got {len(language_data)}"
     text = language_data[list(language_data.keys())[0]][0]
@@ -71,6 +80,8 @@ def extract_step_data(
     vla_step_data = VLAStepData(
         images=video_data,
         masks=mask_data if mask_data else None,
+        tactile=tactile_data if tactile_data else None,
+        pointclouds=pointcloud_data if pointcloud_data else None,
         states=state_data,
         actions=action_data,
         text=text,
@@ -98,7 +109,7 @@ class ShardedSingleStepDataset(ShardedDataset):
     - Balanced sharding for consistent batch sizes
     - Episode subsampling via sampling rate
     - Integration with LeRobot data format
-    - Support for multi-modal data (video, state, action, language)
+    - Support for multi-modal data (video, state, action, language, tactile, pointcloud)
 
     Args:
         dataset_path: Path to LeRobot format dataset directory

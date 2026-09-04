@@ -33,7 +33,10 @@ from convert_univtac_to_lerobot import (
     CHUNK_SIZE,
     JOINT_DATASET,
     JOINT_DIMENSION,
+    POINTCLOUD_ARRAY_KEY,
+    POINTCLOUD_OUTPUT_KEY,
     STATE_COLUMN,
+    TACTILE_OUTPUT_KEYS,
     ConversionError,
     inspect_video,
 )
@@ -74,12 +77,12 @@ def _video_path(
     info: dict[str, Any],
     *,
     episode_index: int,
-    camera_name: str,
+    original_key: str,
 ) -> Path:
     video_pattern = info["video_path"]
     relative_path = video_pattern.format(
         episode_chunk=episode_index // info["chunks_size"],
-        video_key=f"observation.images.{camera_name}",
+        video_key=original_key,
         episode_index=episode_index,
     )
     return dataset_root / relative_path
@@ -124,6 +127,14 @@ def check_gr00t_loader(
     if not modality_config_path.is_file():
         raise FileNotFoundError(f"Modality config does not exist: {modality_config_path}")
 
+    from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
+    from gr00t.data.embodiment_tags import EmbodimentTag
+
+    embodiment_tag = EmbodimentTag.NEW_EMBODIMENT
+    # The inspector may intentionally compare multimodal and baseline configs
+    # in one process; each config uses the normal one-time registration API.
+    MODALITY_CONFIGS.pop(embodiment_tag.value, None)
+
     spec = importlib.util.spec_from_file_location(
         "univtac_loader_check_config", modality_config_path
     )
@@ -133,14 +144,11 @@ def check_gr00t_loader(
     sys.modules[spec.name] = config_module
     spec.loader.exec_module(config_module)
 
-    from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
     from gr00t.data.dataset.sharded_single_step_dataset import (
         ShardedSingleStepDataset,
         extract_step_data,
     )
-    from gr00t.data.embodiment_tags import EmbodimentTag
 
-    embodiment_tag = EmbodimentTag.NEW_EMBODIMENT
     modality_configs = MODALITY_CONFIGS[embodiment_tag.value]
     dataset = ShardedSingleStepDataset(
         dataset_path=dataset_root,
@@ -167,6 +175,49 @@ def check_gr00t_loader(
         raise ConversionError(
             f"GR00T loader returned unexpected image keys: {sample.images.keys()}"
         )
+
+    for image_key in CAMERA_DATASETS:
+        image = sample.images[image_key][0]
+        if image.dtype != np.uint8 or image.ndim != 3 or image.shape[-1] != 3:
+            raise ConversionError(
+                f"GR00T loader returned invalid video.{image_key}: {image.shape} {image.dtype}"
+            )
+        np.testing.assert_array_equal(image, episode_data[f"video.{image_key}"].iloc[0])
+
+    if "tactile" in modality_configs:
+        if sample.tactile is None or set(sample.tactile) != set(TACTILE_OUTPUT_KEYS):
+            raise ConversionError(f"GR00T loader returned invalid tactile keys: {sample.tactile}")
+        for tactile_key in TACTILE_OUTPUT_KEYS:
+            tactile = sample.tactile[tactile_key]
+            tactile_array = np.asarray(tactile)
+            if tactile_array.dtype != np.uint8 or tactile_array.ndim != 4:
+                raise ConversionError(
+                    f"GR00T loader returned invalid tactile.{tactile_key}: "
+                    f"{tactile_array.shape} {tactile_array.dtype}"
+                )
+            np.testing.assert_array_equal(
+                tactile[0], episode_data[f"tactile.{tactile_key}"].iloc[0]
+            )
+            print(
+                f"GR00T sample tactile.{tactile_key}: {tactile_array.shape} {tactile_array.dtype}"
+            )
+    elif sample.tactile is not None:
+        raise ConversionError("RGB-only config unexpectedly returned tactile data")
+
+    if "pointcloud" in modality_configs:
+        if sample.pointclouds is None or set(sample.pointclouds) != {"xyz"}:
+            raise ConversionError(
+                f"GR00T loader returned invalid point-cloud keys: {sample.pointclouds}"
+            )
+        xyz = sample.pointclouds["xyz"]
+        if xyz.shape != (1, 1024, 3) or xyz.dtype != np.float32:
+            raise ConversionError(
+                f"GR00T loader returned invalid pointcloud.xyz: {xyz.shape} {xyz.dtype}"
+            )
+        np.testing.assert_array_equal(xyz[0], episode_data["pointcloud.xyz"].iloc[0])
+        print(f"GR00T sample pointcloud.xyz: {xyz.shape} {xyz.dtype}")
+    elif sample.pointclouds is not None:
+        raise ConversionError("RGB-only config unexpectedly returned point-cloud data")
 
     print("GR00T dataset initialization: PASS")
     print(f"GR00T sample state shape: {state_shape}")
@@ -229,7 +280,7 @@ def inspect_dataset(args: argparse.Namespace) -> None:
             dataset_root,
             info,
             episode_index=args.episode_index,
-            camera_name=camera_name,
+            original_key=f"observation.images.{camera_name}",
         )
         video_metadata = inspect_video(video_path, decode_all_frames=True)
         print(f"{camera_name.capitalize()} video: {video_path}")
@@ -241,6 +292,44 @@ def inspect_dataset(args: argparse.Namespace) -> None:
                 f"{camera_name} video has {video_metadata.frame_count} frames; "
                 f"parquet has {episode['length']} rows."
             )
+
+    if "tactile" in modality:
+        for tactile_key, original_key in TACTILE_OUTPUT_KEYS.items():
+            tactile_path = _video_path(
+                dataset_root,
+                info,
+                episode_index=args.episode_index,
+                original_key=original_key,
+            )
+            tactile_metadata = inspect_video(tactile_path, decode_all_frames=True)
+            print(f"Tactile {tactile_key} video: {tactile_path}")
+            print(
+                f"  shape/dtype: ({tactile_metadata.frame_count}, "
+                f"{tactile_metadata.height}, {tactile_metadata.width}, 3) uint8"
+            )
+            if tactile_metadata.frame_count != episode["length"]:
+                raise ConversionError(
+                    f"Tactile {tactile_key} video has {tactile_metadata.frame_count} frames; "
+                    f"parquet has {episode['length']} rows."
+                )
+
+    if "pointcloud" in modality:
+        pointcloud_relative_path = info["pointcloud_path"].format(
+            episode_chunk=chunk_index,
+            pointcloud_key=POINTCLOUD_OUTPUT_KEY,
+            episode_index=args.episode_index,
+        )
+        pointcloud_path = dataset_root / pointcloud_relative_path
+        with np.load(pointcloud_path, allow_pickle=False) as archive:
+            xyz = archive[POINTCLOUD_ARRAY_KEY]
+            expected_shape = (episode["length"], 1024, 3)
+            if xyz.shape != expected_shape or xyz.dtype != np.float32:
+                raise ConversionError(
+                    f"Invalid {pointcloud_path}:{POINTCLOUD_ARRAY_KEY}: "
+                    f"{xyz.shape} {xyz.dtype}; expected {expected_shape} float32"
+                )
+            print(f"Point cloud: {pointcloud_path}")
+            print(f"  shape/dtype: {xyz.shape} {xyz.dtype}")
 
     if args.skip_source_comparison:
         print("Source comparison: skipped by request")
@@ -261,6 +350,13 @@ def inspect_dataset(args: argparse.Namespace) -> None:
             args.modality_config.expanduser().resolve(),
             episode_index=args.episode_index,
         )
+        if args.rgb_only_dataset is not None:
+            check_gr00t_loader(
+                args.rgb_only_dataset.expanduser().resolve(),
+                args.rgb_only_modality_config.expanduser().resolve(),
+                episode_index=0,
+            )
+            print(f"RGB-only backward-compatibility dataset: {args.rgb_only_dataset} PASS")
 
     print("Inspection result: PASS")
 
@@ -273,6 +369,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Episode to inspect (default: 0).",
+    )
+    parser.add_argument(
+        "--rgb-only-dataset",
+        type=Path,
+        help="Optional existing RGB-only dataset to load as a backward-compatibility check.",
+    )
+    parser.add_argument(
+        "--rgb-only-modality-config",
+        type=Path,
+        default=Path(__file__).with_name("univtac_config.py"),
+        help="Config for --rgb-only-dataset (default: adjacent univtac_config.py).",
     )
     parser.add_argument(
         "--source-hdf5",

@@ -38,6 +38,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 from tqdm import tqdm
 
 from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
@@ -253,7 +254,17 @@ def generate_stats(dataset_path: Path | str):
     print(f"Generating stats for {str(dataset_path)}")
     with open(dataset_path / LE_ROBOT_INFO_FILENAME, "r") as f:
         le_features = json.load(f)["features"]
-    lowdim_features = [f for f in le_features if "float" in le_features[f]["dtype"]]
+    parquet_files = list(dataset_path.glob(LE_ROBOT_DATA_FILENAME))
+    if not parquet_files:
+        raise FileNotFoundError(f"No parquet episode files found below {dataset_path}")
+    parquet_columns = set(pq.read_schema(parquet_files[0]).names)
+    # External numeric modalities (for example episode-level point-cloud NPZs)
+    # may still be declared in info.json. Statistics only apply to parquet columns.
+    lowdim_features = [
+        feature
+        for feature, metadata in le_features.items()
+        if "float" in metadata["dtype"] and feature in parquet_columns
+    ]
 
     stats_path = dataset_path / LE_ROBOT_STATS_FILENAME
     existing = _load_stats_cache(stats_path)
@@ -281,7 +292,6 @@ def generate_stats(dataset_path: Path | str):
     if not stale and not dropped:
         return
 
-    parquet_files = list(dataset_path.glob(LE_ROBOT_DATA_FILENAME))
     fresh = calculate_dataset_statistics(parquet_files, stale) if stale else {}
     for feature, values in fresh.items():
         existing[feature] = values

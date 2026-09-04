@@ -22,7 +22,7 @@ from gr00t.model.extension.point_encoder import (
     build_point_encoder,
 )
 from gr00t.model.extension.tactile_encoder import TactileEncoder
-from gr00t.model.modules.dit import DiT
+from gr00t.model.modules.dit import AlternateVLDiT
 import torch
 
 
@@ -41,18 +41,22 @@ def _dit_config() -> dict:
 
 
 def _multimodal_dit() -> MultiModalConditionedDiT:
-    return MultiModalConditionedDiT(
-        **_dit_config(),
-        point_input_dim=5,
-        tactile_input_channels=2,
-        tactile_patch_size=4,
-    ).eval()
+    return MultiModalConditionedDiT(**_dit_config()).eval()
 
 
-def test_zero_gates_preserve_original_dit_output() -> None:
+def _vlm_masks(batch_size: int = 2, sequence_length: int = 6) -> dict[str, torch.Tensor]:
+    image_mask = torch.zeros(batch_size, sequence_length, dtype=torch.bool)
+    image_mask[:, sequence_length // 2 :] = True
+    return {
+        "image_mask": image_mask,
+        "backbone_attention_mask": torch.ones_like(image_mask),
+    }
+
+
+def test_zero_gates_preserve_original_alternate_vl_dit_output() -> None:
     """New modality branches must begin as exact no-ops for old checkpoints."""
     torch.manual_seed(7)
-    original_dit = DiT(**_dit_config()).eval()
+    original_dit = AlternateVLDiT(**_dit_config()).eval()
     multimodal_dit = _multimodal_dit()
 
     missing_keys, unexpected_keys = multimodal_dit.load_state_dict(
@@ -65,21 +69,24 @@ def test_zero_gates_preserve_original_dit_output() -> None:
     hidden_states = torch.randn(2, 5, 8)
     vlm_hidden_states = torch.randn(2, 6, 6)
     timesteps = torch.tensor([3, 9])
-    point_cloud = torch.randn(2, 7, 5)
-    tactile_images = torch.randn(2, 2, 8, 12)
+    point_tokens = torch.randn(2, 7, 8)
+    tactile_tokens = torch.randn(2, 3, 8)
+    vlm_masks = _vlm_masks()
 
     with torch.no_grad():
         original_output = original_dit(
             hidden_states,
             vlm_hidden_states,
             timestep=timesteps,
+            **vlm_masks,
         )
         multimodal_output = multimodal_dit(
             hidden_states,
             vlm_hidden_states,
             timestep=timesteps,
-            point_cloud=point_cloud,
-            tactile_images=tactile_images,
+            point_tokens=point_tokens,
+            tactile_tokens=tactile_tokens,
+            **vlm_masks,
         )
 
     torch.testing.assert_close(multimodal_output, original_output, rtol=0, atol=0)
@@ -88,12 +95,7 @@ def test_zero_gates_preserve_original_dit_output() -> None:
 def test_modality_attention_updates_only_action_slice() -> None:
     """The sensor branches must not directly overwrite state-token outputs."""
     torch.manual_seed(11)
-    model = MultiModalConditionedDiT(
-        **(_dit_config() | {"num_layers": 1, "interleave_self_attention": False}),
-        point_input_dim=5,
-        tactile_input_channels=2,
-        tactile_patch_size=4,
-    ).eval()
+    model = MultiModalConditionedDiT(**(_dit_config() | {"num_layers": 1})).eval()
     with torch.no_grad():
         model.point_gates.fill_(1.0)
         model.tactile_gates.fill_(1.0)
@@ -109,15 +111,17 @@ def test_modality_attention_updates_only_action_slice() -> None:
             timestep=timesteps,
             return_all_hidden_states=True,
             num_state_tokens=2,
+            **_vlm_masks(sequence_length=4),
         )
         _, conditioned_hidden_states = model(
             hidden_states,
             vlm_hidden_states,
             timestep=timesteps,
             return_all_hidden_states=True,
-            point_cloud=torch.randn(2, 7, 5),
-            tactile_images=torch.randn(2, 2, 8, 8),
+            point_tokens=torch.randn(2, 7, 8),
+            tactile_tokens=torch.randn(2, 3, 8),
             num_state_tokens=2,
+            **_vlm_masks(sequence_length=4),
         )
 
     baseline_state_tokens = baseline_hidden_states[-1][:, :2]
@@ -142,8 +146,8 @@ def test_fully_masked_modality_rows_produce_finite_outputs_and_gradients() -> No
     )
     tactile_attention_mask = torch.tensor(
         [
-            [True],
-            [False],
+            [True, True, False],
+            [False, False, False],
         ]
     )
 
@@ -151,10 +155,11 @@ def test_fully_masked_modality_rows_produce_finite_outputs_and_gradients() -> No
         hidden_states=torch.randn(2, 5, 8),
         encoder_hidden_states=torch.randn(2, 6, 6),
         timestep=torch.tensor([1, 4]),
-        point_cloud=torch.randn(2, 7, 5),
-        tactile_images=torch.randn(2, 2, 8, 12),
+        point_tokens=torch.randn(2, 7, 8),
+        tactile_tokens=torch.randn(2, 3, 8),
         point_attention_mask=point_attention_mask,
         tactile_attention_mask=tactile_attention_mask,
+        **_vlm_masks(),
     )
     output.square().mean().backward()
 
@@ -194,18 +199,20 @@ def test_point_encoder_factory_and_multimodal_integration() -> None:
 
     for encoder_type in ("pointnet2", "point_transformer"):
         model = MultiModalConditionedDiT(
-            **(_dit_config() | {"num_layers": 1, "interleave_self_attention": False}),
-            point_input_dim=6,
-            point_encoder_type=encoder_type,
-            tactile_input_channels=3,
+            **(_dit_config() | {"num_layers": 1}),
         ).eval()
+        point_encoder = build_point_encoder(encoder_type, point_dim=8).eval()
+        tactile_encoder = TactileEncoder(tactile_dim=8).eval()
         with torch.no_grad():
+            point_tokens = point_encoder(torch.randn(2, 128, 6))
+            tactile_tokens = tactile_encoder(torch.randn(2, 3, 64, 64))
             output = model(
                 hidden_states=torch.randn(2, 5, 8),
                 encoder_hidden_states=torch.randn(2, 6, 6),
                 timestep=torch.tensor([1, 4]),
-                point_cloud=torch.randn(2, 128, 6),
-                tactile_images=torch.randn(2, 3, 64, 64),
+                point_tokens=point_tokens,
+                tactile_tokens=tactile_tokens,
+                **_vlm_masks(),
             )
 
         assert output.shape == (2, 5, 8)

@@ -28,10 +28,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from gr00t.model.modules.dit import DiT, _sdpa_context
-
-from .point_encoder import PointEncoder, build_point_encoder
-from .tactile_encoder import TactileEncoder
+from gr00t.model.modules.dit import AlternateVLDiT, _sdpa_context
 
 
 def _validate_token_mask(
@@ -140,12 +137,12 @@ class ModalityCrossAttention(nn.Module):
         return action_update
 
 
-class MultiModalConditionedDiT(DiT):
+class MultiModalConditionedDiT(AlternateVLDiT):
     """Extend GR00T DiT with point-cloud and tactile action conditioning.
 
     The model accepts the same joint state/action and VLM inputs as
-    :class:`~gr00t.model.modules.dit.DiT`, plus raw point clouds and tactile
-    images. At each transformer layer, the original GR00T block runs first.
+    :class:`~gr00t.model.modules.dit.AlternateVLDiT`, plus pre-encoded point
+    and tactile tokens. At each transformer layer, the original GR00T block runs first.
     Only the action-token suffix then cross-attends to encoded point and
     tactile tokens before state and action tokens are recombined.
 
@@ -153,9 +150,8 @@ class MultiModalConditionedDiT(DiT):
         hidden_states: Joint ``[state; action]`` tokens, shape
             ``[B, N_state + N_action, D_dit]``.
         encoder_hidden_states: VLM tokens, shape ``[B, N_vlm, D_vlm]``.
-        point_cloud: Optional point features, shape
-            ``[B, N_point, point_input_dim]``.
-        tactile_images: Optional images, shape ``[B, C_tactile, H, W]``.
+        point_tokens: Optional point features, shape ``[B, N_point, D_dit]``.
+        tactile_tokens: Optional tactile features, shape ``[B, N_tactile, D_dit]``.
         point_attention_mask: Optional valid-token mask, shape
             ``[B, N_point]``. ``True`` means the point may be attended to.
         tactile_attention_mask: Optional valid-token mask, shape
@@ -191,15 +187,7 @@ class MultiModalConditionedDiT(DiT):
         positional_embeddings: Optional[str] = "sinusoidal",
         interleave_self_attention: bool = False,
         cross_attention_dim: Optional[int] = None,
-        point_input_dim: int = 6,
-        point_encoder_hidden_dim: Optional[int] = None,
-        point_encoder_type: str = "pointnet2",
-        point_num_samples: tuple[int, int] = (256, 64),
-        point_num_neighbors: tuple[int, int] = (32, 32),
-        point_transformer_layers: int = 2,
-        tactile_input_channels: int = 3,
-        tactile_patch_size: int = 16,
-        tactile_pretrained: bool = False,
+        attend_text_every_n_blocks: int = 2,
         modality_attention_heads: Optional[int] = None,
         modality_dropout: float = 0.0,
     ) -> None:
@@ -222,6 +210,7 @@ class MultiModalConditionedDiT(DiT):
             positional_embeddings=positional_embeddings,
             interleave_self_attention=interleave_self_attention,
             cross_attention_dim=cross_attention_dim,
+            attend_text_every_n_blocks=attend_text_every_n_blocks,
         )
 
         # ConfigMixin writes constructor values to JSON. Preserve the dtype as
@@ -230,35 +219,6 @@ class MultiModalConditionedDiT(DiT):
             self.register_to_config(compute_dtype=str(compute_dtype))
 
         modality_attention_heads = modality_attention_heads or num_attention_heads
-        point_encoder_kwargs = {
-            "input_dim": point_input_dim,
-            "point_dim": self.inner_dim,
-            "dropout": modality_dropout,
-        }
-        if point_encoder_type.lower().replace("-", "_") in {"pointnet2", "pointnet++"}:
-            point_encoder_kwargs.update(
-                {
-                    "hidden_dim": point_encoder_hidden_dim,
-                    "num_samples": point_num_samples,
-                    "num_neighbors": point_num_neighbors,
-                }
-            )
-        else:
-            point_encoder_kwargs.update(
-                {
-                    "num_layers": point_transformer_layers,
-                    "num_heads": modality_attention_heads,
-                }
-            )
-        self.point_encoder = build_point_encoder(point_encoder_type, **point_encoder_kwargs)
-        self.tactile_encoder = TactileEncoder(
-            input_channels=tactile_input_channels,
-            token_dim=self.inner_dim,
-            patch_size=tactile_patch_size,
-            dropout=modality_dropout,
-            pretrained=tactile_pretrained,
-        )
-
         self.point_cross_attention = nn.ModuleList(
             [
                 ModalityCrossAttention(
@@ -288,13 +248,26 @@ class MultiModalConditionedDiT(DiT):
         self.point_gates = nn.Parameter(torch.zeros(num_layers))
         self.tactile_gates = nn.Parameter(torch.zeros(num_layers))
 
+    def set_multimodal_adapter_trainable(self, trainable: bool) -> None:
+        """Control only the new cross-attention branches and residual gates."""
+        self.point_cross_attention.requires_grad_(trainable)
+        self.tactile_cross_attention.requires_grad_(trainable)
+        self.point_gates.requires_grad_(trainable)
+        self.tactile_gates.requires_grad_(trainable)
+
+    def set_multimodal_adapter_mode(self, training: bool) -> None:
+        """Set dropout behavior for the adapter branches independently of the base DiT."""
+        self.point_cross_attention.train(training)
+        self.tactile_cross_attention.train(training)
+
     def _run_original_gr00t_block(
         self,
         block_index: int,
         hidden_states: torch.Tensor,
         vlm_hidden_states: torch.Tensor,
         timestep_embedding: torch.Tensor,
-        vlm_attention_mask: Optional[torch.Tensor],
+        image_attention_mask: torch.Tensor,
+        non_image_attention_mask: torch.Tensor,
     ) -> torch.Tensor:
         """Run one unmodified self- or VLM-cross-attention DiT block."""
         transformer_block = self.transformer_blocks[block_index]
@@ -309,11 +282,16 @@ class MultiModalConditionedDiT(DiT):
                 temb=timestep_embedding,
             )
 
+        if block_index % (2 * self.attend_text_every_n_blocks) == 0:
+            current_vlm_attention_mask = non_image_attention_mask
+        else:
+            current_vlm_attention_mask = image_attention_mask
+
         return transformer_block(
             hidden_states,
             attention_mask=None,
             encoder_hidden_states=vlm_hidden_states,
-            encoder_attention_mask=vlm_attention_mask,
+            encoder_attention_mask=current_vlm_attention_mask,
             temb=timestep_embedding,
         )
 
@@ -372,9 +350,11 @@ class MultiModalConditionedDiT(DiT):
         timestep: Optional[torch.LongTensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         return_all_hidden_states: bool = False,
+        image_mask: Optional[torch.Tensor] = None,
+        backbone_attention_mask: Optional[torch.Tensor] = None,
         *,
-        point_cloud: Optional[torch.Tensor] = None,
-        tactile_images: Optional[torch.Tensor] = None,
+        point_tokens: Optional[torch.Tensor] = None,
+        tactile_tokens: Optional[torch.Tensor] = None,
         point_attention_mask: Optional[torch.Tensor] = None,
         tactile_attention_mask: Optional[torch.Tensor] = None,
         num_state_tokens: int = 1,
@@ -401,29 +381,36 @@ class MultiModalConditionedDiT(DiT):
                 "num_state_tokens must leave at least one action token. "
                 f"Got {num_state_tokens} for a sequence of length {hidden_states.shape[1]}."
             )
-        if point_cloud is None and point_attention_mask is not None:
-            raise ValueError("point_attention_mask was provided without point_cloud.")
-        if tactile_images is None and tactile_attention_mask is not None:
-            raise ValueError("tactile_attention_mask was provided without tactile_images.")
+        if image_mask is None or backbone_attention_mask is None:
+            raise ValueError("image_mask and backbone_attention_mask are required")
+        if point_tokens is None and point_attention_mask is not None:
+            raise ValueError("point_attention_mask was provided without point_tokens.")
+        if tactile_tokens is None and tactile_attention_mask is not None:
+            raise ValueError("tactile_attention_mask was provided without tactile_tokens.")
 
-        # Encode each sensor once, then reuse its K/V tokens at every DiT layer.
-        # point_tokens:   [B, N_point_out, D_dit] or None
-        # tactile_tokens: [B, N_tactile, D_dit] or None
-        if point_cloud is not None:
-            point_tokens, point_attention_mask = self.point_encoder(
-                point_cloud,
-                point_mask=point_attention_mask,
-                return_mask=True,
+        # Preserve AlternateVLDiT's image/non-image attention masks and schedule.
+        valid_vlm_tokens = backbone_attention_mask.to(dtype=torch.bool)
+        image_tokens = image_mask.to(dtype=torch.bool)
+        image_attention_mask = image_tokens & valid_vlm_tokens
+        non_image_attention_mask = (~image_tokens) & valid_vlm_tokens
+        if not self.config.interleave_self_attention:
+            raise ValueError(
+                "MultiModalConditionedDiT preserves AlternateVLDiT and requires "
+                "interleave_self_attention=True"
             )
-        else:
-            point_tokens = None
-        tactile_tokens = (
-            self.tactile_encoder(tactile_images) if tactile_images is not None else None
-        )
+
         if point_tokens is not None and point_tokens.shape[0] != batch_size:
-            raise ValueError("hidden_states and point_cloud must share a batch size.")
+            raise ValueError("hidden_states and point_tokens must share a batch size.")
         if tactile_tokens is not None and tactile_tokens.shape[0] != batch_size:
-            raise ValueError("hidden_states and tactile_images must share a batch size.")
+            raise ValueError("hidden_states and tactile_tokens must share a batch size.")
+        for token_name, tokens in (
+            ("point_tokens", point_tokens),
+            ("tactile_tokens", tactile_tokens),
+        ):
+            if tokens is not None and tokens.shape[-1] != self.inner_dim:
+                raise ValueError(
+                    f"{token_name} width must be {self.inner_dim}, got {tokens.shape[-1]}."
+                )
 
         timestep_embedding = self.timestep_encoder(timestep)
         hidden_states = hidden_states.contiguous()
@@ -438,7 +425,8 @@ class MultiModalConditionedDiT(DiT):
                 hidden_states,
                 vlm_hidden_states,
                 timestep_embedding,
-                encoder_attention_mask,
+                image_attention_mask,
+                non_image_attention_mask,
             )
 
             # 2. State is the prefix and action is the suffix. Sensor branches
@@ -479,4 +467,4 @@ class MultiModalConditionedDiT(DiT):
         return output
 
 
-__all__ = ["ModalityCrossAttention", "MultiModalConditionedDiT", "PointEncoder", "TactileEncoder"]
+__all__ = ["ModalityCrossAttention", "MultiModalConditionedDiT"]

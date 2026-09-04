@@ -77,8 +77,18 @@ if __name__ == "__main__":
     # overwrite with finetune config supplied by the user
     config.model.tune_llm = ft_config.tune_llm
     config.model.tune_visual = ft_config.tune_visual
+    config.model.dit_type = ft_config.dit_type
+    config.model.use_point_conditioning = ft_config.use_point_conditioning
+    config.model.use_tactile_conditioning = ft_config.use_tactile_conditioning
+    config.model.point_input_dim = ft_config.point_input_dim
+    config.model.tactile_input_channels = ft_config.tactile_input_channels
+    config.model.point_encoder_cfg = ft_config.point_encoder_cfg
     config.model.tune_projector = ft_config.tune_projector
     config.model.tune_diffusion_model = ft_config.tune_diffusion_model
+    config.model.tune_vlln = ft_config.tune_vlln
+    config.model.tune_point_encoder = ft_config.tune_point_encoder
+    config.model.tune_tactile_encoder = ft_config.tune_tactile_encoder
+    config.model.tune_multimodal_adapter = ft_config.tune_multimodal_adapter
     config.model.state_dropout_prob = ft_config.state_dropout_prob
     config.model.random_rotation_angle = ft_config.random_rotation_angle
     config.model.color_jitter_params = ft_config.color_jitter_params

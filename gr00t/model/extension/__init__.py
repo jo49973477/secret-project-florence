@@ -15,8 +15,14 @@
 
 """Research extensions for GR00T models."""
 
-from .multimodal_dit import MultiModalConditionedDiT, PointEncoder, TactileEncoder
-from .point_encoder import PointNet2Encoder, PointTransformerEncoder, build_point_encoder
+from .multimodal_dit import MultiModalConditionedDiT
+from .point_encoder import (
+    PointEncoder,
+    PointNet2Encoder,
+    PointTransformerEncoder,
+    build_point_encoder,
+)
+from .tactile_encoder import TactileEncoder
 
 
 __all__ = [
