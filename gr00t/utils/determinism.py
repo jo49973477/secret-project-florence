@@ -20,11 +20,10 @@ environment variable is unset, these helpers are no-ops, so training and
 production code paths are unaffected.
 
 When enabled, :func:`seed_everything` seeds Python, NumPy, torch CPU and
-torch CUDA RNGs, sets cuDNN to deterministic mode, and (optionally) asks
-torch to use deterministic algorithm implementations. This is required
-before any historical metric recording so that run-to-run variance on the
-same checkpoint is driven by hardware/library noise only, not by unseeded
-RNGs.
+torch CUDA RNGs. By default it also sets cuDNN to deterministic mode and asks
+torch to use deterministic algorithm implementations; callers can opt out of
+those potentially expensive global settings when repeatable random sampling
+is sufficient.
 """
 
 from __future__ import annotations
@@ -58,8 +57,13 @@ def get_eval_seed(default: int | None = None) -> int | None:
         raise ValueError(f"{EVAL_SEED_ENV_VAR}={raw!r} is not a valid integer") from exc
 
 
-def seed_everything(seed: int | None = None, *, warn_only: bool = True) -> int | None:
-    """Seed all standard RNGs and enable deterministic cuDNN / CUDA kernels.
+def seed_everything(
+    seed: int | None = None,
+    *,
+    warn_only: bool = True,
+    deterministic_algorithms: bool = True,
+) -> int | None:
+    """Seed all standard RNGs and optionally enable deterministic CUDA kernels.
 
     Args:
         seed: Seed to apply. If ``None``, reads ``GR00T_EVAL_SEED``; if that
@@ -68,6 +72,11 @@ def seed_everything(seed: int | None = None, *, warn_only: bool = True) -> int |
         warn_only: Forwarded to ``torch.use_deterministic_algorithms``. When
             ``True`` (default), ops without a deterministic implementation
             warn instead of raising.
+        deterministic_algorithms: When ``True`` (default, preserving the
+            historical helper behavior), also request deterministic torch and
+            cuDNN implementations. Evaluation paths that only need repeatable
+            flow-matching noise can set this to ``False`` to avoid the runtime
+            cost of globally forcing deterministic CUDA algorithms.
 
     Returns:
         The effective seed that was applied, or ``None`` if no seeding was
@@ -81,12 +90,18 @@ def seed_everything(seed: int | None = None, *, warn_only: bool = True) -> int |
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.use_deterministic_algorithms(True, warn_only=warn_only)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    # Required by some CUDA kernels when deterministic algorithms are on.
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if deterministic_algorithms:
+        torch.use_deterministic_algorithms(True, warn_only=warn_only)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        # Required by some CUDA kernels when deterministic algorithms are on.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
-    logger.info("Determinism enabled: seed=%d warn_only=%s", seed, warn_only)
+    logger.info(
+        "Seeded Python, NumPy, and torch RNGs: seed=%d deterministic_algorithms=%s",
+        seed,
+        deterministic_algorithms,
+    )
     return seed

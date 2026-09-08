@@ -29,6 +29,7 @@ from gr00t.eval._horizon_contract import PolicyHorizonSpec, migrate_deprecated_a
 from gr00t.policy import BasePolicy
 from gr00t.policy.gr00t_policy import Gr00tPolicy
 from gr00t.policy.server_client import PolicyClient
+from gr00t.utils.determinism import seed_everything
 from matplotlib import pyplot as plt
 import numpy as np
 import pandas as pd
@@ -266,6 +267,9 @@ class ArgsConfig:
     denoising_steps: int = 4
     """Number of denoising steps to use."""
 
+    seed: int | None = None
+    """Seed Python, NumPy, torch, and CUDA RNGs for repeatable local inference sampling."""
+
     save_plot_path: str | None = None
     """Path to save the plot to."""
 
@@ -277,6 +281,9 @@ def main(args: ArgsConfig):
     args.embodiment_tag = EmbodimentTag.resolve(args.embodiment_tag)
     # Set up logging
     logging.basicConfig(level=logging.INFO)
+    effective_seed = seed_everything(args.seed, deterministic_algorithms=False)
+    if effective_seed is not None:
+        logging.info("Using inference seed %d", effective_seed)
 
     # Download model checkpoint if it's an S3 path
     local_model_path = args.model_path
@@ -311,6 +318,11 @@ def main(args: ArgsConfig):
         logging.info(f"Using {args.denoising_steps} denoising steps")
     else:
         policy = PolicyClient(host=args.host, port=args.port)
+        if args.seed is not None:
+            logging.warning(
+                "--seed only seeds this client process when using a remote policy server; "
+                "seed the server process to control its flow-matching noise."
+            )
         if args.denoising_steps != ArgsConfig.denoising_steps:
             logging.warning(
                 "--denoising-steps=%d is ignored when running against a remote "

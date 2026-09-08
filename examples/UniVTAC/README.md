@@ -122,6 +122,52 @@ uv run bash examples/finetune.sh \
 
 Each converted episode needs at least 40 aligned rows (`T >= 41`) to contribute a training sample with this configuration.
 
+## Baseline diagnostic evaluation
+
+The diagnostic code is prepared and CPU-tested locally, but loading GR00T checkpoints and running the RGB ablations is intentionally left to the GPU server. After syncing or pulling this repository on the server, first run the smoke configuration on a selected physical GPU:
+
+```bash
+EVAL_GPU=5 RUN_MODE=smoke \
+bash scripts/run_univtac_baseline_diagnostics.sh
+```
+
+If that succeeds, run the complete checkpoint/seed sweep:
+
+```bash
+EVAL_GPU=4 RUN_MODE=full \
+bash scripts/run_univtac_baseline_diagnostics.sh
+```
+
+`EVAL_GPU` is the physical index shown by `nvidia-smi`. The script assigns it to `CUDA_VISIBLE_DEVICES`, so evaluation always uses the remapped logical device `cuda:0`; the physical index is never passed directly to torch. The defaults target `/ssdg/spl_yeongyoo/univtac_gr00t` and `outputs/univtac_rgb_joint_20260904_121012`. Override server paths and sweep settings entirely through the environment, for example:
+
+```bash
+EVAL_GPU=5 \
+DATASET_PATH=/data/univtac_gr00t \
+RUN_DIR=outputs/my_run \
+TRAJ_IDS="0 1 2 3 4" \
+SEEDS="0 1 2 3 4" \
+VERIFY_REPRODUCIBILITY=1 \
+RUN_MODE=full \
+bash scripts/run_univtac_baseline_diagnostics.sh
+```
+
+Other overrides are `CHECKPOINT_STEPS`, `CONDITIONS`, `EVAL_STEPS`, `EXECUTION_HORIZON`, `DENOISING_STEPS`, `RESULT_DIR`, and `EMBODIMENT_TAG`. Full mode defaults to checkpoints `500 1000 1500 2000`, trajectories `0 1 2 3 4`, seeds `0 1 2 3 4`, all three conditions, and 400 steps. Smoke mode defaults to checkpoint 500, trajectory 0, seed 0, all conditions, and 32 steps. Both modes use an execution horizon of 16 and four denoising steps.
+
+The result directory contains:
+
+```text
+diagnostics/
+├── logs/
+├── raw_metrics.csv
+├── summary_metrics.csv
+├── persistence_metrics.csv
+└── reproducibility_check.csv  # only with VERIFY_REPRODUCIBILITY=1
+```
+
+`raw_metrics.csv` has one row per checkpoint, RGB condition, and seed. `summary_metrics.csv` reports mean and population standard deviation across seeds, plus absolute and percentage degradation relative to normal RGB. `persistence_metrics.csv` reports both one-step persistence (`q_t` predicts `q_(t+1)`) and chunk-hold persistence (repeat `q_t` for the execution horizon). Logs include the complete configuration and detailed progress. With `VERIFY_REPRODUCIBILITY=1`, the first checkpoint/condition/seed combination is repeated and its exact and tolerance-based metric matches are saved.
+
+Interpret these offline diagnostics conservatively. Similar normal, black, and shuffled results suggest that the current policy is weakly dependent on RGB under this offline test; significantly worse ablations indicate that RGB provides predictive information. GR00T performance near persistence suggests that temporal or proprioceptive smoothness may explain much of the score, while a substantial improvement over persistence indicates predictive structure beyond trivial persistence. These tests alone do not establish that RGB is useless or that tactile sensing is necessary.
+
 ## Common failures
 
 - **Missing `h5py`:** run `uv pip install h5py` in the environment used for conversion and inspection.

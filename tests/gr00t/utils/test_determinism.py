@@ -85,3 +85,9 @@ def test_cudnn_flags_flipped_when_seeded():
     assert torch.backends.cudnn.deterministic is True
     assert torch.backends.cudnn.benchmark is False
     assert torch.are_deterministic_algorithms_enabled() is True
+
+
+def test_rng_only_seeding_does_not_force_deterministic_algorithms():
+    torch.use_deterministic_algorithms(False)
+    seed_everything(0, deterministic_algorithms=False)
+    assert torch.are_deterministic_algorithms_enabled() is False
