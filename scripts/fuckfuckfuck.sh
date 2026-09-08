@@ -68,7 +68,7 @@ LOG_DIR="${OUTPUT_DIR}/logs"
 # ============================================================
 
 # PyTorch CUDA allocator fragmentation mitigation
-export PYTORCH_ALLOC_CONF=expandable_segments:True
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 export CUDA_VISIBLE_DEVICES="${TRAIN_GPUS}"
 
