@@ -45,7 +45,7 @@ univtac_config = {
     "action": ModalityConfig(
         # UniVTAC's ACT baseline uses 50, but the N1.7 base model predicts at
         # most 40 actions and rejects longer modality horizons at startup.
-        delta_indices=list(range(40)),
+        delta_indices=list(range(16)),
         modality_keys=["joint"],
         action_configs=[
             ActionConfig(
