@@ -16,6 +16,7 @@
 import logging
 
 from huggingface_hub.errors import GatedRepoError
+from peft import LoraConfig, inject_adapter_in_model
 import torch
 from transformers.feature_extraction_utils import BatchFeature
 
@@ -42,6 +43,53 @@ _GATED_BACKBONE_HINT = (
 
 
 _GATED_MARKERS = ("gated repo", "is restricted", "access to model", "401 client error")
+
+
+def attach_lora_adapters(
+    model: torch.nn.Module,
+    *,
+    r: int,
+    alpha: int,
+    dropout: float,
+    bias: str,
+) -> list[str]:
+    """Inject LoRA into every linear Qwen3-VL module and return adapter parameter names.
+
+    Only the Qwen3-VL module is passed to PEFT, so GR00T's action head and its
+    custom ``CategorySpecificLinear`` parameters are outside the adapter target
+    scope. PEFT's in-place injection keeps the surrounding backbone module and
+    its forward API unchanged, which makes the resulting state dict suitable
+    for normal ``Gr00tN1d7.save_pretrained`` serialization.
+    """
+    if bias != "none":
+        raise ValueError("LoRA bias must be 'none' so all original Qwen3-VL parameters stay frozen")
+
+    lora_config = LoraConfig(
+        r=r,
+        lora_alpha=alpha,
+        lora_dropout=dropout,
+        bias=bias,
+        target_modules="all-linear",
+    )
+    inject_adapter_in_model(lora_config, model)
+
+    lora_names = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
+    if not lora_names:
+        raise RuntimeError("LoRA is enabled but PEFT created no trainable adapter parameters")
+    if any("lora_" not in name for name in lora_names):
+        raise RuntimeError(
+            "LoRA injection left non-adapter Qwen3-VL parameters trainable; "
+            "the backbone base weights must remain frozen"
+        )
+
+    language_lora = [name for name in lora_names if name.startswith("language_model.")]
+    visual_lora = [name for name in lora_names if name.startswith("visual.")]
+    if not language_lora or not visual_lora:
+        raise RuntimeError(
+            "LoRA must target both Qwen3-VL language_model and visual linear layers; "
+            f"found language={len(language_lora)}, visual={len(visual_lora)} trainable tensors"
+        )
+    return lora_names
 
 
 def _is_gated_repo_error(exc: BaseException) -> bool:
@@ -145,6 +193,11 @@ class Qwen3Backbone(torch.nn.Module):
         load_bf16: bool = False,
         tune_top_llm_layers: int = 0,
         trainable_params_fp32: bool = False,
+        use_lora: bool = False,
+        lora_r: int = 16,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.0,
+        lora_bias: str = "none",
         transformers_loading_kwargs: dict = {},
     ):
         """
@@ -196,6 +249,14 @@ class Qwen3Backbone(torch.nn.Module):
 
         self.select_layer = select_layer
         self.set_trainable_parameters(tune_llm, tune_visual, tune_top_llm_layers)
+        self.use_lora = False
+        if use_lora:
+            self.enable_lora(
+                r=lora_r,
+                alpha=lora_alpha,
+                dropout=lora_dropout,
+                bias=lora_bias,
+            )
         if load_bf16 and trainable_params_fp32:
             # cast trainable parameters to fp32
             for n, p in self.named_parameters():
@@ -270,6 +331,31 @@ class Qwen3Backbone(torch.nn.Module):
         if not any(p.requires_grad for p in self.parameters()):
             logger.warning("No backbone trainable parameters found.")
 
+    def enable_lora(self, *, r: int, alpha: int, dropout: float, bias: str) -> list[str]:
+        """Attach trainable LoRA adapters while freezing every Qwen3-VL base parameter."""
+        if self.use_lora:
+            raise RuntimeError("LoRA adapters are already attached to the Qwen3-VL backbone")
+        if self.tune_llm or self.tune_visual:
+            raise ValueError("LoRA cannot be combined with full language or visual fine-tuning")
+
+        lora_names = attach_lora_adapters(
+            self.model,
+            r=r,
+            alpha=alpha,
+            dropout=dropout,
+            bias=bias,
+        )
+        self.use_lora = True
+        logger.info(
+            "Attached Qwen3-VL LoRA adapters to language_model and visual "
+            "(r=%d, alpha=%d, dropout=%s, tensors=%d)",
+            r,
+            alpha,
+            dropout,
+            len(lora_names),
+        )
+        return lora_names
+
     def set_frozen_modules_to_eval_mode(self):
         """
         Huggingface will call model.train() at each training_step. To ensure
@@ -277,9 +363,9 @@ class Qwen3Backbone(torch.nn.Module):
         need to call model.eval() for the frozen modules.
         """
         if self.training:
-            if self.model.language_model and not self.tune_llm:
+            if self.model.language_model and not self.tune_llm and not self.use_lora:
                 self.model.language_model.eval()
-            if self.model.visual and not self.tune_visual:
+            if self.model.visual and not self.tune_visual and not self.use_lora:
                 self.model.visual.eval()
 
     def _reset_rotary_inv_freq(self) -> None:

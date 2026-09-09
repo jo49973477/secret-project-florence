@@ -15,7 +15,6 @@
 
 # Finetune config used for single node post-training.
 from dataclasses import dataclass
-from typing import Literal
 import warnings
 
 
@@ -46,7 +45,7 @@ class FinetuneConfig:
     If None, use the pre-registered modality config in `gr00t/configs/data/embodiment_configs.py`. 
     """
 
-    dit_type: Literal["alternate_vl_dit", "multimodal_conditioned_dit", "dit"] = "alternate_vl_dit"
+    dit_type: str = "alternate_vl_dit"
     """Action-head DiT implementation; use multimodal_conditioned_dit for sensor inputs."""
 
     use_point_conditioning: bool = True
@@ -61,9 +60,7 @@ class FinetuneConfig:
     tactile_input_channels: int = 3
     """Number of tactile image input channels."""
 
-    point_encoder_cfg: Literal[
-        "pointnet2", "pointnet", "point_transformer", "pointnet++", "transformer"
-    ] = "pointnet2"
+    point_encoder_cfg: str = "pointnet2"
     """Point encoder backend used by multimodal_conditioned_dit."""
 
     # --- Model Tuning Flags ---
@@ -78,6 +75,21 @@ class FinetuneConfig:
 
     tune_diffusion_model: bool = True
     """If True, fine-tune the diffusion-based action decoder (if present in the model)."""
+
+    use_lora: bool = False
+    """If True, freeze the Qwen3-VL base weights and train LoRA adapters on its linear layers."""
+
+    lora_r: int = 16
+    """Rank of the Qwen3-VL LoRA adapters."""
+
+    lora_alpha: int = 32
+    """LoRA scaling alpha."""
+
+    lora_dropout: float = 0.0
+    """Dropout probability applied on LoRA adapter inputs."""
+
+    lora_bias: str = "none"
+    """PEFT LoRA bias mode. Must remain ``none`` to keep all backbone base weights frozen."""
 
     tune_vlln: bool = True
     """If True, fine-tune the VLM feature normalization/self-attention projection."""
@@ -230,6 +242,26 @@ class FinetuneConfig:
     Useful for CI/testing to skip the slow checkpoint shard loading."""
 
     def __post_init__(self) -> None:
+        if self.use_lora and (self.tune_llm or self.tune_visual):
+            raise ValueError("use_lora cannot be combined with tune_llm or tune_visual")
+        if self.use_lora and (
+            not self.tune_projector or not self.tune_diffusion_model or not self.tune_vlln
+        ):
+            raise ValueError(
+                "use_lora requires tune_projector, tune_diffusion_model, and tune_vlln so "
+                "the complete GR00T action head remains trainable"
+            )
+        if self.lora_r < 1:
+            raise ValueError(f"lora_r must be >= 1, got {self.lora_r}")
+        if self.lora_alpha < 1:
+            raise ValueError(f"lora_alpha must be >= 1, got {self.lora_alpha}")
+        if not 0.0 <= self.lora_dropout < 1.0:
+            raise ValueError(f"lora_dropout must be in [0, 1), got {self.lora_dropout}")
+        if self.lora_bias != "none":
+            raise ValueError(
+                "lora_bias must be 'none': training backbone biases would violate the "
+                "frozen-backbone LoRA strategy"
+            )
         if self.gradient_accumulation_steps < 1:
             raise ValueError(
                 f"gradient_accumulation_steps must be >= 1, got {self.gradient_accumulation_steps}"
