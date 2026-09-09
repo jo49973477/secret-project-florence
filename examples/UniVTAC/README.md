@@ -185,9 +185,6 @@ uv run bash examples/finetune.sh \
 
 The N1.7 action horizon is 40, so a converted episode needs at least 40 aligned rows (`T >= 41`) to contribute a training sample.
 
-<<<<<<< HEAD
-### Experimental tactile + point-cloud conditioning
-=======
 ## Baseline diagnostic evaluation
 
 The diagnostic code is prepared and CPU-tested locally, but loading GR00T checkpoints and running the RGB ablations is intentionally left to the GPU server. After syncing or pulling this repository on the server, first run the smoke configuration on a selected physical GPU:
@@ -235,7 +232,6 @@ diagnostics/
 Interpret these offline diagnostics conservatively. Similar normal, black, and shuffled results suggest that the current policy is weakly dependent on RGB under this offline test; significantly worse ablations indicate that RGB provides predictive information. GR00T performance near persistence suggests that temporal or proprioceptive smoothness may explain much of the score, while a substantial improvement over persistence indicates predictive structure beyond trivial persistence. These tests alone do not establish that RGB is useless or that tactile sensing is necessary.
 
 ## Common failures
->>>>>>> origin/rgbd_test
 
 Select the multimodal dataset config and DiT explicitly. This example freezes the pre-existing VLM, projector/action path, VLM normalization, and base DiT while training only the point/tactile encoders, sensor cross-attention branches, and residual gates:
 
