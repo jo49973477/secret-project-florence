@@ -25,8 +25,8 @@ cd "${REPO_ROOT}"
 # --------------------------
 # User-configurable settings
 # --------------------------
-TRAIN_GPUS="${TRAIN_GPUS:-4,5}"
-EVAL_GPU="${EVAL_GPU:-4}"
+TRAIN_GPUS="${TRAIN_GPUS:-5,6}"
+EVAL_GPU="${EVAL_GPU:-5}"
 NUM_GPUS="${NUM_GPUS:-2}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 
