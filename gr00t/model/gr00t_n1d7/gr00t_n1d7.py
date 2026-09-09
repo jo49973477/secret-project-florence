@@ -735,6 +735,11 @@ class Gr00tN1d7(PreTrainedModel):
             load_bf16=config.load_bf16,
             tune_top_llm_layers=config.tune_top_llm_layers,
             trainable_params_fp32=config.backbone_trainable_params_fp32,
+            use_lora=config.use_lora,
+            lora_r=config.lora_r,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout,
+            lora_bias=config.lora_bias,
             transformers_loading_kwargs=transformers_loading_kwargs,
         )
 
@@ -747,6 +752,28 @@ class Gr00tN1d7(PreTrainedModel):
             model_type=config.backbone_model_type,
             transformers_loading_kwargs=transformers_loading_kwargs,
         )
+
+    def enable_lora(
+        self,
+        *,
+        r: int,
+        alpha: int,
+        dropout: float,
+        bias: str,
+    ) -> list[str]:
+        """Attach backbone-only LoRA after a non-LoRA GR00T checkpoint is loaded."""
+        lora_names = self.backbone.enable_lora(
+            r=r,
+            alpha=alpha,
+            dropout=dropout,
+            bias=bias,
+        )
+        self.config.use_lora = True
+        self.config.lora_r = r
+        self.config.lora_alpha = alpha
+        self.config.lora_dropout = dropout
+        self.config.lora_bias = bias
+        return lora_names
 
     def prepare_input(self, inputs: dict) -> Tuple[BatchFeature, BatchFeature]:
         """Prepare inputs for backbone and action head."""

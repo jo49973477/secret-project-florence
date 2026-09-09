@@ -77,6 +77,11 @@ if __name__ == "__main__":
     # overwrite with finetune config supplied by the user
     config.model.tune_llm = ft_config.tune_llm
     config.model.tune_visual = ft_config.tune_visual
+    config.model.use_lora = ft_config.use_lora
+    config.model.lora_r = ft_config.lora_r
+    config.model.lora_alpha = ft_config.lora_alpha
+    config.model.lora_dropout = ft_config.lora_dropout
+    config.model.lora_bias = ft_config.lora_bias
     config.model.dit_type = ft_config.dit_type
     config.model.use_point_conditioning = ft_config.use_point_conditioning
     config.model.use_tactile_conditioning = ft_config.use_tactile_conditioning
