@@ -17,7 +17,6 @@ from dataclasses import MISSING, asdict, dataclass, field, is_dataclass
 from enum import Enum
 import json
 from pathlib import Path
-from typing import Literal
 
 import torch
 from transformers import PretrainedConfig
@@ -90,14 +89,12 @@ class Gr00tN1d7Config(PretrainedConfig):
     attend_text_every_n_blocks: int = 2
 
     # Optional action-head sensor conditioning.
-    dit_type: Literal["alternate_vl_dit", "multimodal_conditioned_dit", "dit"] = "alternate_vl_dit"
+    dit_type: str = "alternate_vl_dit" # candidates : ["alternate_vl_dit", "multimodal_conditioned_dit", "dit"] 
     use_point_conditioning: bool = True
     use_tactile_conditioning: bool = True
     point_input_dim: int = 3
     tactile_input_channels: int = 3
-    point_encoder_cfg: Literal[
-        "pointnet2", "pointnet", "point_transformer", "pointnet++", "transformer"
-    ] = "pointnet2"
+    point_encoder_cfg: str = "pointnet2" # candidates: ["pointnet2", "pointnet", "point_transformer", "pointnet++", "transformer"]
 
     diffusion_model_cfg: dict = field(
         default_factory=lambda: {
