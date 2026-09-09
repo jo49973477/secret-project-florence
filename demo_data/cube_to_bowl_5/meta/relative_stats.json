@@ -684,5 +684,8 @@
                 1.4495384693145752
             ]
         ]
+    },
+    "__fingerprints__": {
+        "single_arm": "sha256:8c4207deeeedc544cebd201b3d8cdae5e3db979cb468ff7da25671996519caf2"
     }
 }
