@@ -15,10 +15,61 @@
 
 from gr00t.configs.data.embodiment_configs import register_modality_config
 from gr00t.data.embodiment_tags import EmbodimentTag
-from univtac_config_common import build_univtac_config
+from gr00t.data.types import (
+    ActionConfig,
+    ActionFormat,
+    ActionRepresentation,
+    ActionType,
+    ModalityConfig,
+)
 
 
-univtac_config = build_univtac_config(multimodal=False)
+univtac_config = {
+    # ============================================================
+    # 1. RGB observation
+    # ============================================================
+    "video": ModalityConfig(
+        delta_indices=[0],
+        modality_keys=["head", "wrist"],
+    ),
+    # ============================================================
+    # 2. Robot proprioceptive state
+    # ============================================================
+    "state": ModalityConfig(
+        delta_indices=[0],
+        modality_keys=["joint"],
+    ),
+    # ============================================================
+    # 3. Robot action
+    # ============================================================
+    "action": ModalityConfig(
+        # UniVTAC's ACT baseline uses 50, but the N1.7 base model predicts at
+        # most 40 actions and rejects longer modality horizons at startup.
+        delta_indices=list(range(16)),
+        modality_keys=["joint"],
+        action_configs=[
+            ActionConfig(
+                # Dataset stores q_{t+1}, not q_{t+1} - q_t.
+                # GR00T will convert absolute q into relative action internally.
+                rep=ActionRepresentation.RELATIVE,
+                # Joint-space control
+                type=ActionType.NON_EEF,
+                format=ActionFormat.DEFAULT,
+                # Compute relative action against current joint state
+                state_key="joint",
+            ),
+        ],
+    ),
+    # ============================================================
+    # 4. Language instruction
+    # ============================================================
+    "language": ModalityConfig(
+        delta_indices=[0],
+        modality_keys=[
+            "annotation.human.task_description",
+        ],
+    ),
+}
 
 
 register_modality_config(
