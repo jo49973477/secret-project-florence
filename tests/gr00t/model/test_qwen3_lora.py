@@ -3,6 +3,8 @@
 
 """CPU-only tests for backbone-scoped LoRA attachment and checkpoint structure."""
 
+import logging
+
 from gr00t.configs.finetune_config import FinetuneConfig
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
 from gr00t.model.modules.qwen3_backbone import attach_lora_adapters
@@ -18,6 +20,22 @@ class _ToyQwen(nn.Module):
         super().__init__()
         self.language_model = nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 8))
         self.visual = nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 8))
+
+
+class _WrappedToyQwen(nn.Module):
+    """Match Qwen3VLForConditionalGeneration's registered ``model.*`` paths."""
+
+    def __init__(self):
+        super().__init__()
+        self.model = _ToyQwen()
+
+    @property
+    def language_model(self):
+        return self.model.language_model
+
+    @property
+    def visual(self):
+        return self.model.visual
 
 
 class _ToyCategorySpecific(nn.Module):
@@ -87,6 +105,25 @@ def test_lora_targets_language_and_visual_but_not_action_head():
     ]
     assert backbone_base
     assert not any(parameter.requires_grad for parameter in backbone_base)
+
+
+def test_lora_component_validation_accepts_qwen_model_prefix(caplog):
+    model = _WrappedToyQwen()
+
+    with caplog.at_level(logging.INFO):
+        lora_names = attach_lora_adapters(
+            model,
+            r=2,
+            alpha=4,
+            dropout=0.0,
+            bias="none",
+        )
+
+    assert any(name.startswith("model.language_model.") for name in lora_names)
+    assert any(name.startswith("model.visual.") for name in lora_names)
+    assert "LoRA trainable tensors: total=8, language=4, visual=4" in caplog.text
+    assert "model.language_model." in caplog.text
+    assert "model.visual." in caplog.text
 
 
 def test_lora_state_dict_round_trips_with_structure_recreated_first():

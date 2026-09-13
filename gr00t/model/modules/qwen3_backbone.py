@@ -45,6 +45,31 @@ _GATED_BACKBONE_HINT = (
 _GATED_MARKERS = ("gated repo", "is restricted", "access to model", "401 client error")
 
 
+def _find_model_component(model: torch.nn.Module, component_name: str) -> torch.nn.Module:
+    """Find a uniquely named model component without depending on its path prefix."""
+    direct_component = getattr(model, component_name, None)
+    if isinstance(direct_component, torch.nn.Module):
+        return direct_component
+
+    matches: dict[int, tuple[str, torch.nn.Module]] = {}
+    for name, module in model.named_modules():
+        if name.rsplit(".", 1)[-1] == component_name:
+            matches[id(module)] = (name, module)
+
+    if len(matches) != 1:
+        paths = [name for name, _module in matches.values()]
+        raise RuntimeError(
+            f"Expected exactly one Qwen3-VL {component_name!r} module, found "
+            f"{len(matches)} at paths {paths}"
+        )
+    return next(iter(matches.values()))[1]
+
+
+def _is_lora_parameter_name(name: str) -> bool:
+    """Return whether a PEFT parameter path contains a LoRA-owned path component."""
+    return any(component.startswith("lora_") for component in name.split("."))
+
+
 def attach_lora_adapters(
     model: torch.nn.Module,
     *,
@@ -64,6 +89,14 @@ def attach_lora_adapters(
     if bias != "none":
         raise ValueError("LoRA bias must be 'none' so all original Qwen3-VL parameters stay frozen")
 
+    # Resolve the semantic component objects before PEFT rewrites their linear
+    # children. Qwen3VLForConditionalGeneration registers them below ``model``
+    # (and PEFT wrappers may add more prefixes), so parameter-name prefixes are
+    # not a reliable ownership test.
+    language_model = _find_model_component(model, "language_model")
+    visual = _find_model_component(model, "visual")
+    base_parameter_ids = {id(parameter) for parameter in model.parameters()}
+
     lora_config = LoraConfig(
         r=r,
         lora_alpha=alpha,
@@ -73,17 +106,47 @@ def attach_lora_adapters(
     )
     inject_adapter_in_model(lora_config, model)
 
-    lora_names = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
-    if not lora_names:
+    trainable_parameters = [
+        (name, parameter) for name, parameter in model.named_parameters() if parameter.requires_grad
+    ]
+    if not trainable_parameters:
         raise RuntimeError("LoRA is enabled but PEFT created no trainable adapter parameters")
-    if any("lora_" not in name for name in lora_names):
+
+    trainable_base_names = [
+        name for name, parameter in trainable_parameters if id(parameter) in base_parameter_ids
+    ]
+    if trainable_base_names:
         raise RuntimeError(
-            "LoRA injection left non-adapter Qwen3-VL parameters trainable; "
-            "the backbone base weights must remain frozen"
+            "LoRA injection left original Qwen3-VL base parameters trainable; "
+            f"the backbone base weights must remain frozen (examples: {trainable_base_names[:5]})"
         )
 
-    language_lora = [name for name in lora_names if name.startswith("language_model.")]
-    visual_lora = [name for name in lora_names if name.startswith("visual.")]
+    non_lora_names = [
+        name for name, _parameter in trainable_parameters if not _is_lora_parameter_name(name)
+    ]
+    if non_lora_names:
+        raise RuntimeError(
+            "LoRA injection left non-adapter Qwen3-VL parameters trainable; "
+            f"the backbone base weights must remain frozen (examples: {non_lora_names[:5]})"
+        )
+
+    language_parameter_ids = {id(parameter) for parameter in language_model.parameters()}
+    visual_parameter_ids = {id(parameter) for parameter in visual.parameters()}
+    lora_names = [name for name, _parameter in trainable_parameters]
+    language_lora = [
+        name for name, parameter in trainable_parameters if id(parameter) in language_parameter_ids
+    ]
+    visual_lora = [
+        name for name, parameter in trainable_parameters if id(parameter) in visual_parameter_ids
+    ]
+    representative_lora = language_lora[:2] + visual_lora[:2]
+    logger.info(
+        "Qwen3-VL LoRA trainable tensors: total=%d, language=%d, visual=%d; examples=%s",
+        len(lora_names),
+        len(language_lora),
+        len(visual_lora),
+        representative_lora,
+    )
     if not language_lora or not visual_lora:
         raise RuntimeError(
             "LoRA must target both Qwen3-VL language_model and visual linear layers; "
