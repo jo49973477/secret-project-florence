@@ -19,6 +19,7 @@
 import json
 import os
 from pathlib import Path
+import sys
 
 import tyro
 
@@ -46,7 +47,17 @@ if __name__ == "__main__":
     if "LOGURU_LEVEL" not in os.environ:
         os.environ["LOGURU_LEVEL"] = "INFO"
     # Use tyro for clean CLI
-    ft_config = tyro.cli(FinetuneConfig, description=__doc__)
+    # ``bool | str`` lets callers select either the latest checkpoint or an
+    # explicit path. Preserve the legacy bare boolean flag by supplying the
+    # value Tyro requires for union-typed options.
+    cli_args = list(sys.argv[1:])
+    for index, arg in enumerate(cli_args):
+        if arg in {"--resume-from-checkpoint", "--resume_from_checkpoint"} and (
+            index + 1 == len(cli_args) or cli_args[index + 1].startswith("--")
+        ):
+            cli_args.insert(index + 1, "True")
+            break
+    ft_config = tyro.cli(FinetuneConfig, description=__doc__, args=cli_args)
     from gr00t.data.embodiment_tags import EmbodimentTag
 
     ft_config.embodiment_tag = EmbodimentTag.resolve(ft_config.embodiment_tag)

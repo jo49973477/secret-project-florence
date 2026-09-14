@@ -3,6 +3,8 @@ set -Eeuo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
+# shellcheck source=scripts/lib/checkpoint_resume.sh
+source "${REPO_ROOT}/scripts/lib/checkpoint_resume.sh"
 
 # ============================================================
 # GPU
@@ -27,7 +29,7 @@ MODALITY_CONFIG="${MODALITY_CONFIG:-examples/UniVTAC/univtac_multimodal_config.p
 # ============================================================
 
 MAX_STEPS="${MAX_STEPS:-5000}"
-SAVE_STEPS="${SAVE_STEPS:-1000}"
+SAVE_STEPS="${SAVE_STEPS:-100}"
 
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-2}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-16}"
@@ -42,6 +44,7 @@ EPISODE_SAMPLING_RATE="${EPISODE_SAMPLING_RATE:-1.0}"
 
 RUN_NAME="${RUN_NAME:-univtac_full_multimodal_$(date +%Y%m%d_%H%M%S)}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/${RUN_NAME}}"
+checkpoint_resume_configure "${OUTPUT_DIR}" 5
 
 # ============================================================
 # Environment
@@ -97,6 +100,7 @@ echo "Global batch        : ${GLOBAL_BATCH_SIZE}"
 echo "Grad accumulation   : ${GRAD_ACCUM_STEPS}"
 echo "Effective batch     : ${EFFECTIVE_BATCH}"
 echo "Episode sampling    : ${EPISODE_SAMPLING_RATE}"
+checkpoint_resume_print_status "${OUTPUT_DIR}"
 echo
 echo "Modalities:"
 echo "  RGB          : ON"
@@ -128,6 +132,7 @@ TRAIN_ARGS=(
 
     --max-steps "${MAX_STEPS}"
     --save-steps "${SAVE_STEPS}"
+    --save-total-limit "${SAVE_TOTAL_LIMIT}"
 
     --global-batch-size "${GLOBAL_BATCH_SIZE}"
     --gradient-accumulation-steps "${GRAD_ACCUM_STEPS}"
@@ -157,7 +162,8 @@ TRAIN_ARGS=(
     --tune-tactile-encoder
     --tune-multimodal-adapter
 
-    --save-only-model
+    "${CHECKPOINT_SAVE_ARGS[@]}"
+    "${CHECKPOINT_RESUME_ARGS[@]}"
 )
 
 CUDA_VISIBLE_DEVICES="${TRAIN_GPUS}" \

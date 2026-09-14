@@ -14,6 +14,8 @@ set -Eeuo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
+# shellcheck source=scripts/lib/checkpoint_resume.sh
+source "${REPO_ROOT}/scripts/lib/checkpoint_resume.sh"
 
 # --------------------------
 # User-configurable settings
@@ -35,7 +37,7 @@ MODALITY_CONFIG="${MODALITY_CONFIG:-examples/UniVTAC/univtac_config.py}"
 
 # Intentionally short/aggressive memorization run.
 MAX_STEPS="${MAX_STEPS:-1000}"
-SAVE_STEPS="${SAVE_STEPS:-250}"
+SAVE_STEPS="${SAVE_STEPS:-100}"
 
 # 2 GPUs => one sample/GPU at global batch 2.
 # Accumulation is deliberately 1 for a memorization test.
@@ -67,6 +69,13 @@ EVAL_TRAJ_IDS=(0 1 2 3 4)
 
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/univtac_overfit5_lora_$(date +%Y%m%d_%H%M%S)}"
 LOG_DIR="${OUTPUT_DIR}/logs"
+
+if [[ ! "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]] || [[ ! "${SAVE_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[ERROR] MAX_STEPS and SAVE_STEPS must be positive integers." >&2
+    exit 1
+fi
+ALL_CHECKPOINTS_LIMIT=$(((MAX_STEPS + SAVE_STEPS - 1) / SAVE_STEPS))
+checkpoint_resume_configure "${OUTPUT_DIR}" "${ALL_CHECKPOINTS_LIMIT}"
 
 # ============================================================
 # Basic checks
@@ -249,7 +258,6 @@ if [[ "${USE_WANDB}" == "1" ]]; then
     WANDB_ARG="--use-wandb"
 fi
 
-SAVE_TOTAL_LIMIT=$(((MAX_STEPS + SAVE_STEPS - 1) / SAVE_STEPS))
 EFFECTIVE_BATCH=$((GLOBAL_BATCH_SIZE * GRAD_ACCUM_STEPS))
 
 echo
@@ -268,6 +276,7 @@ echo "Warmup                 : ${WARMUP_RATIO}"
 echo "Weight decay           : ${WEIGHT_DECAY}"
 echo "State dropout          : ${STATE_DROPOUT_PROB}"
 echo "LoRA r / alpha         : ${LORA_R} / ${LORA_ALPHA}"
+checkpoint_resume_print_status "${OUTPUT_DIR}"
 echo
 echo "TRAIN:"
 echo "  Qwen base weights    : FROZEN"
@@ -324,7 +333,8 @@ TRAIN_ARGS=(
     --no-tune-tactile-encoder
     --no-tune-multimodal-adapter
 
-    --save-only-model
+    "${CHECKPOINT_SAVE_ARGS[@]}"
+    "${CHECKPOINT_RESUME_ARGS[@]}"
     "${WANDB_ARG}"
 )
 

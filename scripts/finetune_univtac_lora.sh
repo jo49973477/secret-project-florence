@@ -3,6 +3,8 @@ set -Eeuo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
+# shellcheck source=scripts/lib/checkpoint_resume.sh
+source "${REPO_ROOT}/scripts/lib/checkpoint_resume.sh"
 
 TRAIN_GPUS="${TRAIN_GPUS:-2,3}"
 EVAL_GPU="${EVAL_GPU:-2}"
@@ -14,7 +16,7 @@ DATASET_PATH="${DATASET_PATH:-/ssdg/spl_yeongyoo/univtac_gr00t}"
 MODALITY_CONFIG="${MODALITY_CONFIG:-examples/UniVTAC/univtac_config.py}"
 
 MAX_STEPS="${MAX_STEPS:-5000}"
-SAVE_STEPS="${SAVE_STEPS:-1000}"
+SAVE_STEPS="${SAVE_STEPS:-100}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-2}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-16}"
 LR="${LR:-1e-4}"
@@ -40,7 +42,6 @@ EVAL_TRAJ_IDS=(0 1 2 3 4)
 
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/univtac_lora_$(date +%Y%m%d_%H%M%S)}"
 LOG_DIR="${OUTPUT_DIR}/logs"
-SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-}"
 
 if [[ ! "${NUM_GPUS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "[ERROR] NUM_GPUS must be a positive integer, got: ${NUM_GPUS}" >&2
@@ -50,9 +51,8 @@ if [[ ! "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]] || [[ ! "${SAVE_STEPS}" =~ ^[1-9][0-9
     echo "[ERROR] MAX_STEPS and SAVE_STEPS must be positive integers." >&2
     exit 1
 fi
-if [[ -z "${SAVE_TOTAL_LIMIT}" ]]; then
-    SAVE_TOTAL_LIMIT=$(((MAX_STEPS + SAVE_STEPS - 1) / SAVE_STEPS))
-fi
+ALL_CHECKPOINTS_LIMIT=$(((MAX_STEPS + SAVE_STEPS - 1) / SAVE_STEPS))
+checkpoint_resume_configure "${OUTPUT_DIR}" "${ALL_CHECKPOINTS_LIMIT}"
 if [[ ! -d "${DATASET_PATH}" ]]; then
     echo "[ERROR] Dataset not found: ${DATASET_PATH}" >&2
     exit 1
@@ -93,6 +93,7 @@ echo "Max steps                : ${MAX_STEPS}"
 echo "Output directory         : ${OUTPUT_DIR}"
 echo "Percentile normalization : enabled"
 echo "Run evaluation           : ${RUN_EVAL}"
+checkpoint_resume_print_status "${OUTPUT_DIR}"
 echo "============================================================"
 
 TRAIN_ARGS=(
@@ -132,6 +133,8 @@ TRAIN_ARGS=(
     --no-tune-point-encoder
     --no-tune-tactile-encoder
     --no-tune-multimodal-adapter
+    "${CHECKPOINT_SAVE_ARGS[@]}"
+    "${CHECKPOINT_RESUME_ARGS[@]}"
     "${WANDB_ARG}"
 )
 

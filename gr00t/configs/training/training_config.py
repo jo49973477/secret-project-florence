@@ -65,15 +65,15 @@ class TrainingConfig:
 
     # Logging and saving
     logging_steps: int = 10
-    save_steps: int = 1000
+    save_steps: int = 100
     save_total_limit: int = 5
 
     # Model saving
     save_vl_model: bool = False  # Control whether to save VL model and processor in callbacks
     save_only_model: bool = False  # Skip optimizer/scheduler/RNG states — cannot resume training
 
-    # Default False so a rerun against an existing output_dir starts fresh.
-    resume_from_checkpoint: bool = False
+    # True selects the latest checkpoint; a string selects an explicit path.
+    resume_from_checkpoint: bool | str = False
 
     # Checkpoint uploading
     upload_checkpoints: bool = False
@@ -163,7 +163,7 @@ class TrainingConfig:
 
 
 def check_resume_compatibility(training: TrainingConfig) -> None:
-    """Reject ``save_only_model=True`` + ``resume_from_checkpoint=True``.
+    """Reject ``save_only_model=True`` with any requested resume.
 
     HF Trainer would otherwise restore ``global_step`` from
     ``trainer_state.json`` and silently re-init optimizer / LR schedule.

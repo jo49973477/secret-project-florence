@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/checkpoint_resume.sh
+source "${SCRIPT_DIR}/lib/checkpoint_resume.sh"
+
 # ============================================================
 # User config
 # ============================================================
@@ -46,7 +50,7 @@ EXECUTION_HORIZON="${EXECUTION_HORIZON:-16}"
 # ------------------------------------------------------------
 
 MAX_STEPS="${MAX_STEPS:-5000}"
-SAVE_STEPS="${SAVE_STEPS:-1000}"
+SAVE_STEPS="${SAVE_STEPS:-100}"
 
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-2}"
 
@@ -59,8 +63,15 @@ DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-0}"
 STATE_DROPOUT_PROB="${STATE_DROPOUT_PROB:-0.0}"
 
 RUN_NAME="${RUN_NAME:-univtac_rgb_joint_h16_$(date +%Y%m%d_%H%M%S)}"
-OUTPUT_DIR="outputs/${RUN_NAME}"
+OUTPUT_DIR="${OUTPUT_DIR:-outputs/${RUN_NAME}}"
 LOG_DIR="${OUTPUT_DIR}/logs"
+
+if [[ ! "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]] || [[ ! "${SAVE_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[ERROR] MAX_STEPS and SAVE_STEPS must be positive integers." >&2
+    exit 1
+fi
+ALL_CHECKPOINTS_LIMIT=$(((MAX_STEPS + SAVE_STEPS - 1) / SAVE_STEPS))
+checkpoint_resume_configure "${OUTPUT_DIR}" "${ALL_CHECKPOINTS_LIMIT}"
 
 
 # ============================================================
@@ -129,6 +140,7 @@ echo "Gradient accumulation  : ${GRAD_ACCUM_STEPS}"
 echo "Effective batch        : ${EFFECTIVE_BATCH_SIZE}"
 echo "State dropout          : ${STATE_DROPOUT_PROB}"
 echo "Execution horizon      : ${EXECUTION_HORIZON}"
+checkpoint_resume_print_status "${OUTPUT_DIR}"
 echo "============================================================"
 
 
@@ -144,7 +156,6 @@ uv run bash examples/finetune.sh \
     --embodiment-tag NEW_EMBODIMENT \
     --modality-config-path "${MODALITY_CONFIG}" \
     --output-dir "${OUTPUT_DIR}" \
-    --save-only-model \
     --state-dropout-prob "${STATE_DROPOUT_PROB}" \
     -- \
     --gradient-accumulation-steps "${GRAD_ACCUM_STEPS}" \
@@ -160,7 +171,7 @@ RESULT_CSV="${LOG_DIR}/metrics.csv"
 echo "step,mse,mae" > "${RESULT_CSV}"
 
 # SAVE_STEPS마다 checkpoint 평가:
-# default = 1000 2000 3000 4000 5000
+# default = 100 200 300 ... 5000
 CHECKPOINTS=()
 
 STEP="${SAVE_STEPS}"

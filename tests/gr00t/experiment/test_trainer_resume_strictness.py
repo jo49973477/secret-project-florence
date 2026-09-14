@@ -114,3 +114,21 @@ def test_raises_when_resume_true_and_only_non_checkpoint_subdirs(tmp_path):
     trainer = _make_trainer(tmp_path)
     with pytest.raises(ValueError, match="No valid checkpoint found"):
         trainer.train(resume_from_checkpoint=True)
+
+
+def test_explicit_save_only_checkpoint_is_rejected(tmp_path):
+    checkpoint = tmp_path / "checkpoint-700"
+    checkpoint.mkdir()
+    (checkpoint / "trainer_state.json").write_text("{}")
+
+    with pytest.raises(ValueError, match="optimizer state, scheduler state, RNG state"):
+        Gr00tTrainer._validate_resumable_checkpoint(checkpoint)
+
+
+def test_explicit_full_checkpoint_is_accepted(tmp_path):
+    checkpoint = tmp_path / "checkpoint-700"
+    checkpoint.mkdir()
+    for filename in ("trainer_state.json", "optimizer.pt", "scheduler.pt", "rng_state.pth"):
+        (checkpoint / filename).touch()
+
+    Gr00tTrainer._validate_resumable_checkpoint(checkpoint)

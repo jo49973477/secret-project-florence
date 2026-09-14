@@ -189,7 +189,7 @@ class FinetuneConfig:
     wandb_project: str = "finetune-gr00t-n1d7"
     """W&B project name to log runs to."""
 
-    save_steps: int = 1000
+    save_steps: int = 100
     """Frequency (in training steps) at which to save checkpoints."""
 
     save_total_limit: int = 5
@@ -230,11 +230,12 @@ class FinetuneConfig:
     save_only_model: bool = False
     """If True, save only model weights (skip optimizer/scheduler/RNG states). Cannot resume training from these checkpoints."""
 
-    resume_from_checkpoint: bool = False
-    """If True, resume from the latest ``checkpoint-*`` in ``output_dir``. Default
-    False so a rerun against an existing ``output_dir`` starts fresh instead of
-    silently merging with a previous experiment. Incompatible with
-    ``save_only_model=True`` (enforced by ``experiment.run``)."""
+    resume_from_checkpoint: bool | str = False
+    """If True, resume from the latest ``checkpoint-*`` in ``output_dir``. A
+    string selects an explicit checkpoint directory. Default False so a rerun
+    against an existing ``output_dir`` starts fresh instead of silently merging
+    with a previous experiment. Incompatible with ``save_only_model=True``
+    (enforced by ``experiment.run``)."""
 
     skip_weight_loading: bool = False
     """If True, skip loading model weights from base_model_path (architecture only).

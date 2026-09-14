@@ -30,6 +30,8 @@ set -Eeuo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "${REPO_ROOT}"
+# shellcheck source=scripts/lib/checkpoint_resume.sh
+source "${REPO_ROOT}/scripts/lib/checkpoint_resume.sh"
 
 MODE="${MODE:-official}"
 
@@ -43,7 +45,7 @@ DATASET_PATH="${DATASET_PATH:-demo_data/cube_to_bowl_5}"
 MODALITY_CONFIG="${MODALITY_CONFIG:-examples/SO100/so100_config.py}"
 
 MAX_STEPS="${MAX_STEPS:-2000}"
-SAVE_STEPS="${SAVE_STEPS:-500}"
+SAVE_STEPS="${SAVE_STEPS:-100}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-0}"
 
 # Dataset loader knobs. Keep all five episodes available.
@@ -104,6 +106,13 @@ RUN_NAME="${RUN_NAME:-so100_5eps_${MODE}_$(date +%Y%m%d_%H%M%S)}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/${RUN_NAME}}"
 LOG_DIR="${OUTPUT_DIR}/logs"
 PLOT_DIR="${LOG_DIR}/plots"
+
+if [[ ! "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]] || [[ ! "${SAVE_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[ERROR] MAX_STEPS and SAVE_STEPS must be positive integers." >&2
+    exit 1
+fi
+ALL_CHECKPOINTS_LIMIT=$(((MAX_STEPS + SAVE_STEPS - 1) / SAVE_STEPS))
+checkpoint_resume_configure "${OUTPUT_DIR}" "${ALL_CHECKPOINTS_LIMIT}"
 
 # ------------------------------------------------------------
 # Safety checks
@@ -167,6 +176,7 @@ echo "Weight decay              : ${WEIGHT_DECAY}"
 echo "Warmup ratio              : ${WARMUP_RATIO}"
 echo "Color jitter              : ${CJ_BRIGHTNESS}/${CJ_CONTRAST}/${CJ_SATURATION}/${CJ_HUE}"
 echo "Use percentiles           : ${USE_PERCENTILES}"
+checkpoint_resume_print_status "${OUTPUT_DIR}"
 echo "============================================================"
 
 TRAIN_LOG="${LOG_DIR}/train.log"
@@ -187,7 +197,7 @@ if [[ "${NUM_GPUS}" -eq 1 ]]; then
         --num-gpus 1 \
         --output-dir "${OUTPUT_DIR}" \
         --save-steps "${SAVE_STEPS}" \
-        --save-total-limit 10 \
+        --save-total-limit "${SAVE_TOTAL_LIMIT}" \
         --max-steps "${MAX_STEPS}" \
         --learning-rate "${LR}" \
         --weight-decay "${WEIGHT_DECAY}" \
@@ -206,7 +216,8 @@ if [[ "${NUM_GPUS}" -eq 1 ]]; then
             saturation "${CJ_SATURATION}" \
             hue "${CJ_HUE}" \
         "${PERCENTILE_ARG[@]}" \
-        --save-only-model \
+        "${CHECKPOINT_SAVE_ARGS[@]}" \
+        "${CHECKPOINT_RESUME_ARGS[@]}" \
         2>&1 | tee "${TRAIN_LOG}"
 else
     CUDA_VISIBLE_DEVICES="${TRAIN_GPUS}" \
@@ -221,7 +232,7 @@ else
         --num-gpus "${NUM_GPUS}" \
         --output-dir "${OUTPUT_DIR}" \
         --save-steps "${SAVE_STEPS}" \
-        --save-total-limit 10 \
+        --save-total-limit "${SAVE_TOTAL_LIMIT}" \
         --max-steps "${MAX_STEPS}" \
         --learning-rate "${LR}" \
         --weight-decay "${WEIGHT_DECAY}" \
@@ -240,7 +251,8 @@ else
             saturation "${CJ_SATURATION}" \
             hue "${CJ_HUE}" \
         "${PERCENTILE_ARG[@]}" \
-        --save-only-model \
+        "${CHECKPOINT_SAVE_ARGS[@]}" \
+        "${CHECKPOINT_RESUME_ARGS[@]}" \
         2>&1 | tee "${TRAIN_LOG}"
 fi
 

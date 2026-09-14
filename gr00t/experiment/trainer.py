@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 import queue
 import threading
 from typing import Any, Optional
@@ -239,6 +240,7 @@ class Gr00tTrainer(Trainer):
             latest_checkpoint = resume_from_checkpoint  # caller passed an explicit path
 
         if latest_checkpoint is not None:
+            self._validate_resumable_checkpoint(latest_checkpoint)
             logging.info(f"Resuming from checkpoint {latest_checkpoint}")
             # In case of repeating the find_executable_batch_size, set `self._train_batch_size` properly
             self.state = TrainerState.load_from_json(
@@ -246,6 +248,39 @@ class Gr00tTrainer(Trainer):
             )
 
         return super().train(resume_from_checkpoint=latest_checkpoint, **kwargs)
+
+    @staticmethod
+    def _validate_resumable_checkpoint(checkpoint: str | os.PathLike[str]) -> None:
+        """Reject partial/save-only checkpoints before HF silently reinitializes state."""
+        checkpoint_path = Path(checkpoint)
+        if not checkpoint_path.is_dir():
+            raise ValueError(f"Checkpoint directory does not exist: {checkpoint_path}")
+
+        required_root_files = {
+            "trainer state": checkpoint_path / TRAINER_STATE_NAME,
+        }
+        missing = [name for name, path in required_root_files.items() if not path.is_file()]
+
+        has_optimizer = (checkpoint_path / "optimizer.pt").is_file() or any(
+            checkpoint_path.rglob("*optim_states.pt")
+        )
+        has_scheduler = (checkpoint_path / "scheduler.pt").is_file() or any(
+            checkpoint_path.rglob("*model_states.pt")
+        )
+        has_rng = any(checkpoint_path.glob("rng_state*.pth"))
+
+        if not has_optimizer:
+            missing.append("optimizer state")
+        if not has_scheduler:
+            missing.append("scheduler state")
+        if not has_rng:
+            missing.append("RNG state")
+
+        if missing:
+            raise ValueError(
+                f"Checkpoint {checkpoint_path} is not resumable; missing "
+                f"{', '.join(missing)}. Save checkpoints with save_only_model=False."
+            )
 
     # ------------------------------------------------------------------
     # Loss / accuracy computation override

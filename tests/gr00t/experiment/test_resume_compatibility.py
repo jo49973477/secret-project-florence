@@ -29,12 +29,22 @@ def test_raises_on_save_only_model_and_resume():
         check_resume_compatibility(training)
 
 
+def test_raises_on_save_only_model_and_explicit_resume_path():
+    training = TrainingConfig(
+        save_only_model=True,
+        resume_from_checkpoint="outputs/run/checkpoint-700",
+    )
+    with pytest.raises(ValueError, match="save_only_model=True is incompatible"):
+        check_resume_compatibility(training)
+
+
 @pytest.mark.parametrize(
     ("save_only_model", "resume_from_checkpoint"),
     [
         (False, False),
         (True, False),
         (False, True),
+        (False, "outputs/run/checkpoint-700"),
     ],
 )
 def test_compatible_combinations_pass(save_only_model, resume_from_checkpoint):

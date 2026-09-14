@@ -2,9 +2,17 @@
 
 set -x -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../scripts/lib/checkpoint_resume.sh
+source "${SCRIPT_DIR}/../scripts/lib/checkpoint_resume.sh"
+
 NUM_GPUS="${NUM_GPUS:-1}"
 MASTER_PORT="${MASTER_PORT:-29500}"
-SAVE_STEPS="${SAVE_STEPS:-1000}"
+SAVE_STEPS="${SAVE_STEPS:-100}"
+SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-5}"
+RESUME="${RESUME:-0}"
+RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
+SAVE_ONLY_MODEL="${SAVE_ONLY_MODEL:-0}"
 MAX_STEPS="${MAX_STEPS:-10000}"
 USE_WANDB="${USE_WANDB:-1}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"
@@ -43,7 +51,7 @@ Usage: bash examples/finetune.sh \
   [--crop-fraction <fraction>] \
   [--ds-weights-alpha <value>] \
   [--save-only-model] \
-  [--resume-from-checkpoint] \
+  [--resume-from-checkpoint [checkpoint-path]] \
   [-- <extra launch_finetune.py args>...]
 EOF
 }
@@ -107,8 +115,13 @@ while [ "$#" -gt 0 ]; do
             shift
             ;;
         --resume-from-checkpoint)
-            RESUME_FROM_CHECKPOINT=1
-            shift
+            if [[ "$#" -gt 1 && "$2" != --* ]]; then
+                RESUME_FROM_CHECKPOINT="$2"
+                shift 2
+            else
+                RESUME=1
+                shift
+            fi
             ;;
         --help|-h)
             usage
@@ -135,6 +148,8 @@ for required_var in BASE_MODEL_PATH DATASET_PATH EMBODIMENT_TAG OUTPUT_DIR; do
     fi
 done
 
+checkpoint_resume_configure "${OUTPUT_DIR}" 5
+
 WANDB_FLAG=()
 if [ "$USE_WANDB" = "1" ]; then
     WANDB_FLAG+=(--use_wandb)
@@ -148,7 +163,7 @@ LAUNCH_CMD=(
     --num_gpus "$NUM_GPUS"
     --output_dir "$OUTPUT_DIR"
     --save_steps "$SAVE_STEPS"
-    --save_total_limit 5
+    --save_total_limit "$SAVE_TOTAL_LIMIT"
     --max_steps "$MAX_STEPS"
     --warmup_ratio 0.05
     --weight_decay 1e-5
@@ -202,16 +217,14 @@ fi
 if [ -n "$DS_WEIGHTS_ALPHA" ]; then
     LAUNCH_CMD+=(--ds_weights_alpha "$DS_WEIGHTS_ALPHA")
 fi
-if [ -n "${SAVE_ONLY_MODEL:-}" ]; then
-    LAUNCH_CMD+=(--save_only_model)
-fi
-if [ -n "${RESUME_FROM_CHECKPOINT:-}" ]; then
-    LAUNCH_CMD+=(--resume_from_checkpoint)
-fi
+LAUNCH_CMD+=("${CHECKPOINT_SAVE_ARGS[@]}")
+LAUNCH_CMD+=("${CHECKPOINT_RESUME_ARGS[@]}")
 
 if [ "${#EXTRA_ARGS[@]}" -gt 0 ]; then
     LAUNCH_CMD+=("${EXTRA_ARGS[@]}")
 fi
+
+checkpoint_resume_print_status "${OUTPUT_DIR}"
 
 if [ "$NUM_GPUS" = "1" ]; then
     # Restrict to a single GPU so HF Trainer doesn't wrap the model in DataParallel,

@@ -21,6 +21,8 @@ set -Eeuo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "${REPO_ROOT}"
+# shellcheck source=scripts/lib/checkpoint_resume.sh
+source "${REPO_ROOT}/scripts/lib/checkpoint_resume.sh"
 
 # --------------------------
 # User-configurable settings
@@ -42,7 +44,7 @@ OVERFIT_DATASET="${OVERFIT_DATASET:-/ssdg/spl_yeongyoo/univtac_gr00t_overfit5}"
 MODALITY_CONFIG="${MODALITY_CONFIG:-examples/UniVTAC/univtac_config.py}"
 
 MAX_STEPS="${MAX_STEPS:-5000}"
-SAVE_STEPS="${SAVE_STEPS:-1000}"
+SAVE_STEPS="${SAVE_STEPS:-100}"
 
 # Two 3090s -> global batch 2 means roughly 1 sample/GPU.
 # For memorization, do NOT use the previous grad accumulation = 16.
@@ -68,6 +70,13 @@ EVAL_TRAJ_IDS=(0 1 2 3 4)
 RUN_NAME="${RUN_NAME:-univtac_overfit5_$(date +%Y%m%d_%H%M%S)}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/${RUN_NAME}}"
 LOG_DIR="${OUTPUT_DIR}/logs"
+
+if [[ ! "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]] || [[ ! "${SAVE_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[ERROR] MAX_STEPS and SAVE_STEPS must be positive integers." >&2
+    exit 1
+fi
+ALL_CHECKPOINTS_LIMIT=$(((MAX_STEPS + SAVE_STEPS - 1) / SAVE_STEPS))
+checkpoint_resume_configure "${OUTPUT_DIR}" "${ALL_CHECKPOINTS_LIMIT}"
 
 # Rebuild the tiny metadata/symlink dataset each run by default.
 REBUILD_SUBSET="${REBUILD_SUBSET:-1}"
@@ -270,6 +279,7 @@ echo "Color jitter             : all zeros"
 echo "Use percentiles          : false (full min/max)"
 echo "Trainable by default     : projector + diffusion/action model"
 echo "Frozen by default        : LLM + visual backbone"
+checkpoint_resume_print_status "${OUTPUT_DIR}"
 echo "============================================================"
 
 TRAIN_LOG="${LOG_DIR}/train.log"
@@ -285,7 +295,7 @@ uv run torchrun \
     --num_gpus "${NUM_GPUS}" \
     --output_dir "${OUTPUT_DIR}" \
     --save_steps "${SAVE_STEPS}" \
-    --save_total_limit 5 \
+    --save_total_limit "${SAVE_TOTAL_LIMIT}" \
     --max_steps "${MAX_STEPS}" \
     --warmup_ratio "${WARMUP_RATIO}" \
     --weight_decay "${WEIGHT_DECAY}" \
@@ -304,7 +314,8 @@ uv run torchrun \
         saturation 0.0 \
         hue 0.0 \
     --no-use-percentiles \
-    --save_only_model \
+    "${CHECKPOINT_SAVE_ARGS[@]}" \
+    "${CHECKPOINT_RESUME_ARGS[@]}" \
     2>&1 | tee "${TRAIN_LOG}"
 
 # ============================================================
