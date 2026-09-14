@@ -20,9 +20,7 @@ BASE_MODEL="${BASE_MODEL:-nvidia/GR00T-N1.7-3B}"
 
 DATASET_PATH="${DATASET_PATH:-/ssdg/spl_yeongyoo/univtac_full}"
 
-MODALITY_CONFIG="${
-    MODALITY_CONFIG:-examples/UniVTAC/univtac_multimodal_config.py
-}"
+MODALITY_CONFIG="${MODALITY_CONFIG:-examples/UniVTAC/univtac_multimodal_config.py}"
 
 # ============================================================
 # Training
