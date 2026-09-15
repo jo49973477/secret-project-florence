@@ -51,7 +51,7 @@ def _make_trainer(tmp_path, model=None):
         report_to="none",
     )
     return Gr00tTrainer(
-        model=model or _ToySplitModel(),
+        model=_ToySplitModel() if model is None else model,
         args=args,
         vlm_learning_rate=1e-4,
         action_head_learning_rate=1e-3,
@@ -125,10 +125,32 @@ def test_split_optimizer_preserves_hf_weight_decay_and_scheduler_lr_ratio(tmp_pa
     assert max(scheduled_lrs) / min(scheduled_lrs) == pytest.approx(10.0)
 
 
+def test_split_optimizer_allows_an_empty_vlm_group(tmp_path):
+    model = _ToySplitModel()
+    model.config.use_lora = False
+    model.backbone.requires_grad_(False)
+    trainer = _make_trainer(tmp_path, model=model)
+
+    optimizer = trainer.create_optimizer()
+
+    assert {group["lr"] for group in optimizer.param_groups} == {1e-3}
+    assert {
+        id(parameter) for group in optimizer.param_groups for parameter in group["params"]
+    } == {
+        id(parameter)
+        for parameter in model.action_head.parameters()
+        if parameter.requires_grad
+    }
+
+
 def test_split_optimizer_state_loads_with_deterministic_parameter_groups(tmp_path):
     first = _make_trainer(tmp_path / "first")
     first_optimizer = first.create_optimizer()
-    loss = sum(parameter.square().sum() for parameter in first.model.parameters() if parameter.requires_grad)
+    loss = sum(
+        parameter.square().sum()
+        for parameter in first.model.parameters()
+        if parameter.requires_grad
+    )
     loss.backward()
     first_optimizer.step()
     state_dict = first_optimizer.state_dict()
@@ -151,6 +173,15 @@ def test_split_optimizer_rejects_unclassified_trainable_parameters(tmp_path):
     trainer = _make_trainer(tmp_path, model=model)
 
     with pytest.raises(RuntimeError, match="unclassified=.*unowned"):
+        trainer.create_optimizer()
+
+
+def test_split_optimizer_rejects_trainable_backbone_base_weight_in_lora_mode(tmp_path):
+    model = _ToySplitModel()
+    model.backbone.base.weight.requires_grad_(True)
+    trainer = _make_trainer(tmp_path, model=model)
+
+    with pytest.raises(RuntimeError, match="trainable non-LoRA backbone parameters"):
         trainer.create_optimizer()
 
 

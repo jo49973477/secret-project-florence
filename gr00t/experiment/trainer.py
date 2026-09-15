@@ -239,7 +239,10 @@ class Gr00tTrainer(Trainer):
         names_by_id = {id(parameter): name for name, parameter in named_parameters}
 
         def parameter_names(parameter_ids: set[int]) -> list[str]:
-            return [names_by_id.get(parameter_id, f"<unknown:{parameter_id}>") for parameter_id in parameter_ids]
+            return [
+                names_by_id.get(parameter_id, f"<unknown:{parameter_id}>")
+                for parameter_id in parameter_ids
+            ]
 
         if duplicate_parameter_ids or unclassified_parameter_ids or missing_trainable_parameter_ids:
             raise RuntimeError(
@@ -253,13 +256,15 @@ class Gr00tTrainer(Trainer):
             )
 
         if bool(getattr(getattr(model, "config", None), "use_lora", False)):
-            from gr00t.model.modules.qwen3_backbone import is_lora_parameter_name
+            from gr00t.model.modules.qwen3_backbone import _is_lora_parameter_name
 
             trainable_backbone_names = [
                 name for name, parameter in backbone.named_parameters() if parameter.requires_grad
             ]
+            if not trainable_backbone_names:
+                raise RuntimeError("LoRA mode has no trainable VLM adapter parameters")
             non_lora_names = [
-                name for name in trainable_backbone_names if not is_lora_parameter_name(name)
+                name for name in trainable_backbone_names if not _is_lora_parameter_name(name)
             ]
             if non_lora_names:
                 raise RuntimeError(
@@ -327,7 +332,9 @@ class Gr00tTrainer(Trainer):
                 f"unexpected={parameter_names(unexpected)[:10]}"
             )
         if not optimizer_groups:
-            raise RuntimeError("Cannot create an optimizer because the model has no trainable parameters")
+            raise RuntimeError(
+                "Cannot create an optimizer because the model has no trainable parameters"
+            )
 
         vlm_parameter_count = sum(
             parameter.numel()
@@ -342,12 +349,12 @@ class Gr00tTrainer(Trainer):
         logging.info(
             "Optimizer parameter groups:\n"
             "  VLM:\n"
-            "    lr = %.6g\n"
+            "    lr = %.1e\n"
             "    trainable parameters = %s\n"
             "    tensors = %d\n"
             "    decay/no_decay tensors = %d/%d\n"
             "  Action Head:\n"
-            "    lr = %.6g\n"
+            "    lr = %.1e\n"
             "    trainable parameters = %s\n"
             "    tensors = %d\n"
             "    decay/no_decay tensors = %d/%d",
@@ -378,7 +385,10 @@ class Gr00tTrainer(Trainer):
         skipped = 0
         for module in model.modules():
             if isinstance(module, torch.nn.Embedding):
-                skipped += sum({parameter.data_ptr(): parameter.numel() for parameter in module.parameters()}.values())
+                parameter_sizes = {
+                    parameter.data_ptr(): parameter.numel() for parameter in module.parameters()
+                }
+                skipped += sum(parameter_sizes.values())
                 manager.register_module_override(module, "weight", {"optim_bits": 32})
         logging.info("bitsandbytes optimizer keeps %s embedding parameters in fp32", f"{skipped:,}")
 
