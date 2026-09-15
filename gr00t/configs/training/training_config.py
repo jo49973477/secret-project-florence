@@ -43,6 +43,8 @@ class TrainingConfig:
 
     # Optimization
     learning_rate: float = 1e-4
+    vlm_learning_rate: float = 1e-4
+    action_head_learning_rate: float = 1e-3
     lr_scheduler_type: str = "cosine"
     weight_decay: float = 1e-5
     warmup_ratio: float = 0.05
@@ -90,7 +92,7 @@ class TrainingConfig:
     save_best_eval_metric_greater_is_better: bool = True
 
     # DeepSpeed (default)
-    deepspeed_stage: int = 2  # ZeRO stage (1, 2, or 3)
+    deepspeed_stage: int = 3  # ZeRO stage (2 or 3)
     gradient_checkpointing: bool = False
 
     # Transformers loading parameters
@@ -149,6 +151,15 @@ class TrainingConfig:
         return global_batch * self.gradient_accumulation_steps
 
     def __post_init__(self) -> None:
+        if self.vlm_learning_rate <= 0:
+            raise ValueError(
+                f"vlm_learning_rate must be positive, got {self.vlm_learning_rate}"
+            )
+        if self.action_head_learning_rate <= 0:
+            raise ValueError(
+                "action_head_learning_rate must be positive, got "
+                f"{self.action_head_learning_rate}"
+            )
         if self.gradient_accumulation_steps < 1:
             raise ValueError(
                 f"gradient_accumulation_steps must be >= 1, got {self.gradient_accumulation_steps}"

@@ -174,7 +174,13 @@ class FinetuneConfig:
     """Number of parallel worker processes used for data loading."""
 
     learning_rate: float = 1e-4
-    """Initial learning rate for optimizer."""
+    """Legacy/default optimizer learning rate for backward compatibility."""
+
+    vlm_learning_rate: float = 1e-4
+    """Learning rate for trainable VLM backbone parameters, including LoRA adapters."""
+
+    action_head_learning_rate: float = 1e-3
+    """Learning rate for trainable parameters owned by the GR00T action head."""
 
     gradient_accumulation_steps: int = 1
     """Forward passes per optimizer step. Multiplies ``global_batch_size`` to
@@ -197,6 +203,12 @@ class FinetuneConfig:
 
     num_gpus: int = 1
     """Number of GPUs available for distributed or single-node training."""
+
+    deepspeed_stage: int = 3
+    """DeepSpeed ZeRO stage: supports 2 and 3 (default: 3).
+    ZeRO-2 replicates parameters and shards gradients/optimizer states.
+    ZeRO-3 also shards parameters.
+    """
 
     use_wandb: bool = False
     """
@@ -243,6 +255,17 @@ class FinetuneConfig:
     Useful for CI/testing to skip the slow checkpoint shard loading."""
 
     def __post_init__(self) -> None:
+        if self.deepspeed_stage not in (2, 3):
+            raise ValueError(f"deepspeed_stage must be 2 or 3, got {self.deepspeed_stage}")
+        if self.vlm_learning_rate <= 0:
+            raise ValueError(
+                f"vlm_learning_rate must be positive, got {self.vlm_learning_rate}"
+            )
+        if self.action_head_learning_rate <= 0:
+            raise ValueError(
+                "action_head_learning_rate must be positive, got "
+                f"{self.action_head_learning_rate}"
+            )
         if self.use_lora and (self.tune_llm or self.tune_visual):
             raise ValueError("use_lora cannot be combined with tune_llm or tune_visual")
         if self.use_lora and (

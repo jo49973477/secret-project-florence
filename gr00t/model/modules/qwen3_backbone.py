@@ -65,7 +65,7 @@ def _find_model_component(model: torch.nn.Module, component_name: str) -> torch.
     return next(iter(matches.values()))[1]
 
 
-def _is_lora_parameter_name(name: str) -> bool:
+def is_lora_parameter_name(name: str) -> bool:
     """Return whether a PEFT parameter path contains a LoRA-owned path component."""
     return any(component.startswith("lora_") for component in name.split("."))
 
@@ -122,7 +122,7 @@ def attach_lora_adapters(
         )
 
     non_lora_names = [
-        name for name, _parameter in trainable_parameters if not _is_lora_parameter_name(name)
+        name for name, _parameter in trainable_parameters if not is_lora_parameter_name(name)
     ]
     if non_lora_names:
         raise RuntimeError(

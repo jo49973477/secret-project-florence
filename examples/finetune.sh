@@ -7,6 +7,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../scripts/lib/checkpoint_resume.sh"
 
 NUM_GPUS="${NUM_GPUS:-1}"
+DEEPSPEED_STAGE="${DEEPSPEED_STAGE:-3}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 SAVE_STEPS="${SAVE_STEPS:-100}"
 SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-5}"
@@ -49,6 +50,7 @@ Usage: bash examples/finetune.sh \
   [--use-percentiles <true|false>] \
   [--shortest-image-edge <pixels>] \
   [--crop-fraction <fraction>] \
+  [--deepspeed-stage <2|3>] \
   [--ds-weights-alpha <value>] \
   [--save-only-model] \
   [--resume-from-checkpoint [checkpoint-path]] \
@@ -106,6 +108,10 @@ while [ "$#" -gt 0 ]; do
             CROP_FRACTION="$2"
             shift 2
             ;;
+        --deepspeed-stage)
+            DEEPSPEED_STAGE="$2"
+            shift 2
+            ;;
         --ds-weights-alpha)
             DS_WEIGHTS_ALPHA="$2"
             shift 2
@@ -161,6 +167,7 @@ LAUNCH_CMD=(
     --dataset_path "$DATASET_PATH"
     --embodiment_tag "$EMBODIMENT_TAG"
     --num_gpus "$NUM_GPUS"
+    --deepspeed-stage "${DEEPSPEED_STAGE}"
     --output_dir "$OUTPUT_DIR"
     --save_steps "$SAVE_STEPS"
     --save_total_limit "$SAVE_TOTAL_LIMIT"
@@ -224,6 +231,7 @@ if [ "${#EXTRA_ARGS[@]}" -gt 0 ]; then
     LAUNCH_CMD+=("${EXTRA_ARGS[@]}")
 fi
 
+echo "DeepSpeed stage : ${DEEPSPEED_STAGE}"
 checkpoint_resume_print_status "${OUTPUT_DIR}"
 
 if [ "$NUM_GPUS" = "1" ]; then

@@ -45,6 +45,7 @@ export CUDA_VISIBLE_DEVICES="${TRAIN_GPUS}"
 
 export USE_WANDB=0
 export NUM_GPUS=2
+DEEPSPEED_STAGE="${DEEPSPEED_STAGE:-3}"
 
 export GLOBAL_BATCH_SIZE=2
 export DATALOADER_NUM_WORKERS=0
@@ -74,6 +75,7 @@ echo "Dataset         : ${TRAIN_DATASET_PATH}"
 echo "Output          : ${OUTPUT_DIR}"
 echo "Max steps       : ${MAX_STEPS}"
 echo "Save interval   : ${SAVE_STEPS}"
+echo "DeepSpeed stage : ${DEEPSPEED_STAGE}"
 checkpoint_resume_print_status "${OUTPUT_DIR}"
 echo "============================================================"
 
@@ -85,6 +87,7 @@ echo "============================================================"
 TRAIN_LOG="${LOG_DIR}/train.log"
 
 uv run bash examples/finetune.sh \
+  --deepspeed-stage "${DEEPSPEED_STAGE}" \
   --base-model-path "${BASE_MODEL}" \
   --dataset-path "${TRAIN_DATASET_PATH}" \
   --embodiment-tag NEW_EMBODIMENT \

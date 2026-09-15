@@ -12,6 +12,7 @@ source "${REPO_ROOT}/scripts/lib/checkpoint_resume.sh"
 
 TRAIN_GPUS="${TRAIN_GPUS:-6,7}"
 NUM_GPUS="${NUM_GPUS:-2}"
+DEEPSPEED_STAGE="${DEEPSPEED_STAGE:-3}"
 MASTER_PORT="${MASTER_PORT:-29627}"
 
 # ============================================================
@@ -34,7 +35,8 @@ SAVE_STEPS="${SAVE_STEPS:-100}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-2}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-16}"
 
-LR="${LR:-1e-4}"
+LR_VLM="${LR_VLM:-1e-4}"
+LR_ACTION_HEAD="${LR_ACTION_HEAD:-1e-3}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-5}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.05}"
 
@@ -99,7 +101,10 @@ echo "Max steps           : ${MAX_STEPS}"
 echo "Global batch        : ${GLOBAL_BATCH_SIZE}"
 echo "Grad accumulation   : ${GRAD_ACCUM_STEPS}"
 echo "Effective batch     : ${EFFECTIVE_BATCH}"
+echo "VLM LR              : ${LR_VLM}"
+echo "Action Head LR      : ${LR_ACTION_HEAD}"
 echo "Episode sampling    : ${EPISODE_SAMPLING_RATE}"
+echo "DeepSpeed stage : ${DEEPSPEED_STAGE}"
 checkpoint_resume_print_status "${OUTPUT_DIR}"
 echo
 echo "Modalities:"
@@ -129,6 +134,7 @@ TRAIN_ARGS=(
     --output-dir "${OUTPUT_DIR}"
 
     --num-gpus "${NUM_GPUS}"
+    --deepspeed-stage "${DEEPSPEED_STAGE}"
 
     --max-steps "${MAX_STEPS}"
     --save-steps "${SAVE_STEPS}"
@@ -137,7 +143,8 @@ TRAIN_ARGS=(
     --global-batch-size "${GLOBAL_BATCH_SIZE}"
     --gradient-accumulation-steps "${GRAD_ACCUM_STEPS}"
 
-    --learning-rate "${LR}"
+    --vlm-learning-rate "${LR_VLM}"
+    --action-head-learning-rate "${LR_ACTION_HEAD}"
     --weight-decay "${WEIGHT_DECAY}"
     --warmup-ratio "${WARMUP_RATIO}"
 

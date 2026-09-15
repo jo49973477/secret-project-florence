@@ -133,11 +133,14 @@ if __name__ == "__main__":
     config.training.global_batch_size = ft_config.global_batch_size
     config.training.dataloader_num_workers = ft_config.dataloader_num_workers
     config.training.learning_rate = ft_config.learning_rate
+    config.training.vlm_learning_rate = ft_config.vlm_learning_rate
+    config.training.action_head_learning_rate = ft_config.action_head_learning_rate
     config.training.gradient_accumulation_steps = ft_config.gradient_accumulation_steps
     config.training.output_dir = ft_config.output_dir
     config.training.save_steps = ft_config.save_steps
     config.training.save_total_limit = ft_config.save_total_limit
     config.training.num_gpus = ft_config.num_gpus
+    config.training.deepspeed_stage = ft_config.deepspeed_stage
     config.training.use_wandb = ft_config.use_wandb
     config.training.max_steps = ft_config.max_steps
     config.training.weight_decay = ft_config.weight_decay
@@ -153,4 +156,5 @@ if __name__ == "__main__":
     config.training.resume_from_checkpoint = ft_config.resume_from_checkpoint
     config.training.skip_weight_loading = ft_config.skip_weight_loading
 
+    print(f"DeepSpeed stage : {config.training.deepspeed_stage}")
     run(config)

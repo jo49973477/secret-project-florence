@@ -23,6 +23,7 @@ source "${REPO_ROOT}/scripts/lib/checkpoint_resume.sh"
 TRAIN_GPUS="${TRAIN_GPUS:-3,4}"
 EVAL_GPU="${EVAL_GPU:-3}"
 NUM_GPUS="${NUM_GPUS:-2}"
+DEEPSPEED_STAGE="${DEEPSPEED_STAGE:-3}"
 MASTER_PORT="${MASTER_PORT:-29631}"
 
 BASE_MODEL="${BASE_MODEL:-nvidia/GR00T-N1.7-3B}"
@@ -42,9 +43,10 @@ SAVE_STEPS="${SAVE_STEPS:-100}"
 # 2 GPUs => one sample/GPU at global batch 2.
 # Accumulation is deliberately 1 for a memorization test.
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-2}"
-GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-16}"
 
-LR="${LR:-1e-4}"
+LR_VLM="${LR_VLM:-1e-4}"
+LR_ACTION_HEAD="${LR_ACTION_HEAD:-1e-3}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.0}"
 STATE_DROPOUT_PROB="${STATE_DROPOUT_PROB:-0.0}"
@@ -250,7 +252,7 @@ fi
 
 mkdir -p "${LOG_DIR}"
 
-export PYTORCH_ALLOC_CONF=expandable_segments:True
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export LOGURU_LEVEL="${LOGURU_LEVEL:-INFO}"
 
 WANDB_ARG="--no-use-wandb"
@@ -271,11 +273,13 @@ echo "Save every             : ${SAVE_STEPS}"
 echo "Global batch           : ${GLOBAL_BATCH_SIZE}"
 echo "Grad accumulation      : ${GRAD_ACCUM_STEPS}"
 echo "Effective batch        : ${EFFECTIVE_BATCH}"
-echo "LR                     : ${LR}"
+echo "VLM LR                 : ${LR_VLM}"
+echo "Action Head LR         : ${LR_ACTION_HEAD}"
 echo "Warmup                 : ${WARMUP_RATIO}"
 echo "Weight decay           : ${WEIGHT_DECAY}"
 echo "State dropout          : ${STATE_DROPOUT_PROB}"
 echo "LoRA r / alpha         : ${LORA_R} / ${LORA_ALPHA}"
+echo "DeepSpeed stage : ${DEEPSPEED_STAGE}"
 checkpoint_resume_print_status "${OUTPUT_DIR}"
 echo
 echo "TRAIN:"
@@ -294,6 +298,7 @@ TRAIN_ARGS=(
     --modality-config-path "${MODALITY_CONFIG}"
 
     --num-gpus "${NUM_GPUS}"
+    --deepspeed-stage "${DEEPSPEED_STAGE}"
     --output-dir "${OUTPUT_DIR}"
     --save-steps "${SAVE_STEPS}"
     --save-total-limit "${SAVE_TOTAL_LIMIT}"
@@ -301,7 +306,8 @@ TRAIN_ARGS=(
 
     --warmup-ratio "${WARMUP_RATIO}"
     --weight-decay "${WEIGHT_DECAY}"
-    --learning-rate "${LR}"
+    --vlm-learning-rate "${LR_VLM}"
+    --action-head-learning-rate "${LR_ACTION_HEAD}"
     --global-batch-size "${GLOBAL_BATCH_SIZE}"
     --gradient-accumulation-steps "${GRAD_ACCUM_STEPS}"
     --dataloader-num-workers "${DATALOADER_NUM_WORKERS}"

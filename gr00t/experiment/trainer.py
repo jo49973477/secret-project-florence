@@ -165,7 +165,222 @@ class Gr00tTrainer(Trainer):
         """
         self.action_offset = kwargs.pop("action_offset", None)
         self.multiprocessing_context = kwargs.pop("multiprocessing_context", "fork")
+        self.vlm_learning_rate = kwargs.pop("vlm_learning_rate", None)
+        self.action_head_learning_rate = kwargs.pop("action_head_learning_rate", None)
         super().__init__(*args, **kwargs)
+
+    def create_optimizer(self):
+        """Create identity-safe VLM/action-head optimizer parameter groups.
+
+        Direct ``Gr00tTrainer`` users that do not provide the split learning rates retain
+        HuggingFace Trainer's standard optimizer behavior. The GR00T experiment path always
+        provides both rates.
+        """
+        if self.vlm_learning_rate is None and self.action_head_learning_rate is None:
+            return super().create_optimizer()
+        if self.vlm_learning_rate is None or self.action_head_learning_rate is None:
+            raise ValueError(
+                "vlm_learning_rate and action_head_learning_rate must be provided together"
+            )
+        if self.optimizer is not None:
+            return self.optimizer
+
+        opt_model = self.model
+        optimizer_grouped_parameters = self._create_split_optimizer_groups(opt_model)
+
+        if self.optimizer_cls_and_kwargs is not None:
+            optimizer_cls, optimizer_kwargs = self.optimizer_cls_and_kwargs
+        else:
+            optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(
+                self.args, opt_model
+            )
+        optimizer_kwargs = dict(optimizer_kwargs)
+        unsupported_overrides = {
+            key for key in ("params", "model", "optimizer_dict") if key in optimizer_kwargs
+        }
+        if unsupported_overrides:
+            raise ValueError(
+                "The selected optimizer supplies its own parameter grouping and cannot preserve "
+                "the VLM/action-head learning-rate split: "
+                f"{sorted(unsupported_overrides)}"
+            )
+
+        self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+        self._configure_bitsandbytes_embedding_overrides(opt_model, optimizer_cls, optimizer_kwargs)
+        return self.optimizer
+
+    def _create_split_optimizer_groups(self, model: torch.nn.Module) -> list[dict[str, Any]]:
+        """Classify every trainable tensor by module identity, LR, and HF decay semantics."""
+        backbone = getattr(model, "backbone", None)
+        action_head = getattr(model, "action_head", None)
+        if not isinstance(backbone, torch.nn.Module) or not isinstance(
+            action_head, torch.nn.Module
+        ):
+            raise RuntimeError(
+                "Split learning rates require model.backbone and model.action_head modules"
+            )
+
+        named_parameters = list(model.named_parameters())
+        trainable_parameter_ids = {
+            id(parameter) for _name, parameter in named_parameters if parameter.requires_grad
+        }
+        vlm_parameter_ids = {
+            id(parameter) for parameter in backbone.parameters() if parameter.requires_grad
+        }
+        action_head_parameter_ids = {
+            id(parameter) for parameter in action_head.parameters() if parameter.requires_grad
+        }
+
+        duplicate_parameter_ids = vlm_parameter_ids & action_head_parameter_ids
+        classified_parameter_ids = vlm_parameter_ids | action_head_parameter_ids
+        unclassified_parameter_ids = trainable_parameter_ids - classified_parameter_ids
+        missing_trainable_parameter_ids = classified_parameter_ids - trainable_parameter_ids
+
+        names_by_id = {id(parameter): name for name, parameter in named_parameters}
+
+        def parameter_names(parameter_ids: set[int]) -> list[str]:
+            return [names_by_id.get(parameter_id, f"<unknown:{parameter_id}>") for parameter_id in parameter_ids]
+
+        if duplicate_parameter_ids or unclassified_parameter_ids or missing_trainable_parameter_ids:
+            raise RuntimeError(
+                "Invalid optimizer parameter ownership: "
+                f"total_trainable_tensors={len(trainable_parameter_ids)}, "
+                f"vlm_tensors={len(vlm_parameter_ids)}, "
+                f"action_head_tensors={len(action_head_parameter_ids)}, "
+                f"duplicate={parameter_names(duplicate_parameter_ids)[:10]}, "
+                f"unclassified={parameter_names(unclassified_parameter_ids)[:10]}, "
+                f"non_trainable_classified={parameter_names(missing_trainable_parameter_ids)[:10]}"
+            )
+
+        if bool(getattr(getattr(model, "config", None), "use_lora", False)):
+            from gr00t.model.modules.qwen3_backbone import is_lora_parameter_name
+
+            trainable_backbone_names = [
+                name for name, parameter in backbone.named_parameters() if parameter.requires_grad
+            ]
+            non_lora_names = [
+                name for name in trainable_backbone_names if not is_lora_parameter_name(name)
+            ]
+            if non_lora_names:
+                raise RuntimeError(
+                    "LoRA mode found trainable non-LoRA backbone parameters; frozen Qwen3-VL "
+                    f"base weights must not enter the optimizer: {non_lora_names[:10]}"
+                )
+
+        decay_parameter_names = set(self.get_decay_parameter_names(model))
+        decay_parameter_ids = {
+            id(parameter)
+            for name, parameter in named_parameters
+            if name in decay_parameter_names
+        }
+
+        group_specs = (
+            ("VLM decay", vlm_parameter_ids, True, self.vlm_learning_rate),
+            ("VLM no_decay", vlm_parameter_ids, False, self.vlm_learning_rate),
+            (
+                "Action Head decay",
+                action_head_parameter_ids,
+                True,
+                self.action_head_learning_rate,
+            ),
+            (
+                "Action Head no_decay",
+                action_head_parameter_ids,
+                False,
+                self.action_head_learning_rate,
+            ),
+        )
+        optimizer_groups: list[dict[str, Any]] = []
+        group_counts: dict[str, tuple[int, int]] = {}
+        for group_name, owner_ids, use_decay, learning_rate in group_specs:
+            parameters = [
+                parameter
+                for _name, parameter in named_parameters
+                if id(parameter) in owner_ids
+                and (id(parameter) in decay_parameter_ids) == use_decay
+            ]
+            group_counts[group_name] = (
+                sum(parameter.numel() for parameter in parameters),
+                len(parameters),
+            )
+            if parameters:
+                optimizer_groups.append(
+                    {
+                        "params": parameters,
+                        "lr": learning_rate,
+                        "weight_decay": self.args.weight_decay if use_decay else 0.0,
+                    }
+                )
+
+        optimizer_parameter_ids = [
+            id(parameter) for group in optimizer_groups for parameter in group["params"]
+        ]
+        unique_optimizer_parameter_ids = set(optimizer_parameter_ids)
+        if len(optimizer_parameter_ids) != len(unique_optimizer_parameter_ids):
+            raise RuntimeError("A trainable parameter was assigned to multiple optimizer groups")
+        if unique_optimizer_parameter_ids != trainable_parameter_ids:
+            missing = trainable_parameter_ids - unique_optimizer_parameter_ids
+            unexpected = unique_optimizer_parameter_ids - trainable_parameter_ids
+            raise RuntimeError(
+                "Optimizer parameter coverage mismatch: "
+                f"missing={parameter_names(missing)[:10]}, "
+                f"unexpected={parameter_names(unexpected)[:10]}"
+            )
+        if not optimizer_groups:
+            raise RuntimeError("Cannot create an optimizer because the model has no trainable parameters")
+
+        vlm_parameter_count = sum(
+            parameter.numel()
+            for _name, parameter in named_parameters
+            if id(parameter) in vlm_parameter_ids
+        )
+        action_head_parameter_count = sum(
+            parameter.numel()
+            for _name, parameter in named_parameters
+            if id(parameter) in action_head_parameter_ids
+        )
+        logging.info(
+            "Optimizer parameter groups:\n"
+            "  VLM:\n"
+            "    lr = %.6g\n"
+            "    trainable parameters = %s\n"
+            "    tensors = %d\n"
+            "    decay/no_decay tensors = %d/%d\n"
+            "  Action Head:\n"
+            "    lr = %.6g\n"
+            "    trainable parameters = %s\n"
+            "    tensors = %d\n"
+            "    decay/no_decay tensors = %d/%d",
+            self.vlm_learning_rate,
+            f"{vlm_parameter_count:,}",
+            len(vlm_parameter_ids),
+            group_counts["VLM decay"][1],
+            group_counts["VLM no_decay"][1],
+            self.action_head_learning_rate,
+            f"{action_head_parameter_count:,}",
+            len(action_head_parameter_ids),
+            group_counts["Action Head decay"][1],
+            group_counts["Action Head no_decay"][1],
+        )
+        return optimizer_groups
+
+    @staticmethod
+    def _configure_bitsandbytes_embedding_overrides(
+        model: torch.nn.Module, optimizer_cls: type, optimizer_kwargs: dict[str, Any]
+    ) -> None:
+        """Preserve HuggingFace Trainer's 8-bit embedding override behavior."""
+        if "bitsandbytes" not in str(optimizer_cls) or optimizer_kwargs.get("optim_bits") != 8:
+            return
+
+        import bitsandbytes
+
+        manager = bitsandbytes.optim.GlobalOptimManager.get_instance()
+        skipped = 0
+        for module in model.modules():
+            if isinstance(module, torch.nn.Embedding):
+                skipped += sum({parameter.data_ptr(): parameter.numel() for parameter in module.parameters()}.values())
+                manager.register_module_override(module, "weight", {"optim_bits": 32})
+        logging.info("bitsandbytes optimizer keeps %s embedding parameters in fp32", f"{skipped:,}")
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         # Hide epoch from logged metrics as it's misleading for Iterable datasets.

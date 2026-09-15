@@ -38,6 +38,7 @@ MODE="${MODE:-official}"
 TRAIN_GPUS="${TRAIN_GPUS:-2,3}"
 EVAL_GPU="${EVAL_GPU:-2}"
 NUM_GPUS="${NUM_GPUS:-2}"
+DEEPSPEED_STAGE="${DEEPSPEED_STAGE:-3}"
 MASTER_PORT="${MASTER_PORT:-29611}"
 
 BASE_MODEL="${BASE_MODEL:-nvidia/GR00T-N1.7-3B}"
@@ -176,6 +177,7 @@ echo "Weight decay              : ${WEIGHT_DECAY}"
 echo "Warmup ratio              : ${WARMUP_RATIO}"
 echo "Color jitter              : ${CJ_BRIGHTNESS}/${CJ_CONTRAST}/${CJ_SATURATION}/${CJ_HUE}"
 echo "Use percentiles           : ${USE_PERCENTILES}"
+echo "DeepSpeed stage : ${DEEPSPEED_STAGE}"
 checkpoint_resume_print_status "${OUTPUT_DIR}"
 echo "============================================================"
 
@@ -195,6 +197,7 @@ if [[ "${NUM_GPUS}" -eq 1 ]]; then
         --embodiment-tag NEW_EMBODIMENT \
         --modality-config-path "${MODALITY_CONFIG}" \
         --num-gpus 1 \
+        --deepspeed-stage "${DEEPSPEED_STAGE}" \
         --output-dir "${OUTPUT_DIR}" \
         --save-steps "${SAVE_STEPS}" \
         --save-total-limit "${SAVE_TOTAL_LIMIT}" \
@@ -230,6 +233,7 @@ else
         --embodiment-tag NEW_EMBODIMENT \
         --modality-config-path "${MODALITY_CONFIG}" \
         --num-gpus "${NUM_GPUS}" \
+        --deepspeed-stage "${DEEPSPEED_STAGE}" \
         --output-dir "${OUTPUT_DIR}" \
         --save-steps "${SAVE_STEPS}" \
         --save-total-limit "${SAVE_TOTAL_LIMIT}" \

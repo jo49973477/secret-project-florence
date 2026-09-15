@@ -30,6 +30,7 @@ source "${REPO_ROOT}/scripts/lib/checkpoint_resume.sh"
 TRAIN_GPUS="${TRAIN_GPUS:-5,6}"
 EVAL_GPU="${EVAL_GPU:-5}"
 NUM_GPUS="${NUM_GPUS:-2}"
+DEEPSPEED_STAGE="${DEEPSPEED_STAGE:-3}"
 MASTER_PORT="${MASTER_PORT:-29601}"
 
 BASE_MODEL="${BASE_MODEL:-nvidia/GR00T-N1.7-3B}"
@@ -279,6 +280,7 @@ echo "Color jitter             : all zeros"
 echo "Use percentiles          : false (full min/max)"
 echo "Trainable by default     : projector + diffusion/action model"
 echo "Frozen by default        : LLM + visual backbone"
+echo "DeepSpeed stage : ${DEEPSPEED_STAGE}"
 checkpoint_resume_print_status "${OUTPUT_DIR}"
 echo "============================================================"
 
@@ -293,6 +295,7 @@ uv run torchrun \
     --embodiment_tag NEW_EMBODIMENT \
     --modality_config_path "${MODALITY_CONFIG}" \
     --num_gpus "${NUM_GPUS}" \
+    --deepspeed-stage "${DEEPSPEED_STAGE}" \
     --output_dir "${OUTPUT_DIR}" \
     --save_steps "${SAVE_STEPS}" \
     --save_total_limit "${SAVE_TOTAL_LIMIT}" \
