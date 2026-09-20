@@ -28,7 +28,12 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from gr00t.model.modules.dit import AlternateVLDiT, _sdpa_context
+from gr00t.model.modules.dit import (
+    AlternateVLDiT,
+    _canonical_hidden_attention_mask,
+    _mask_hidden_states,
+    _sdpa_context,
+)
 
 
 def _validate_token_mask(
@@ -268,6 +273,7 @@ class MultiModalConditionedDiT(AlternateVLDiT):
         timestep_embedding: torch.Tensor,
         image_attention_mask: torch.Tensor,
         non_image_attention_mask: torch.Tensor,
+        hidden_attention_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         """Run one unmodified self- or VLM-cross-attention DiT block."""
         transformer_block = self.transformer_blocks[block_index]
@@ -276,7 +282,7 @@ class MultiModalConditionedDiT(AlternateVLDiT):
         if is_self_attention_block:
             return transformer_block(
                 hidden_states,
-                attention_mask=None,
+                attention_mask=hidden_attention_mask,
                 encoder_hidden_states=None,
                 encoder_attention_mask=None,
                 temb=timestep_embedding,
@@ -358,6 +364,7 @@ class MultiModalConditionedDiT(AlternateVLDiT):
         point_attention_mask: Optional[torch.Tensor] = None,
         tactile_attention_mask: Optional[torch.Tensor] = None,
         num_state_tokens: int = 1,
+        hidden_attention_mask: Optional[torch.Tensor] = None,
     ):
         if hidden_states.ndim != 3:
             raise ValueError(
@@ -414,6 +421,10 @@ class MultiModalConditionedDiT(AlternateVLDiT):
 
         timestep_embedding = self.timestep_encoder(timestep)
         hidden_states = hidden_states.contiguous()
+        hidden_attention_mask = _canonical_hidden_attention_mask(
+            hidden_attention_mask, hidden_states
+        )
+        hidden_states = _mask_hidden_states(hidden_states, hidden_attention_mask)
         vlm_hidden_states = encoder_hidden_states.contiguous()
         all_hidden_states = [hidden_states]
 
@@ -427,7 +438,9 @@ class MultiModalConditionedDiT(AlternateVLDiT):
                 timestep_embedding,
                 image_attention_mask,
                 non_image_attention_mask,
+                hidden_attention_mask,
             )
+            hidden_states = _mask_hidden_states(hidden_states, hidden_attention_mask)
 
             # 2. State is the prefix and action is the suffix. Sensor branches
             #    intentionally query with action tokens only.
@@ -454,13 +467,16 @@ class MultiModalConditionedDiT(AlternateVLDiT):
 
             # 5. Rebuild [state; action] for the next original GR00T block.
             hidden_states = torch.cat((state_hidden_states, action_hidden_states), dim=1)
+            hidden_states = _mask_hidden_states(hidden_states, hidden_attention_mask)
             all_hidden_states.append(hidden_states)
 
         # Preserve the original DiT adaptive output normalization and projection.
         shift, scale = self.proj_out_1(F.silu(timestep_embedding)).chunk(2, dim=1)
         hidden_states = self.norm_out(hidden_states)
         hidden_states = hidden_states * (1 + scale[:, None]) + shift[:, None]
+        hidden_states = _mask_hidden_states(hidden_states, hidden_attention_mask)
         output = self.proj_out_2(hidden_states)
+        output = _mask_hidden_states(output, hidden_attention_mask)
 
         if return_all_hidden_states:
             return output, all_hidden_states

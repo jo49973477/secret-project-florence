@@ -597,26 +597,43 @@ class Gr00tN1d7Processor(BaseProcessor):
         )
         transformed_observation["embodiment_id"] = embodiment_id
 
-        # Mask both the valid horizon and embodiment-specific action dimensions.
-        action_config = modality_config["action"]
-        action_horizon = len(action_config.delta_indices)
-        action_dim = self.state_action_processor.get_action_dim(embodiment_tag.value)
-        assert action_horizon <= self.max_action_horizon, (
-            f"Action horizon {action_horizon} (from delta_indices) exceeds"
-            f" max_action_horizon {self.max_action_horizon}. Increase model config"
-            f" action_horizon to >= {action_horizon}."
-        )
-        assert action_dim <= self.max_action_dim, (
-            f"Action dimension {action_dim} exceeds max_action_dim {self.max_action_dim}."
-        )
-        action_mask = torch.zeros(
-            (B, self.max_action_horizon, self.max_action_dim), dtype=torch.float32
-        )
-        if action_horizon > 0 and action_dim > 0:
-            action_mask[:, :action_horizon, :action_dim] = 1.0
-        transformed_observation["action_mask"] = action_mask
+        transformed_observation["action_mask"] = self._make_action_mask(
+            embodiment_tag.value
+        ).expand(B, -1, -1)
 
         return BatchFeature(transformed_observation)
+
+    def _make_action_mask(
+        self,
+        embodiment_tag: str,
+        action_horizon: int | None = None,
+        action_dim: int | None = None,
+    ) -> torch.Tensor:
+        """Build the structural action mask shared by training and inference.
+
+        Inference has no ground-truth action tensor, so its valid shape comes from
+        the embodiment's action ``delta_indices`` and normalization statistics.
+        This mask prevents padded action tokens from changing evaluation output;
+        it does not alter the flow-matching training target.
+        """
+        action_config = self.modality_configs[embodiment_tag]["action"]
+        if action_horizon is None:
+            action_horizon = len(action_config.delta_indices)
+        if action_dim is None:
+            action_dim = self.state_action_processor.get_action_dim(embodiment_tag)
+        if not 0 <= action_horizon <= self.max_action_horizon:
+            raise ValueError(
+                f"Action horizon {action_horizon} exceeds max_action_horizon "
+                f"{self.max_action_horizon} for {embodiment_tag}."
+            )
+        if not 0 <= action_dim <= self.max_action_dim:
+            raise ValueError(
+                f"Action dimension {action_dim} exceeds max_action_dim "
+                f"{self.max_action_dim} for {embodiment_tag}."
+            )
+        mask = torch.zeros((self.max_action_horizon, self.max_action_dim), dtype=torch.float32)
+        mask[:action_horizon, :action_dim] = 1.0
+        return mask
 
     def _apply_vlm_processing(self, images: np.ndarray, language: str) -> BatchFeature:
         """
@@ -705,14 +722,15 @@ class Gr00tN1d7Processor(BaseProcessor):
                 ],
                 dim=0,
             )  # (max_action_horizon, max_action_dim)
-            # Create action mask
-            action_mask = torch.ones_like(normalized_actions)
-            action_mask[action_horizon:] = 0
-            action_mask[:, action_dim:] = 0
+            action_mask = self._make_action_mask(
+                embodiment_tag.value,
+                action_horizon=action_horizon,
+                action_dim=action_dim,
+            )
         else:
             assert not self.training, "Action is required in training mode"
             normalized_actions = None
-            action_mask = None
+            action_mask = self._make_action_mask(embodiment_tag.value)
 
         # Concatenate states with optional dropout/noise augmentation
         state_keys = self.modality_configs[embodiment_tag.value]["state"].modality_keys
@@ -784,8 +802,7 @@ class Gr00tN1d7Processor(BaseProcessor):
             transformed_inputs["action"] = normalized_actions.to(torch.get_default_dtype())
         # Add VLM inputs
         transformed_inputs.update(vlm_inputs)
-        if action_mask is not None:
-            transformed_inputs["action_mask"] = action_mask
+        transformed_inputs["action_mask"] = action_mask
         transformed_inputs["embodiment_id"] = self.embodiment_id_mapping[embodiment_tag.value]
         return transformed_inputs
 
@@ -860,6 +877,7 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "shortest_image_edge": self.shortest_image_edge,
                 "crop_fraction": self.crop_fraction,
                 "letter_box_transform": self.letter_box_transform,
+                "extra_augmentation_config": self.extra_augmentation_config,
                 # VLM settings
                 "model_name": self.model_name,
                 "model_type": self.model_type,
@@ -904,6 +922,7 @@ class Gr00tN1d7Processor(BaseProcessor):
             "force_download",
             "local_files_only",
             "proxies",
+            "resume_download",
             "revision",
             "subfolder",
             "token",
@@ -912,6 +931,12 @@ class Gr00tN1d7Processor(BaseProcessor):
         use_auth_token = kwargs.pop("use_auth_token", None)
         if "token" not in hub_kwargs and use_auth_token is not None:
             hub_kwargs["token"] = use_auth_token
+        # AutoProcessor supplies these for the nested VLM processor rather than
+        # the three GR00T JSON files fetched with cached_file().
+        for key in ("trust_remote_code", "use_fast"):
+            if key in kwargs:
+                transformers_loading_kwargs[key] = kwargs.pop(key)
+        kwargs.pop("_from_auto", None)
         pretrained_model_name_or_path = Path(pretrained_model_name_or_path)
         config_file = pretrained_model_name_or_path / "processor_config.json"
         statistics_file = pretrained_model_name_or_path / "statistics.json"
@@ -937,7 +962,7 @@ class Gr00tN1d7Processor(BaseProcessor):
                 embodiment_id_mapping = json.load(f)
         else:
             embodiment_id_mapping = None
-        processor_kwargs = config["processor_kwargs"]
+        processor_kwargs = deepcopy(config["processor_kwargs"])
         processor_kwargs["statistics"] = statistics
         processor_kwargs["embodiment_id_mapping"] = embodiment_id_mapping
 
@@ -948,30 +973,48 @@ class Gr00tN1d7Processor(BaseProcessor):
         processor_kwargs.setdefault("model_type", "qwen")
         processor_kwargs.setdefault("clip_outliers", True)
 
-        # Directly override other processor kwargs
-        if kwargs:
-            # Override modality configs while keeping pretrained embodiment configs
-            modality_configs = kwargs.pop("modality_configs", {})
+        # Merge newly registered embodiments while retaining checkpoint entries.
+        if "modality_configs" in kwargs:
+            modality_configs = kwargs.pop("modality_configs")
+            if modality_configs is None:
+                raise TypeError("modality_configs cannot be None")
             for embodiment_tag, modality_config in modality_configs.items():
                 processor_kwargs["modality_configs"][embodiment_tag] = modality_config
-            override_keys = [
-                "random_rotation_angle",
-                "color_jitter_params",
-                "use_relative_action",
-                "exclude_state",
-                "state_dropout_prob",
-                "use_mean_std",
-                "model_name",
-                "model_type",
-                "max_action_horizon",
-                "max_state_dim",
-                "max_action_dim",
-            ]
-            for key in override_keys:
-                if key in kwargs:
-                    override = kwargs.pop(key)
-                    if override is not None:
-                        processor_kwargs[key] = override
+
+        # Every __init__ option is a valid explicit override, including None.
+        # This is essential for disabling checkpoint augmentations such as color jitter.
+        init_keys = {
+            "statistics",
+            "use_percentiles",
+            "clip_outliers",
+            "image_crop_size",
+            "image_target_size",
+            "shortest_image_edge",
+            "crop_fraction",
+            "random_rotation_angle",
+            "color_jitter_params",
+            "formalize_language",
+            "model_name",
+            "model_type",
+            "max_state_dim",
+            "max_action_dim",
+            "max_action_horizon",
+            "apply_sincos_state_encoding",
+            "use_albumentations",
+            "extra_augmentation_config",
+            "use_relative_action",
+            "embodiment_id_mapping",
+            "exclude_state",
+            "state_dropout_prob",
+            "use_mean_std",
+            "letter_box_transform",
+        }
+        unknown_keys = sorted(set(kwargs) - init_keys)
+        if unknown_keys:
+            raise TypeError(
+                "Unknown Gr00tN1d7Processor.from_pretrained argument(s): " + ", ".join(unknown_keys)
+            )
+        processor_kwargs.update(kwargs)
         return cls(**processor_kwargs, transformers_loading_kwargs=transformers_loading_kwargs)
 
 

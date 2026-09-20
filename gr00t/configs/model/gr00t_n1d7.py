@@ -88,18 +88,23 @@ class Gr00tN1d7Config(PretrainedConfig):
     # Global parameters
     add_pos_embed: bool = True
     attn_dropout: float = 0.2
+    vl_self_attention_cfg: dict | None = None
+    action_head_dropout_override: float | None = None
+    vl_self_attention_dropout_override: float | None = None
     use_vlln: bool = True
     max_seq_len: int = 1024
     use_alternate_vl_dit: bool = True  # Legacy selector retained for checkpoint compatibility.
     attend_text_every_n_blocks: int = 2
 
     # Optional action-head sensor conditioning.
-    dit_type: str = "alternate_vl_dit" # candidates : ["alternate_vl_dit", "multimodal_conditioned_dit", "dit"] 
+    dit_type: str = (
+        "alternate_vl_dit"  # candidates : ["alternate_vl_dit", "multimodal_conditioned_dit", "dit"]
+    )
     use_point_conditioning: bool = True
     use_tactile_conditioning: bool = True
     point_input_dim: int = 3
     tactile_input_channels: int = 3
-    point_encoder_cfg: str = "pointnet2" # candidates: ["pointnet2", "pointnet", "point_transformer", "pointnet++", "transformer"]
+    point_encoder_cfg: str = "pointnet2"  # candidates: ["pointnet2", "pointnet", "point_transformer", "pointnet++", "transformer"]
 
     diffusion_model_cfg: dict = field(
         default_factory=lambda: {

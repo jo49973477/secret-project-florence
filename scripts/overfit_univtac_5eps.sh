@@ -78,6 +78,7 @@ if [[ ! "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]] || [[ ! "${SAVE_STEPS}" =~ ^[1-9][0-9
 fi
 ALL_CHECKPOINTS_LIMIT=$(((MAX_STEPS + SAVE_STEPS - 1) / SAVE_STEPS))
 checkpoint_resume_configure "${OUTPUT_DIR}" "${ALL_CHECKPOINTS_LIMIT}"
+checkpoint_resume_require_fresh_output "${OUTPUT_DIR}"
 
 # Rebuild the tiny metadata/symlink dataset each run by default.
 REBUILD_SUBSET="${REBUILD_SUBSET:-1}"
@@ -274,6 +275,8 @@ echo "Gradient accumulation    : ${GRAD_ACCUM_STEPS}"
 echo "Effective batch          : $((GLOBAL_BATCH_SIZE * GRAD_ACCUM_STEPS))"
 echo "Episode sampling rate    : ${EPISODE_SAMPLING_RATE}"
 echo "State dropout            : ${STATE_DROPOUT_PROB}"
+echo "Resolved VLM LR          : ${LR}"
+echo "Resolved action-head LR  : ${LR}"
 echo "Weight decay             : ${WEIGHT_DECAY}"
 echo "Warmup ratio             : ${WARMUP_RATIO}"
 echo "Color jitter             : all zeros"
@@ -310,12 +313,12 @@ uv run torchrun \
     --num_shards_per_epoch "${NUM_SHARDS_PER_EPOCH}" \
     --episode_sampling_rate "${EPISODE_SAMPLING_RATE}" \
     --state_dropout_prob "${STATE_DROPOUT_PROB}" \
-    --random_rotation_angle 0 \
-    --color_jitter_params \
-        brightness 0.0 \
-        contrast 0.0 \
-        saturation 0.0 \
-        hue 0.0 \
+    --action-head-dropout 0 \
+    --vl-self-attention-dropout 0 \
+    --disable-color-jitter \
+    --random-rotation-angle 0 \
+    --shortest-image-edge 256 \
+    --crop-fraction 1.0 \
     --no-use-percentiles \
     "${CHECKPOINT_SAVE_ARGS[@]}" \
     "${CHECKPOINT_RESUME_ARGS[@]}" \

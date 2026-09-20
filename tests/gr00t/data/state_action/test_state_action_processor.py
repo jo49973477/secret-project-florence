@@ -24,6 +24,7 @@ import json
 from pathlib import Path
 
 from gr00t.data.state_action.state_action_processor import StateActionProcessor
+from gr00t.data.types import ActionConfig, ActionFormat, ActionRepresentation, ActionType
 import numpy as np
 import pytest
 
@@ -169,6 +170,85 @@ class TestActionNormalization:
             np.testing.assert_allclose(
                 recovered[key], raw[key], atol=1e-4, err_msg=f"Action roundtrip failed for {key}"
             )
+
+    @staticmethod
+    def _relative_fixture(*, mean_std=False):
+        modality_configs = {
+            "robot": {
+                "state": {
+                    "delta_indices": [0],
+                    "modality_keys": ["joint"],
+                },
+                "action": {
+                    "delta_indices": [0],
+                    "modality_keys": ["joint"],
+                    "mean_std_embedding_keys": ["joint"] if mean_std else None,
+                    "action_configs": [
+                        ActionConfig(
+                            rep=ActionRepresentation.RELATIVE,
+                            type=ActionType.NON_EEF,
+                            format=ActionFormat.DEFAULT,
+                            state_key="joint",
+                        )
+                    ],
+                },
+            }
+        }
+        base_stats = {
+            "min": [-100.0],
+            "max": [100.0],
+            "q01": [-1.0],
+            "q99": [1.0],
+            "mean": [0.0],
+            "std": [2.0],
+        }
+        statistics = {
+            "robot": {
+                "state": {"joint": base_stats},
+                "action": {"joint": base_stats},
+                "relative_action": {"joint": base_stats},
+            }
+        }
+        return modality_configs, statistics
+
+    @pytest.mark.parametrize(("use_percentiles", "expected"), [(True, 1.0), (False, 0.01)])
+    def test_relative_action_uses_selected_minmax_policy(self, use_percentiles, expected):
+        modality_configs, statistics = self._relative_fixture()
+        original = json.loads(json.dumps(statistics))
+        proc = StateActionProcessor(
+            modality_configs=modality_configs,
+            statistics=statistics,
+            use_percentiles=use_percentiles,
+            clip_outliers=False,
+            use_relative_action=True,
+        )
+        state = {"joint": np.array([[0.0]], dtype=np.float32)}
+        action = {"joint": np.array([[1.0]], dtype=np.float32)}
+
+        normalized = proc.apply_action(action, "robot", state=state)
+        recovered = proc.unapply_action(normalized, "robot", state=state)
+
+        assert normalized["joint"].item() == pytest.approx(expected)
+        np.testing.assert_allclose(recovered["joint"], action["joint"], atol=1e-6)
+        assert statistics == original
+
+    def test_relative_action_mean_std_uses_relative_statistics(self):
+        modality_configs, statistics = self._relative_fixture(mean_std=True)
+        proc = StateActionProcessor(
+            modality_configs=modality_configs,
+            statistics=statistics,
+            use_percentiles=True,
+            clip_outliers=False,
+            use_relative_action=True,
+        )
+        state = {"joint": np.array([[0.0]], dtype=np.float32)}
+        action = {"joint": np.array([[1.0]], dtype=np.float32)}
+
+        normalized = proc.apply_action(action, "robot", state=state)
+        recovered = proc.unapply_action(normalized, "robot", state=state)
+
+        assert normalized["joint"].item() == pytest.approx(0.5)
+        np.testing.assert_allclose(recovered["joint"], action["joint"], atol=1e-6)
 
 
 class TestApplyConvenience:

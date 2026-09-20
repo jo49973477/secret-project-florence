@@ -22,6 +22,7 @@ processor (no model download needed).
 
 import json
 from pathlib import Path
+import runpy
 import tempfile
 from unittest.mock import MagicMock, patch
 
@@ -81,7 +82,7 @@ def test_from_pretrained_passes_hub_kwargs_to_cached_file(tmp_path):
 
     with (
         patch.object(processor_module, "cached_file", side_effect=fake_cached_file),
-        patch.object(processor_module, "build_processor", return_value=mock_vlm),
+        patch.object(processor_module, "build_processor", return_value=mock_vlm) as build_processor,
     ):
         processor_module.Gr00tN1d7Processor.from_pretrained(
             "nvidia/GR00T-N1.7-3B",
@@ -89,6 +90,7 @@ def test_from_pretrained_passes_hub_kwargs_to_cached_file(tmp_path):
             local_files_only=True,
             revision="abc123",
             token="hf_fake",
+            trust_remote_code=False,
         )
 
     assert [call["filename"] for call in calls] == [
@@ -104,6 +106,71 @@ def test_from_pretrained_passes_hub_kwargs_to_cached_file(tmp_path):
             "revision": "abc123",
             "token": "hf_fake",
         }
+    assert build_processor.call_args.args[1]["trust_remote_code"] is False
+
+
+def test_from_pretrained_applies_all_preprocessing_overrides_and_explicit_none():
+    from gr00t.model.gr00t_n1d7 import processing_gr00t_n1d7 as processor_module
+
+    mock_vlm = MagicMock()
+    mock_vlm.tokenizer.padding_side = "left"
+    with patch.object(processor_module, "build_processor", return_value=mock_vlm):
+        proc = processor_module.Gr00tN1d7Processor.from_pretrained(
+            FIXTURE_DIR,
+            use_percentiles=True,
+            crop_fraction=1.0,
+            shortest_image_edge=320,
+            color_jitter_params=None,
+        )
+
+    assert proc.use_percentiles is True
+    assert proc.crop_fraction == 1.0
+    assert proc.shortest_image_edge == 320
+    assert proc.color_jitter_params is None
+
+
+def test_from_pretrained_rejects_unknown_processor_argument():
+    from gr00t.model.gr00t_n1d7 import processing_gr00t_n1d7 as processor_module
+
+    mock_vlm = MagicMock()
+    mock_vlm.tokenizer.padding_side = "left"
+    with (
+        patch.object(processor_module, "build_processor", return_value=mock_vlm),
+        pytest.raises(TypeError, match="unknown_processor_option"),
+    ):
+        processor_module.Gr00tN1d7Processor.from_pretrained(
+            FIXTURE_DIR, unknown_processor_option=True
+        )
+
+
+def test_processor_override_save_load_roundtrip(tmp_path):
+    from gr00t.model.gr00t_n1d7 import processing_gr00t_n1d7 as processor_module
+
+    mock_vlm = MagicMock()
+    mock_vlm.tokenizer.padding_side = "left"
+    with patch.object(processor_module, "build_processor", return_value=mock_vlm):
+        first = processor_module.Gr00tN1d7Processor.from_pretrained(
+            FIXTURE_DIR,
+            use_percentiles=True,
+            crop_fraction=1.0,
+            shortest_image_edge=320,
+            color_jitter_params=None,
+        )
+        first.save_pretrained(tmp_path)
+        second = processor_module.Gr00tN1d7Processor.from_pretrained(tmp_path)
+        explicitly_disabled = processor_module.Gr00tN1d7Processor.from_pretrained(
+            tmp_path, use_percentiles=False
+        )
+
+    for key in (
+        "use_percentiles",
+        "crop_fraction",
+        "shortest_image_edge",
+        "color_jitter_params",
+        "extra_augmentation_config",
+    ):
+        assert getattr(second, key) == getattr(first, key)
+    assert explicitly_disabled.use_percentiles is False
 
 
 def _make_step_data(proc_config) -> VLAStepData:
@@ -175,13 +242,24 @@ class TestProcessorCall:
         result = processor(messages)
         assert result["action_mask"].shape == result["action"].shape
 
+    def test_inference_call_without_action_keeps_structural_mask(self, processor, proc_config):
+        processor.eval()
+        step_data = _make_step_data(proc_config)
+        step_data.actions = {}
+
+        result = processor([{"type": MessageType.EPISODE_STEP.value, "content": step_data}])
+
+        action_horizon = len(proc_config["modality_configs"][EMBODIMENT]["action"]["delta_indices"])
+        action_dim = processor.state_action_processor.get_action_dim(EMBODIMENT)
+        assert "action" not in result
+        assert result["action_mask"].sum().item() == action_horizon * action_dim
+
     def test_embodiment_id_is_integer(self, processor, proc_config):
         step_data = _make_step_data(proc_config)
         messages = [{"type": MessageType.EPISODE_STEP.value, "content": step_data}]
         result = processor(messages)
         assert isinstance(result["embodiment_id"], (int, np.integer))
 
-<<<<<<< HEAD
     def test_multimodal_values_reach_processor_output(self, processor, proc_config):
         processor.modality_configs[EMBODIMENT]["pointcloud"] = ModalityConfig(
             delta_indices=[0], modality_keys=["xyz"]
@@ -210,7 +288,7 @@ class TestProcessorCall:
         )["inputs"]
         assert batch["points"].shape == (2, 32, 3)
         assert batch["tactile"].shape == (2, 3, 24, 32)
-=======
+
     def test_inference_action_mask_covers_horizon_and_dimension(self, processor, proc_config):
         mc = proc_config["modality_configs"][EMBODIMENT]
         with open(FIXTURE_DIR / "statistics.json") as f:
@@ -241,7 +319,6 @@ class TestProcessorCall:
         assert torch.all(action_mask[:, :action_horizon, :action_dim] == 1)
         assert torch.all(action_mask[:, action_horizon:, :] == 0)
         assert torch.all(action_mask[:, :, action_dim:] == 0)
->>>>>>> aa03419 (Fix padded action leakage in GR00T N1.7)
 
 
 class TestProcessorVLMInputs:
@@ -332,3 +409,62 @@ class TestFixtureCompleteness:
             f"Fixture has fields that save_pretrained() no longer writes: {extra}. "
             f"Remove them from tests/fixtures/processor_config/processor_config.json."
         )
+
+
+@pytest.mark.parametrize(
+    ("config_path", "config_name", "dimensions"),
+    [
+        ("examples/SO100/so100_config.py", "so100_config", {"single_arm": 6, "gripper": 1}),
+        ("examples/UniVTAC/univtac_config.py", "univtac_config", {"joint": 7}),
+    ],
+)
+def test_structural_action_mask_for_real_configs(config_path, config_name, dimensions):
+    from gr00t.data.state_action.state_action_processor import StateActionProcessor
+    from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7Processor
+
+    root = Path(__file__).resolve().parents[3]
+    with patch("gr00t.configs.data.embodiment_configs.register_modality_config") as register:
+        modality_config = runpy.run_path(root / config_path)[config_name]
+    register.assert_called_once()
+
+    def stats_for_key(dim):
+        return {
+            "min": [-1.0] * dim,
+            "max": [1.0] * dim,
+            "q01": [-0.9] * dim,
+            "q99": [0.9] * dim,
+            "mean": [0.0] * dim,
+            "std": [1.0] * dim,
+        }
+
+    statistics = {
+        "new_embodiment": {
+            "state": {key: stats_for_key(dim) for key, dim in dimensions.items()},
+            "action": {key: stats_for_key(dim) for key, dim in dimensions.items()},
+            "relative_action": {key: stats_for_key(dim) for key, dim in dimensions.items()},
+        }
+    }
+    state_action = StateActionProcessor(
+        modality_configs={"new_embodiment": modality_config},
+        statistics=statistics,
+        use_relative_action=True,
+    )
+    processor = object.__new__(Gr00tN1d7Processor)
+    processor.modality_configs = state_action.modality_configs
+    processor.state_action_processor = state_action
+    processor.max_action_horizon = 40
+    processor.max_action_dim = 128
+
+    mask = processor._make_action_mask("new_embodiment")
+    horizon = len(modality_config["action"].delta_indices)
+    action_dim = sum(dimensions.values())
+
+    assert mask.shape == (40, 128)
+    assert mask.sum().item() == horizon * action_dim
+    assert torch.count_nonzero(mask[horizon:]) == 0
+    assert torch.count_nonzero(mask[:, action_dim:]) == 0
+
+    collator = object.__new__(processor.data_collator_class)
+    batch = collator([{"action_mask": mask.numpy()}, {"action_mask": mask.numpy()}])["inputs"]
+    assert batch["action_mask"].shape == (2, 40, 128)
+    torch.testing.assert_close(batch["action_mask"][0], mask)

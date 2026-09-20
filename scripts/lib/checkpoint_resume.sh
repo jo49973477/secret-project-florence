@@ -172,3 +172,13 @@ checkpoint_resume_print_status() {
     echo "Resume checkpoint      : ${RESUME_CHECKPOINT_DISPLAY}"
     echo "Save resumable state   : ${SAVE_RESUMABLE_STATE}"
 }
+
+checkpoint_resume_require_fresh_output() {
+    local output_dir="$1"
+    if [[ "${RESUME}" == "0" && -d "${output_dir}" ]] && \
+       [[ -n "$(find "${output_dir}" -mindepth 1 -print -quit)" ]]; then
+        echo "[ERROR] OUTPUT_DIR already exists and is not empty: ${output_dir}" >&2
+        echo "        Set RESUME=1, choose a new OUTPUT_DIR, or use the timestamped default." >&2
+        exit 1
+    fi
+}

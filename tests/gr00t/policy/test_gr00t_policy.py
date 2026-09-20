@@ -71,6 +71,18 @@ def policy():
     mock_processor.eval = MagicMock()
     mock_processor.training = False
     mock_processor.collator = MagicMock()
+    structural_mask = np.zeros((50, 128), dtype=np.float32)
+    structural_mask[:16, :7] = 1
+    mock_processor.side_effect = lambda messages: {"action_mask": structural_mask.copy()}
+    mock_processor.collator.side_effect = lambda features: BatchFeature(
+        data={
+            "inputs": {
+                "action_mask": torch.from_numpy(
+                    np.stack([feature["action_mask"] for feature in features])
+                )
+            }
+        }
+    )
 
     def fake_process_observation(observation, embodiment_tag):
         return BatchFeature(
@@ -200,6 +212,14 @@ class TestGr00tPolicyGetAction:
         action, info = policy.get_action(obs)
         assert isinstance(action, dict)
         assert isinstance(info, dict)
+
+    def test_action_mask_survives_processor_collator_model_path(self, policy):
+        policy.get_action(_make_observation())
+
+        model_inputs = policy.model.get_action.call_args.kwargs["inputs"]
+        mask = model_inputs["action_mask"]
+        assert mask.shape == (1, 50, 128)
+        assert mask.sum().item() == 16 * 7
 
 
 class _NumpyLanguageSimPolicy:

@@ -58,3 +58,15 @@ def test_compatible_combinations_pass(save_only_model, resume_from_checkpoint):
 def test_default_config_is_compatible():
     """Default TrainingConfig must not trigger the conflict (would break every fresh run)."""
     check_resume_compatibility(TrainingConfig())
+
+
+def test_resume_warns_that_checkpoint_optimizer_controls_current_lr():
+    training = TrainingConfig(
+        learning_rate=3e-4,
+        action_head_learning_rate=1e-3,
+        resume_from_checkpoint=True,
+    )
+    with pytest.warns(
+        UserWarning, match="checkpoint state may restore different current group LRs"
+    ):
+        check_resume_compatibility(training)

@@ -144,6 +144,30 @@ def log_parameter_summary(model: Gr00tN1d7) -> None:
         )
 
 
+def log_processor_summary(processor: Gr00tN1d7Processor) -> None:
+    """Log preprocessing values that materially change training or evaluation."""
+    keys = (
+        "use_percentiles",
+        "use_mean_std",
+        "use_relative_action",
+        "state_dropout_prob",
+        "color_jitter_params",
+        "random_rotation_angle",
+        "use_albumentations",
+        "crop_fraction",
+        "shortest_image_edge",
+        "image_crop_size",
+        "image_target_size",
+        "formalize_language",
+        "max_action_horizon",
+        "max_action_dim",
+        "max_state_dim",
+    )
+    logging.info("Resolved processor configuration:")
+    for key in keys:
+        logging.info("  %s = %r", key, getattr(processor, key))
+
+
 class Gr00tN1d7Pipeline(ModelPipeline):
     model_class = Gr00tN1d7
     processor_class = Gr00tN1d7Processor
@@ -179,6 +203,20 @@ class Gr00tN1d7Pipeline(ModelPipeline):
         """Setup model with proper vocabulary expansion."""
         skip_weight_loading = getattr(self.config.training, "skip_weight_loading", False)
         if self.config.training.start_from_checkpoint is not None and not skip_weight_loading:
+            dropout_overrides = {
+                key: value
+                for key, value in (
+                    (
+                        "action_head_dropout_override",
+                        self.config.model.action_head_dropout_override,
+                    ),
+                    (
+                        "vl_self_attention_dropout_override",
+                        self.config.model.vl_self_attention_dropout_override,
+                    ),
+                )
+                if value is not None
+            }
             model, loading_info = AutoModel.from_pretrained(
                 self.config.training.start_from_checkpoint,
                 tune_llm=self.config.model.tune_llm,
@@ -191,6 +229,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 load_bf16=self.config.model.load_bf16,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
                 output_loading_info=True,
+                **dropout_overrides,
                 **self.transformers_loading_kwargs,
             )
 
@@ -278,7 +317,6 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 crop_fraction=self.model_config.crop_fraction,
                 letter_box_transform=letter_box_transform,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
-                use_alternate_vl_dit=self.model_config.use_alternate_vl_dit,
                 use_relative_action=self.model_config.use_relative_action,
                 # State augmentation overrides
                 exclude_state=self.model_config.exclude_state,
@@ -316,8 +354,10 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
             )
 
+        log_processor_summary(processor)
         logging.debug(
-            f"Processor configs for training: {json.dumps({k: str(v) for k, v in vars(processor).items()}, indent=2)}"
+            "Processor configs for training: %s",
+            json.dumps({k: str(v) for k, v in vars(processor).items()}, indent=2),
         )
         with run_or_wait_on_rank0(label="final_processor_config.json write") as is_rank0:
             if is_rank0:

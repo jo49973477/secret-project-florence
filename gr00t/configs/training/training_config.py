@@ -43,8 +43,8 @@ class TrainingConfig:
 
     # Optimization
     learning_rate: float = 1e-4
-    vlm_learning_rate: float = 1e-4
-    action_head_learning_rate: float = 1e-3
+    vlm_learning_rate: float | None = None
+    action_head_learning_rate: float | None = None
     lr_scheduler_type: str = "cosine"
     weight_decay: float = 1e-5
     warmup_ratio: float = 0.05
@@ -150,15 +150,32 @@ class TrainingConfig:
             global_batch = self.global_batch_size
         return global_batch * self.gradient_accumulation_steps
 
+    @property
+    def resolved_vlm_learning_rate(self) -> float:
+        """Effective VLM LR after falling back to the global learning rate."""
+        return self.learning_rate if self.vlm_learning_rate is None else self.vlm_learning_rate
+
+    @property
+    def resolved_action_head_learning_rate(self) -> float:
+        """Effective action-head LR after falling back to the global learning rate."""
+        return (
+            self.learning_rate
+            if self.action_head_learning_rate is None
+            else self.action_head_learning_rate
+        )
+
     def __post_init__(self) -> None:
-        if self.vlm_learning_rate <= 0:
+        if self.learning_rate <= 0:
+            raise ValueError(f"learning_rate must be positive, got {self.learning_rate}")
+        if self.resolved_vlm_learning_rate <= 0:
             raise ValueError(
-                f"vlm_learning_rate must be positive, got {self.vlm_learning_rate}"
+                "resolved vlm_learning_rate must be positive, got "
+                f"{self.resolved_vlm_learning_rate}"
             )
-        if self.action_head_learning_rate <= 0:
+        if self.resolved_action_head_learning_rate <= 0:
             raise ValueError(
-                "action_head_learning_rate must be positive, got "
-                f"{self.action_head_learning_rate}"
+                "resolved action_head_learning_rate must be positive, got "
+                f"{self.resolved_action_head_learning_rate}"
             )
         if self.gradient_accumulation_steps < 1:
             raise ValueError(
@@ -186,4 +203,13 @@ def check_resume_compatibility(training: TrainingConfig) -> None:
             "silently re-initializes the optimizer and LR schedule, degrading "
             "training quality. Either disable save_only_model, or start fresh "
             "(set resume_from_checkpoint=False or use a different output_dir)."
+        )
+    if training.resume_from_checkpoint:
+        warnings.warn(
+            "Resuming restores optimizer and scheduler state from the checkpoint. "
+            "Requested learning rates (VLM="
+            f"{training.resolved_vlm_learning_rate:g}, action head="
+            f"{training.resolved_action_head_learning_rate:g}) are used to construct the optimizer, "
+            "but checkpoint state may restore different current group LRs and scheduler progress.",
+            stacklevel=2,
         )

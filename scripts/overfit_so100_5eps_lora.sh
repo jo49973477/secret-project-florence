@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # ============================================================
-# UniVTAC 5-episode memorization test
+# SO100 5-episode memorization test
 # VLM LoRA + FULL GR00T action-head fine-tuning
 #
 # Purpose:
@@ -28,13 +28,14 @@ MASTER_PORT="${MASTER_PORT:-29631}"
 
 BASE_MODEL="${BASE_MODEL:-nvidia/GR00T-N1.7-3B}"
 
-# RGB UniVTAC dataset currently used by finetune_univtac_lora.sh
-SOURCE_DATASET="${SOURCE_DATASET:-/ssdg/spl_yeongyoo/univtac_gr00t}"
+# Official SO100/SO101 example dataset after LeRobot v3 -> v2 conversion.
+# See examples/SO100/README.md. Override SOURCE_DATASET if yours lives elsewhere.
+SOURCE_DATASET="${SOURCE_DATASET:-examples/SO100/finish_sandwich_lerobot/izuluaga/finish_sandwich}"
 
 # Tiny 5-episode subset created with symlinks.
-OVERFIT_DATASET="${OVERFIT_DATASET:-/ssdg/spl_yeongyoo/univtac_gr00t_overfit5_lora}"
+OVERFIT_DATASET="${OVERFIT_DATASET:-demo_data/cube_to_bowl_5}"
 
-MODALITY_CONFIG="${MODALITY_CONFIG:-examples/UniVTAC/univtac_config.py}"
+MODALITY_CONFIG="${MODALITY_CONFIG:-examples/SO100/so100_config.py}"
 
 # Intentionally short/aggressive memorization run.
 MAX_STEPS="${MAX_STEPS:-1000}"
@@ -43,7 +44,7 @@ SAVE_STEPS="${SAVE_STEPS:-100}"
 # 2 GPUs => one sample/GPU at global batch 2.
 # Accumulation is deliberately 1 for a memorization test.
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-2}"
-GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-16}"
 
 LR_VLM="${LR_VLM:-1e-4}"
 LR_ACTION_HEAD="${LR_ACTION_HEAD:-1e-3}"
@@ -51,8 +52,8 @@ WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.0}"
 STATE_DROPOUT_PROB="${STATE_DROPOUT_PROB:-0.0}"
 
-LORA_R="${LORA_R:-16}"
-LORA_ALPHA="${LORA_ALPHA:-32}"
+LORA_R="${LORA_R:-64}"
+LORA_ALPHA="${LORA_ALPHA:-128}"
 LORA_DROPOUT="${LORA_DROPOUT:-0.0}"
 LORA_BIAS="${LORA_BIAS:-none}"
 
@@ -69,7 +70,7 @@ EXECUTION_HORIZON="${EXECUTION_HORIZON:-16}"
 EVAL_STEPS="${EVAL_STEPS:-400}"
 EVAL_TRAJ_IDS=(0 1 2 3 4)
 
-OUTPUT_DIR="${OUTPUT_DIR:-outputs/univtac_overfit5_lora_$(date +%Y%m%d_%H%M%S)}"
+OUTPUT_DIR="${OUTPUT_DIR:-outputs/so100_overfit5_lora_$(date +%Y%m%d_%H%M%S)}"
 LOG_DIR="${OUTPUT_DIR}/logs"
 
 if [[ ! "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]] || [[ ! "${SAVE_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
@@ -78,7 +79,6 @@ if [[ ! "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]] || [[ ! "${SAVE_STEPS}" =~ ^[1-9][0-9
 fi
 ALL_CHECKPOINTS_LIMIT=$(((MAX_STEPS + SAVE_STEPS - 1) / SAVE_STEPS))
 checkpoint_resume_configure "${OUTPUT_DIR}" "${ALL_CHECKPOINTS_LIMIT}"
-checkpoint_resume_require_fresh_output "${OUTPUT_DIR}"
 
 # ============================================================
 # Basic checks
@@ -121,12 +121,12 @@ if [[ -z "${OVERFIT_REAL}" || "${OVERFIT_REAL}" == "/" || "${OVERFIT_REAL}" == "
 fi
 
 # ============================================================
-# 1. Build 5-episode subset: episodes 0..4
+# 1. Build 5-episode SO100 subset: episodes 0..4
 # ============================================================
 
 if [[ "${REBUILD_SUBSET}" == "1" ]]; then
     echo "============================================================"
-    echo "Building UniVTAC 5-episode subset"
+    echo "Building SO100 5-episode subset"
     echo "============================================================"
     echo "Source : ${SOURCE_REAL}"
     echo "Target : ${OVERFIT_REAL}"
@@ -248,7 +248,7 @@ else
 fi
 
 # ============================================================
-# 2. Fine-tune: VLM LoRA + FULL action head
+# 2. Fine-tune SO100: VLM LoRA + FULL action head
 # ============================================================
 
 mkdir -p "${LOG_DIR}"
@@ -265,7 +265,7 @@ EFFECTIVE_BATCH=$((GLOBAL_BATCH_SIZE * GRAD_ACCUM_STEPS))
 
 echo
 echo "============================================================"
-echo "UniVTAC 5-episode OVERFIT: LoRA + full action head"
+echo "SO100 5-episode OVERFIT: LoRA + full action head"
 echo "============================================================"
 echo "GPUs                  : ${TRAIN_GPUS}"
 echo "Subset                 : ${OVERFIT_REAL}"
@@ -316,12 +316,6 @@ TRAIN_ARGS=(
     --num-shards-per-epoch "${NUM_SHARDS_PER_EPOCH}"
     --episode-sampling-rate "${EPISODE_SAMPLING_RATE}"
     --state-dropout-prob "${STATE_DROPOUT_PROB}"
-    --action-head-dropout 0
-    --vl-self-attention-dropout 0
-    --disable-color-jitter
-    --random-rotation-angle 0
-    --shortest-image-edge 256
-    --crop-fraction 1.0
 
     --use-percentiles
 
@@ -367,7 +361,7 @@ else
 fi
 
 # ============================================================
-# 3. Same-episode open-loop eval
+# 3. Same-episode SO100 open-loop eval
 # ============================================================
 
 if [[ "${RUN_EVAL}" != "1" ]]; then
@@ -404,7 +398,6 @@ while (( STEP <= MAX_STEPS )); do
         --traj-ids "${EVAL_TRAJ_IDS[@]}" \
         --execution-horizon "${EXECUTION_HORIZON}" \
         --steps "${EVAL_STEPS}" \
-        --modality-keys joint \
         2>&1 | tee "${EVAL_LOG}"
 
     MSE="$(

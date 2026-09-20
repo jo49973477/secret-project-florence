@@ -68,6 +68,39 @@ class Gr00tN1d7ActionHead(nn.Module):
         self.hidden_size = config.hidden_size
         self.input_embedding_dim = config.input_embedding_dim
 
+        if config.action_head_dropout_override is not None:
+            config.diffusion_model_cfg = {
+                **config.diffusion_model_cfg,
+                "dropout": config.action_head_dropout_override,
+            }
+
+        vl_self_attention_cfg = getattr(config, "vl_self_attention_cfg", None)
+        if config.vl_self_attention_dropout_override is not None:
+            if not vl_self_attention_cfg or vl_self_attention_cfg.get("num_layers", 0) <= 0:
+                logger.warning(
+                    "VL self-attention dropout override was requested, but this checkpoint "
+                    "does not enable a VL self-attention stack."
+                )
+            else:
+                vl_self_attention_cfg = {
+                    **vl_self_attention_cfg,
+                    "dropout": config.vl_self_attention_dropout_override,
+                }
+                config.vl_self_attention_cfg = vl_self_attention_cfg
+
+        logger.info(
+            "Resolved action-head diffusion dropout: %s",
+            config.diffusion_model_cfg.get("dropout"),
+        )
+        logger.info(
+            "Resolved VL self-attention dropout: %s",
+            (
+                vl_self_attention_cfg.get("dropout")
+                if vl_self_attention_cfg and vl_self_attention_cfg.get("num_layers", 0) > 0
+                else "disabled"
+            ),
+        )
+
         if config.dit_type == "alternate_vl_dit":
             self.model = AlternateVLDiT(
                 **config.diffusion_model_cfg,
@@ -131,7 +164,6 @@ class Gr00tN1d7ActionHead(nn.Module):
             nn.LayerNorm(config.backbone_embedding_dim) if config.use_vlln else nn.Identity()
         )
 
-        vl_self_attention_cfg = getattr(config, "vl_self_attention_cfg", None)
         if vl_self_attention_cfg and vl_self_attention_cfg.get("num_layers", 0) > 0:
             self.vl_self_attention = SelfAttentionTransformer(**vl_self_attention_cfg)
         else:
@@ -411,6 +443,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 tactile_tokens=tactile_tokens,
                 image_mask=backbone_output.image_mask,
                 backbone_attention_mask=backbone_output.backbone_attention_mask,
+                hidden_attention_mask=hidden_attention_mask,
                 return_all_hidden_states=True,
             )
         else:
@@ -613,6 +646,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                     tactile_tokens=tactile_tokens,
                     image_mask=backbone_output.image_mask,
                     backbone_attention_mask=backbone_output.backbone_attention_mask,
+                    hidden_attention_mask=hidden_attention_mask,
                 )
             else:
                 model_output = self.model(

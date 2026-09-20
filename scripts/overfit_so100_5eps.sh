@@ -9,12 +9,12 @@ set -Eeuo pipefail
 #      known-good NEW_EMBODIMENT 5-episode example.
 #   2) Evaluate the SAME five training episodes at every checkpoint.
 #
-# Default MODE=official:
+# Optional MODE=official:
 #   - Keeps NVIDIA's official fine-tuning recipe as closely as practical.
 #   - On small GPUs, GLOBAL_BATCH_SIZE=2 + GRAD_ACCUM_STEPS=16
 #     approximates effective batch 32 without needing batch 16/GPU.
 #
-# Optional MODE=overfit:
+# Default MODE=overfit:
 #   - Removes augmentation/regularization and grad accumulation to make
 #     memorization easier.
 #
@@ -33,7 +33,7 @@ cd "${REPO_ROOT}"
 # shellcheck source=scripts/lib/checkpoint_resume.sh
 source "${REPO_ROOT}/scripts/lib/checkpoint_resume.sh"
 
-MODE="${MODE:-official}"
+MODE="${MODE:-overfit}"
 
 TRAIN_GPUS="${TRAIN_GPUS:-2,3}"
 EVAL_GPU="${EVAL_GPU:-2}"
@@ -114,6 +114,26 @@ if [[ ! "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]] || [[ ! "${SAVE_STEPS}" =~ ^[1-9][0-9
 fi
 ALL_CHECKPOINTS_LIMIT=$(((MAX_STEPS + SAVE_STEPS - 1) / SAVE_STEPS))
 checkpoint_resume_configure "${OUTPUT_DIR}" "${ALL_CHECKPOINTS_LIMIT}"
+checkpoint_resume_require_fresh_output "${OUTPUT_DIR}"
+
+PROCESSING_ARGS=(
+    --random-rotation-angle "${RANDOM_ROTATION}"
+    --color-jitter-params
+        brightness "${CJ_BRIGHTNESS}"
+        contrast "${CJ_CONTRAST}"
+        saturation "${CJ_SATURATION}"
+        hue "${CJ_HUE}"
+)
+if [[ "${MODE}" == "overfit" ]]; then
+    PROCESSING_ARGS=(
+        --action-head-dropout 0
+        --vl-self-attention-dropout 0
+        --disable-color-jitter
+        --random-rotation-angle 0
+        --shortest-image-edge 256
+        --crop-fraction 1.0
+    )
+fi
 
 # ------------------------------------------------------------
 # Safety checks
@@ -168,6 +188,8 @@ echo "Output                    : ${OUTPUT_DIR}"
 echo "Max steps                 : ${MAX_STEPS}"
 echo "Save steps                : ${SAVE_STEPS}"
 echo "Learning rate             : ${LR}"
+echo "Resolved VLM LR           : ${LR}"
+echo "Resolved action-head LR   : ${LR}"
 echo "Global/micro batch        : ${GLOBAL_BATCH_SIZE}"
 echo "Gradient accumulation     : ${GRAD_ACCUM_STEPS}"
 echo "Effective batch           : $((GLOBAL_BATCH_SIZE * GRAD_ACCUM_STEPS))"
@@ -212,12 +234,7 @@ if [[ "${NUM_GPUS}" -eq 1 ]]; then
         --num-shards-per-epoch "${NUM_SHARDS_PER_EPOCH}" \
         --episode-sampling-rate "${EPISODE_SAMPLING_RATE}" \
         --state-dropout-prob "${STATE_DROPOUT_PROB}" \
-        --random-rotation-angle "${RANDOM_ROTATION}" \
-        --color-jitter-params \
-            brightness "${CJ_BRIGHTNESS}" \
-            contrast "${CJ_CONTRAST}" \
-            saturation "${CJ_SATURATION}" \
-            hue "${CJ_HUE}" \
+        "${PROCESSING_ARGS[@]}" \
         "${PERCENTILE_ARG[@]}" \
         "${CHECKPOINT_SAVE_ARGS[@]}" \
         "${CHECKPOINT_RESUME_ARGS[@]}" \
@@ -248,12 +265,7 @@ else
         --num-shards-per-epoch "${NUM_SHARDS_PER_EPOCH}" \
         --episode-sampling-rate "${EPISODE_SAMPLING_RATE}" \
         --state-dropout-prob "${STATE_DROPOUT_PROB}" \
-        --random-rotation-angle "${RANDOM_ROTATION}" \
-        --color-jitter-params \
-            brightness "${CJ_BRIGHTNESS}" \
-            contrast "${CJ_CONTRAST}" \
-            saturation "${CJ_SATURATION}" \
-            hue "${CJ_HUE}" \
+        "${PROCESSING_ARGS[@]}" \
         "${PERCENTILE_ARG[@]}" \
         "${CHECKPOINT_SAVE_ARGS[@]}" \
         "${CHECKPOINT_RESUME_ARGS[@]}" \

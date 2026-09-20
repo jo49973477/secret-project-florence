@@ -55,6 +55,7 @@ export DATALOADER_NUM_WORKERS=0
 # 매 100 step마다 checkpoint 저장
 MAX_STEPS="${MAX_STEPS:-2000}"
 SAVE_STEPS="${SAVE_STEPS:-100}"
+LR="${LR:-1e-4}"
 export MAX_STEPS SAVE_STEPS
 
 if [[ ! "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]] || [[ ! "${SAVE_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
@@ -75,6 +76,8 @@ echo "Dataset         : ${TRAIN_DATASET_PATH}"
 echo "Output          : ${OUTPUT_DIR}"
 echo "Max steps       : ${MAX_STEPS}"
 echo "Save interval   : ${SAVE_STEPS}"
+echo "Resolved VLM LR : ${LR}"
+echo "Resolved head LR: ${LR}"
 echo "DeepSpeed stage : ${DEEPSPEED_STAGE}"
 checkpoint_resume_print_status "${OUTPUT_DIR}"
 echo "============================================================"
@@ -94,6 +97,7 @@ uv run bash examples/finetune.sh \
   --modality-config-path "${MODALITY_CONFIG}" \
   --output-dir "${OUTPUT_DIR}" \
   -- \
+  --learning-rate "${LR}" \
   --gradient-accumulation-steps 32 \
   2>&1 | tee "${TRAIN_LOG}"
 

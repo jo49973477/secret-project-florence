@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # Finetune config used for single node post-training.
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import warnings
 
 
@@ -112,7 +112,14 @@ class FinetuneConfig:
     random_rotation_angle: int | None = None
     """Maximum rotation angle (in degrees) for random rotation augmentation of input images."""
 
-    color_jitter_params: dict[str, float] | None = None
+    color_jitter_params: dict[str, float] | None = field(
+        default_factory=lambda: {
+            "brightness": 0.3,
+            "contrast": 0.4,
+            "saturation": 0.5,
+            "hue": 0.08,
+        }
+    )
     """
     Parameters for color jitter augmentation on images.
 
@@ -123,8 +130,11 @@ class FinetuneConfig:
       - "hue": float
     Example: {"brightness": 0.4, "contrast": 0.4, "saturation": 0.4, "hue": 0.1}
 
-    If None, applying the default color jitter augmentation from the pretrained model.
+    If None, color jitter is disabled. The default preserves the normal fine-tuning augmentation.
     """
+
+    disable_color_jitter: bool = False
+    """Explicitly disable color jitter, including a value saved in the pretrained processor."""
 
     use_percentiles: bool = True
     """
@@ -132,14 +142,14 @@ class FinetuneConfig:
     If False, use full min/max statistics.
     """
 
-    shortest_image_edge: int | None = None
+    shortest_image_edge: int | None = 256
     """
     Resize images so the shortest edge has this size before fractional cropping.
     If set, crop_fraction must also be set and legacy image_crop_size/image_target_size
     preprocessing is disabled.
     """
 
-    crop_fraction: float | None = None
+    crop_fraction: float | None = 0.95
     """
     Fraction of the resized image retained by the random/center crop.
     If set, shortest_image_edge must also be set and legacy image_crop_size/image_target_size
@@ -174,13 +184,19 @@ class FinetuneConfig:
     """Number of parallel worker processes used for data loading."""
 
     learning_rate: float = 1e-4
-    """Legacy/default optimizer learning rate for backward compatibility."""
+    """Default optimizer learning rate, used by either split LR when it is omitted."""
 
-    vlm_learning_rate: float = 1e-4
-    """Learning rate for trainable VLM backbone parameters, including LoRA adapters."""
+    vlm_learning_rate: float | None = None
+    """Optional LR for trainable VLM parameters, including LoRA. Falls back to learning_rate."""
 
-    action_head_learning_rate: float = 1e-3
-    """Learning rate for trainable parameters owned by the GR00T action head."""
+    action_head_learning_rate: float | None = None
+    """Optional LR for GR00T action-head parameters. Falls back to learning_rate."""
+
+    action_head_dropout: float | None = None
+    """Optional DiT/action-head dropout override. None preserves the normal model setting."""
+
+    vl_self_attention_dropout: float | None = None
+    """Optional VL self-attention dropout override. None preserves the normal model setting."""
 
     gradient_accumulation_steps: int = 1
     """Forward passes per optimizer step. Multiplies ``global_batch_size`` to
@@ -254,18 +270,39 @@ class FinetuneConfig:
     The processor (tokenizer/config) is still loaded from base_model_path.
     Useful for CI/testing to skip the slow checkpoint shard loading."""
 
+    @property
+    def resolved_vlm_learning_rate(self) -> float:
+        return self.learning_rate if self.vlm_learning_rate is None else self.vlm_learning_rate
+
+    @property
+    def resolved_action_head_learning_rate(self) -> float:
+        return (
+            self.learning_rate
+            if self.action_head_learning_rate is None
+            else self.action_head_learning_rate
+        )
+
     def __post_init__(self) -> None:
         if self.deepspeed_stage not in (2, 3):
             raise ValueError(f"deepspeed_stage must be 2 or 3, got {self.deepspeed_stage}")
-        if self.vlm_learning_rate <= 0:
+        if self.learning_rate <= 0:
+            raise ValueError(f"learning_rate must be positive, got {self.learning_rate}")
+        if self.resolved_vlm_learning_rate <= 0:
             raise ValueError(
-                f"vlm_learning_rate must be positive, got {self.vlm_learning_rate}"
+                "resolved vlm_learning_rate must be positive, got "
+                f"{self.resolved_vlm_learning_rate}"
             )
-        if self.action_head_learning_rate <= 0:
+        if self.resolved_action_head_learning_rate <= 0:
             raise ValueError(
-                "action_head_learning_rate must be positive, got "
-                f"{self.action_head_learning_rate}"
+                "resolved action_head_learning_rate must be positive, got "
+                f"{self.resolved_action_head_learning_rate}"
             )
+        for name, value in (
+            ("action_head_dropout", self.action_head_dropout),
+            ("vl_self_attention_dropout", self.vl_self_attention_dropout),
+        ):
+            if value is not None and not 0.0 <= value < 1.0:
+                raise ValueError(f"{name} must be in [0, 1), got {value}")
         if self.use_lora and (self.tune_llm or self.tune_visual):
             raise ValueError("use_lora cannot be combined with tune_llm or tune_visual")
         if self.use_lora and (

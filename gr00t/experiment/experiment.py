@@ -268,6 +268,14 @@ def run(config: Config):
         per_device_train_batch_size = config.training.per_gpu_batch_size
 
     # Create training arguments
+    resolved_vlm_lr = config.training.resolved_vlm_learning_rate
+    resolved_action_head_lr = config.training.resolved_action_head_learning_rate
+    logging.info(
+        "Resolved optimizer learning rates: VLM=%g, Action Head=%g (base learning_rate=%g)",
+        resolved_vlm_lr,
+        resolved_action_head_lr,
+        config.training.learning_rate,
+    )
     training_args = TrainingArguments(
         output_dir=str(output_dir),
         max_steps=config.training.max_steps,
@@ -310,8 +318,8 @@ def run(config: Config):
         eval_dataset=eval_dataset,
         data_collator=data_collator,
         multiprocessing_context=config.data.multiprocessing_context,
-        vlm_learning_rate=config.training.vlm_learning_rate,
-        action_head_learning_rate=config.training.action_head_learning_rate,
+        vlm_learning_rate=resolved_vlm_lr,
+        action_head_learning_rate=resolved_action_head_lr,
     )
 
     trainer.add_callback(

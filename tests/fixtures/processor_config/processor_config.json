@@ -133,6 +133,7 @@
     "shortest_image_edge": 256,
     "crop_fraction": 0.95,
     "letter_box_transform": false,
+    "extra_augmentation_config": null,
     "model_name": "nvidia/Cosmos-Reason2-2B",
     "model_type": "qwen",
     "formalize_language": true,

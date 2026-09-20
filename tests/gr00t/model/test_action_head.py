@@ -116,6 +116,37 @@ def _small_multimodal_config(**overrides) -> Gr00tN1d7Config:
     )
 
 
+def test_checkpoint_config_accepts_explicit_dropout_overrides(tmp_path):
+    checkpoint_config = _small_config(
+        attn_dropout=0.2,
+        vl_self_attention_cfg={
+            "num_layers": 1,
+            "num_attention_heads": 2,
+            "attention_head_dim": 32,
+            "output_dim": 64,
+            "dropout": 0.2,
+            "final_dropout": True,
+        },
+        diffusion_model_cfg={
+            **_small_config().diffusion_model_cfg,
+            "dropout": 0.2,
+        },
+    )
+    checkpoint_config.save_pretrained(tmp_path)
+
+    loaded = Gr00tN1d7Config.from_pretrained(
+        tmp_path,
+        action_head_dropout_override=0.0,
+        vl_self_attention_dropout_override=0.0,
+    )
+    head = Gr00tN1d7ActionHead(loaded)
+
+    assert loaded.diffusion_model_cfg["dropout"] == 0.0
+    assert loaded.vl_self_attention_cfg["dropout"] == 0.0
+    assert head.model.config.dropout == 0.0
+    assert head.vl_self_attention.config.dropout == 0.0
+
+
 class TestActionHeadForward:
     """Test training forward pass."""
 
@@ -212,6 +243,36 @@ class TestActionHeadGetAction:
 
     def test_get_action_keeps_padding_zero(self, action_head):
         head, config = action_head
+        action_input = _make_action_input(config)
+        del action_input["action"]
+        action_input["action_mask"].zero_()
+        action_input["action_mask"][:, :2, :5] = 1
+
+        out = head.get_action(_make_backbone_output(config), action_input)
+
+        invalid = action_input["action_mask"] == 0
+        assert torch.count_nonzero(out["action_pred"][invalid]) == 0
+
+    def test_rtc_inpainting_keeps_padding_zero(self, action_head):
+        head, config = action_head
+        action_input = _make_action_input(config)
+        action_input["action_mask"].zero_()
+        action_input["action_mask"][:, :2, :5] = 1
+        options = {
+            "action_horizon": config.action_horizon,
+            "rtc_overlap_steps": 2,
+            "rtc_frozen_steps": 1,
+            "rtc_ramp_rate": 2.0,
+        }
+
+        out = head.get_action(_make_backbone_output(config), action_input, options=options)
+
+        invalid = action_input["action_mask"] == 0
+        assert torch.count_nonzero(out["action_pred"][invalid]) == 0
+
+    def test_multimodal_get_action_keeps_padding_zero(self):
+        config = _small_multimodal_config()
+        head = Gr00tN1d7ActionHead(config).eval()
         action_input = _make_action_input(config)
         del action_input["action"]
         action_input["action_mask"].zero_()

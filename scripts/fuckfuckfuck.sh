@@ -61,6 +61,7 @@ GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-16}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-0}"
 
 STATE_DROPOUT_PROB="${STATE_DROPOUT_PROB:-0.0}"
+LR="${LR:-1e-4}"
 
 RUN_NAME="${RUN_NAME:-univtac_rgb_joint_h16_$(date +%Y%m%d_%H%M%S)}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/${RUN_NAME}}"
@@ -140,6 +141,8 @@ echo "Global batch           : ${GLOBAL_BATCH_SIZE}"
 echo "Gradient accumulation  : ${GRAD_ACCUM_STEPS}"
 echo "Effective batch        : ${EFFECTIVE_BATCH_SIZE}"
 echo "State dropout          : ${STATE_DROPOUT_PROB}"
+echo "Resolved VLM LR        : ${LR}"
+echo "Resolved action-head LR: ${LR}"
 echo "Execution horizon      : ${EXECUTION_HORIZON}"
 echo "DeepSpeed stage : ${DEEPSPEED_STAGE}"
 checkpoint_resume_print_status "${OUTPUT_DIR}"
@@ -161,6 +164,7 @@ uv run bash examples/finetune.sh \
     --output-dir "${OUTPUT_DIR}" \
     --state-dropout-prob "${STATE_DROPOUT_PROB}" \
     -- \
+    --learning-rate "${LR}" \
     --gradient-accumulation-steps "${GRAD_ACCUM_STEPS}" \
     2>&1 | tee "${TRAIN_LOG}"
 

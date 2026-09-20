@@ -36,7 +36,6 @@ from gr00t.data.state_action.action_chunking import EndEffectorActionChunk, Join
 from gr00t.data.state_action.pose import EndEffectorPose, JointPose
 from gr00t.data.utils import (
     apply_sin_cos_encoding,
-    nested_dict_to_numpy,
     normalize_values_meanstd,
     normalize_values_minmax,
     parse_modality_configs,
@@ -144,6 +143,20 @@ class StateActionProcessor:
 
     def _compute_normalization_parameters(self) -> None:
         """Compute and cache normalization parameters from statistics for all embodiments and modalities."""
+
+        def select_normalization_params(stats: dict[str, list[float]]) -> dict[str, np.ndarray]:
+            """Copy stats and apply the active min/max policy without mutating source data."""
+            min_key, max_key = ("q01", "q99") if self.use_percentiles else ("min", "max")
+            min_vals = np.asarray(stats[min_key]).copy()
+            max_vals = np.asarray(stats[max_key]).copy()
+            return {
+                "min": min_vals,
+                "max": max_vals,
+                "dim": np.array(min_vals.shape[0]),
+                "mean": np.asarray(stats["mean"]).copy(),
+                "std": np.asarray(stats["std"]).copy(),
+            }
+
         for embodiment_tag in self.statistics:
             self.norm_params[embodiment_tag] = {}
 
@@ -154,27 +167,9 @@ class StateActionProcessor:
                 self.norm_params[embodiment_tag][modality] = {}
 
                 for joint_group, stats in self.statistics[embodiment_tag][modality].items():
-                    if self.use_percentiles:
-                        min_vals = np.array(stats["q01"])
-                        max_vals = np.array(stats["q99"])
-                    else:
-                        min_vals = np.array(stats["min"])
-                        max_vals = np.array(stats["max"])
-
-                    mean_vals = np.array(stats["mean"])
-                    std_vals = np.array(stats["std"])
-
-                    # Compute range, ensuring it's not zero
-                    range_vals = max_vals - min_vals
-                    range_vals = np.maximum(range_vals, 1e-8)
-
-                    self.norm_params[embodiment_tag][modality][joint_group] = {
-                        "min": min_vals,
-                        "max": max_vals,
-                        "dim": np.array(range_vals.shape[0]),
-                        "mean": mean_vals,
-                        "std": std_vals,
-                    }
+                    self.norm_params[embodiment_tag][modality][joint_group] = (
+                        select_normalization_params(stats)
+                    )
 
             # Override absolute action stats with relative stats where specified
             if "action" in self.modality_configs[embodiment_tag]:
@@ -197,11 +192,13 @@ class StateActionProcessor:
                                     f"Relative action statistics required for key '{key}' "
                                     f"in embodiment '{embodiment_tag}' but not found"
                                 )
-                            action_dim = self.norm_params[embodiment_tag]["action"][key]["dim"]
-                            self.norm_params[embodiment_tag]["action"][key] = nested_dict_to_numpy(
-                                self.statistics[embodiment_tag]["relative_action"][key]
+                            # Relative actions use the same percentile/min-max policy
+                            # as absolute actions while retaining relative mean/std.
+                            self.norm_params[embodiment_tag]["action"][key] = (
+                                select_normalization_params(
+                                    self.statistics[embodiment_tag]["relative_action"][key]
+                                )
                             )
-                            self.norm_params[embodiment_tag]["action"][key]["dim"] = action_dim
 
     def apply_state(
         self,

@@ -5,12 +5,13 @@
 
 from types import SimpleNamespace
 
+from gr00t.configs.finetune_config import FinetuneConfig
+from gr00t.configs.training.training_config import TrainingConfig
+from gr00t.experiment.trainer import Gr00tTrainer
 import pytest
 import torch
 from torch import nn
 from transformers import TrainingArguments
-
-from gr00t.experiment.trainer import Gr00tTrainer
 
 
 class _ToyBackbone(nn.Module):
@@ -42,7 +43,7 @@ class _ToySplitModel(nn.Module):
         return {"loss": loss}
 
 
-def _make_trainer(tmp_path, model=None):
+def _make_trainer(tmp_path, model=None, *, vlm_lr=1e-4, action_head_lr=1e-3):
     args = TrainingArguments(
         output_dir=str(tmp_path),
         learning_rate=7e-4,
@@ -53,8 +54,8 @@ def _make_trainer(tmp_path, model=None):
     return Gr00tTrainer(
         model=_ToySplitModel() if model is None else model,
         args=args,
-        vlm_learning_rate=1e-4,
-        action_head_learning_rate=1e-3,
+        vlm_learning_rate=vlm_lr,
+        action_head_learning_rate=action_head_lr,
     )
 
 
@@ -64,6 +65,59 @@ def _learning_rate_by_parameter_id(optimizer):
         for group in optimizer.param_groups
         for parameter in group["params"]
     }
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected_vlm", "expected_head"),
+    [
+        ({"learning_rate": 3e-4}, 3e-4, 3e-4),
+        ({"learning_rate": 3e-4, "action_head_learning_rate": 1e-3}, 3e-4, 1e-3),
+        (
+            {
+                "learning_rate": 3e-4,
+                "vlm_learning_rate": 2e-4,
+                "action_head_learning_rate": 1e-3,
+            },
+            2e-4,
+            1e-3,
+        ),
+    ],
+)
+def test_split_learning_rate_resolution(kwargs, expected_vlm, expected_head):
+    training = TrainingConfig(**kwargs)
+    finetune = FinetuneConfig(
+        base_model_path="model",
+        dataset_path="dataset",
+        embodiment_tag="NEW_EMBODIMENT",
+        **kwargs,
+    )
+
+    assert training.resolved_vlm_learning_rate == pytest.approx(expected_vlm)
+    assert training.resolved_action_head_learning_rate == pytest.approx(expected_head)
+    assert finetune.resolved_vlm_learning_rate == pytest.approx(expected_vlm)
+    assert finetune.resolved_action_head_learning_rate == pytest.approx(expected_head)
+
+
+def test_resolved_rates_reach_optimizer_groups(tmp_path):
+    training = TrainingConfig(learning_rate=3e-4, action_head_learning_rate=1e-3)
+    trainer = _make_trainer(
+        tmp_path,
+        vlm_lr=training.resolved_vlm_learning_rate,
+        action_head_lr=training.resolved_action_head_learning_rate,
+    )
+    optimizer = trainer.create_optimizer()
+    rates = _learning_rate_by_parameter_id(optimizer)
+
+    assert all(
+        rates[id(parameter)] == pytest.approx(3e-4)
+        for parameter in trainer.model.backbone.parameters()
+        if parameter.requires_grad
+    )
+    assert all(
+        rates[id(parameter)] == pytest.approx(1e-3)
+        for parameter in trainer.model.action_head.parameters()
+        if parameter.requires_grad
+    )
 
 
 def test_split_optimizer_has_complete_unique_coverage_and_expected_lrs(tmp_path):
@@ -97,8 +151,7 @@ def test_split_optimizer_has_complete_unique_coverage_and_expected_lrs(tmp_path)
     assert len(optimizer_ids) == len(set(optimizer_ids))
     assert all(learning_rates[parameter_id] == pytest.approx(1e-4) for parameter_id in vlm_ids)
     assert all(
-        learning_rates[parameter_id] == pytest.approx(1e-3)
-        for parameter_id in action_head_ids
+        learning_rates[parameter_id] == pytest.approx(1e-3) for parameter_id in action_head_ids
     )
     assert frozen_backbone_ids.isdisjoint(optimizer_ids)
 
@@ -134,12 +187,8 @@ def test_split_optimizer_allows_an_empty_vlm_group(tmp_path):
     optimizer = trainer.create_optimizer()
 
     assert {group["lr"] for group in optimizer.param_groups} == {1e-3}
-    assert {
-        id(parameter) for group in optimizer.param_groups for parameter in group["params"]
-    } == {
-        id(parameter)
-        for parameter in model.action_head.parameters()
-        if parameter.requires_grad
+    assert {id(parameter) for group in optimizer.param_groups for parameter in group["params"]} == {
+        id(parameter) for parameter in model.action_head.parameters() if parameter.requires_grad
     }
 
 

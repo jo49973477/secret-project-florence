@@ -274,9 +274,7 @@ class Gr00tTrainer(Trainer):
 
         decay_parameter_names = set(self.get_decay_parameter_names(model))
         decay_parameter_ids = {
-            id(parameter)
-            for name, parameter in named_parameters
-            if name in decay_parameter_names
+            id(parameter) for name, parameter in named_parameters if name in decay_parameter_names
         }
 
         group_specs = (
@@ -296,7 +294,6 @@ class Gr00tTrainer(Trainer):
             ),
         )
         optimizer_groups: list[dict[str, Any]] = []
-        group_counts: dict[str, tuple[int, int]] = {}
         for group_name, owner_ids, use_decay, learning_rate in group_specs:
             parameters = [
                 parameter
@@ -304,13 +301,10 @@ class Gr00tTrainer(Trainer):
                 if id(parameter) in owner_ids
                 and (id(parameter) in decay_parameter_ids) == use_decay
             ]
-            group_counts[group_name] = (
-                sum(parameter.numel() for parameter in parameters),
-                len(parameters),
-            )
             if parameters:
                 optimizer_groups.append(
                     {
+                        "name": group_name,
                         "params": parameters,
                         "lr": learning_rate,
                         "weight_decay": self.args.weight_decay if use_decay else 0.0,
@@ -347,28 +341,21 @@ class Gr00tTrainer(Trainer):
             if id(parameter) in action_head_parameter_ids
         )
         logging.info(
-            "Optimizer parameter groups:\n"
-            "  VLM:\n"
-            "    lr = %.1e\n"
-            "    trainable parameters = %s\n"
-            "    tensors = %d\n"
-            "    decay/no_decay tensors = %d/%d\n"
-            "  Action Head:\n"
-            "    lr = %.1e\n"
-            "    trainable parameters = %s\n"
-            "    tensors = %d\n"
-            "    decay/no_decay tensors = %d/%d",
-            self.vlm_learning_rate,
+            "Optimizer ownership: VLM=%s parameters/%d tensors, Action Head=%s parameters/%d tensors",
             f"{vlm_parameter_count:,}",
             len(vlm_parameter_ids),
-            group_counts["VLM decay"][1],
-            group_counts["VLM no_decay"][1],
-            self.action_head_learning_rate,
             f"{action_head_parameter_count:,}",
             len(action_head_parameter_ids),
-            group_counts["Action Head decay"][1],
-            group_counts["Action Head no_decay"][1],
         )
+        for group in optimizer_groups:
+            logging.info(
+                "Optimizer group %r: lr=%g, weight_decay=%g, tensors=%d, trainable_parameters=%s",
+                group["name"],
+                group["lr"],
+                group["weight_decay"],
+                len(group["params"]),
+                f"{sum(parameter.numel() for parameter in group['params']):,}",
+            )
         return optimizer_groups
 
     @staticmethod

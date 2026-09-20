@@ -107,7 +107,9 @@ if __name__ == "__main__":
     config.model.tune_multimodal_adapter = ft_config.tune_multimodal_adapter
     config.model.state_dropout_prob = ft_config.state_dropout_prob
     config.model.random_rotation_angle = ft_config.random_rotation_angle
-    config.model.color_jitter_params = ft_config.color_jitter_params
+    config.model.color_jitter_params = (
+        None if ft_config.disable_color_jitter else ft_config.color_jitter_params
+    )
     config.model.use_percentiles = ft_config.use_percentiles
     if (ft_config.shortest_image_edge is None) != (ft_config.crop_fraction is None):
         raise ValueError("shortest_image_edge and crop_fraction must be set together")
@@ -126,6 +128,10 @@ if __name__ == "__main__":
     config.model.model_name = "nvidia/Cosmos-Reason2-2B"
     config.model.backbone_trainable_params_fp32 = True
     config.model.use_relative_action = True
+    if ft_config.action_head_dropout is not None:
+        config.model.action_head_dropout_override = ft_config.action_head_dropout
+    if ft_config.vl_self_attention_dropout is not None:
+        config.model.vl_self_attention_dropout_override = ft_config.vl_self_attention_dropout
 
     config.training.experiment_name = ft_config.experiment_name
     config.training.start_from_checkpoint = ft_config.base_model_path
