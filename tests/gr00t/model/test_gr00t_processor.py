@@ -265,17 +265,22 @@ class TestProcessorCall:
             delta_indices=[0], modality_keys=["xyz"]
         )
         processor.modality_configs[EMBODIMENT]["tactile"] = ModalityConfig(
-            delta_indices=[0], modality_keys=["rgb"]
+            delta_indices=[-1, 0], modality_keys=["rgb"]
         )
         step_data = _make_step_data(proc_config)
         step_data.pointclouds = {"xyz": np.random.randn(1, 32, 3).astype(np.float32)}
-        step_data.tactile = {"rgb": [np.random.randint(0, 256, (24, 32, 3), dtype=np.uint8)]}
+        step_data.tactile = {
+            "rgb": [
+                np.random.randint(0, 256, (24, 32, 3), dtype=np.uint8),
+                np.random.randint(0, 256, (24, 32, 3), dtype=np.uint8),
+            ]
+        }
 
         result = processor([{"type": MessageType.EPISODE_STEP.value, "content": step_data}])
 
         assert result["points"].shape == (32, 3)
         assert result["points"].dtype.is_floating_point
-        assert result["tactile"].shape == (3, 24, 32)
+        assert result["tactile"].shape == (2, 3, 24, 32)
         assert result["tactile"].dtype.is_floating_point
         assert 0.0 <= result["tactile"].min() <= result["tactile"].max() <= 1.0
 
@@ -287,7 +292,7 @@ class TestProcessorCall:
             ]
         )["inputs"]
         assert batch["points"].shape == (2, 32, 3)
-        assert batch["tactile"].shape == (2, 3, 24, 32)
+        assert batch["tactile"].shape == (2, 2, 3, 24, 32)
 
     def test_inference_action_mask_covers_horizon_and_dimension(self, processor, proc_config):
         mc = proc_config["modality_configs"][EMBODIMENT]

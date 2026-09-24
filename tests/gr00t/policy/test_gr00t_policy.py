@@ -199,6 +199,30 @@ class TestGr00tPolicyCheckObservation:
         with pytest.raises(AssertionError, match="float32"):
             policy.check_observation(obs)
 
+    def test_tactile_history_repeats_after_reset_then_uses_previous(self, policy):
+        policy.modality_configs["tactile"] = ModalityConfig(
+            delta_indices=[-1, 0], modality_keys=["rgb"]
+        )
+        first = _make_observation()
+        first_frame = np.full((1, 1, 24, 32, 3), 17, dtype=np.uint8)
+        first["tactile"] = {"rgb": first_frame}
+
+        policy.check_observation(first)
+        first_pair = policy._with_tactile_history(first)["tactile"]["rgb"]
+        np.testing.assert_array_equal(first_pair[:, 0], first_frame[:, 0])
+        np.testing.assert_array_equal(first_pair[:, 1], first_frame[:, 0])
+
+        second = _make_observation()
+        second_frame = np.full((1, 1, 24, 32, 3), 29, dtype=np.uint8)
+        second["tactile"] = {"rgb": second_frame}
+        second_pair = policy._with_tactile_history(second)["tactile"]["rgb"]
+        np.testing.assert_array_equal(second_pair[:, 0], first_frame[:, 0])
+        np.testing.assert_array_equal(second_pair[:, 1], second_frame[:, 0])
+
+        policy.reset()
+        reset_pair = policy._with_tactile_history(second)["tactile"]["rgb"]
+        np.testing.assert_array_equal(reset_pair[:, 0], second_frame[:, 0])
+
 
 class TestGr00tPolicyGetAction:
     def test_get_action_returns_tuple(self, policy):

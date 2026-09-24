@@ -155,12 +155,12 @@ class TestGr00tN1d7Forward:
         model, config = small_model
         inputs = _make_dummy_inputs(config)
         inputs["points"] = torch.randn(2, 16, 3, dtype=torch.float64)
-        inputs["tactile"] = torch.randn(2, 3, 24, 32, dtype=torch.float64)
+        inputs["tactile"] = torch.randn(2, 2, 3, 24, 32, dtype=torch.float64)
 
         _, action_input = model.prepare_input(inputs)
 
         assert action_input.points.shape == (2, 16, 3)
-        assert action_input.tactile.shape == (2, 3, 24, 32)
+        assert action_input.tactile.shape == (2, 2, 3, 24, 32)
         assert action_input.points.device == model.device
         assert action_input.tactile.device == model.device
         assert action_input.points.dtype == model.dtype

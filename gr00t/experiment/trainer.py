@@ -167,6 +167,8 @@ class Gr00tTrainer(Trainer):
         self.multiprocessing_context = kwargs.pop("multiprocessing_context", "fork")
         self.vlm_learning_rate = kwargs.pop("vlm_learning_rate", None)
         self.action_head_learning_rate = kwargs.pop("action_head_learning_rate", None)
+        self.point_encoder_learning_rate = kwargs.pop("point_encoder_learning_rate", None)
+        self.tactile_encoder_learning_rate = kwargs.pop("tactile_encoder_learning_rate", None)
         super().__init__(*args, **kwargs)
 
     def create_optimizer(self):
@@ -230,6 +232,38 @@ class Gr00tTrainer(Trainer):
         action_head_parameter_ids = {
             id(parameter) for parameter in action_head.parameters() if parameter.requires_grad
         }
+        point_encoder = getattr(action_head, "point_encoder", None)
+        point_backbone_parameter_ids: set[int] = set()
+        if self.point_encoder_learning_rate is not None and callable(
+            getattr(point_encoder, "backbone_parameters", None)
+        ):
+            point_backbone_parameter_ids = {
+                id(parameter)
+                for parameter in point_encoder.backbone_parameters()
+                if parameter.requires_grad
+            }
+            if not point_backbone_parameter_ids:
+                logging.info(
+                    "Point encoder backbone is frozen; no point-encoder LR optimizer group created"
+                )
+        action_head_standard_parameter_ids = (
+            action_head_parameter_ids - point_backbone_parameter_ids
+        )
+        tactile_encoder = getattr(action_head, "tactile_encoder", None)
+        tactile_backbone_parameter_ids: set[int] = set()
+        if self.tactile_encoder_learning_rate is not None and callable(
+            getattr(tactile_encoder, "backbone_parameters", None)
+        ):
+            tactile_backbone_parameter_ids = {
+                id(parameter)
+                for parameter in tactile_encoder.backbone_parameters()
+                if parameter.requires_grad
+            }
+            if not tactile_backbone_parameter_ids:
+                logging.info(
+                    "Tactile encoder backbone is frozen; no tactile-backbone LR group created"
+                )
+        action_head_standard_parameter_ids -= tactile_backbone_parameter_ids
 
         duplicate_parameter_ids = vlm_parameter_ids & action_head_parameter_ids
         classified_parameter_ids = vlm_parameter_ids | action_head_parameter_ids
@@ -282,15 +316,39 @@ class Gr00tTrainer(Trainer):
             ("VLM no_decay", vlm_parameter_ids, False, self.vlm_learning_rate),
             (
                 "Action Head decay",
-                action_head_parameter_ids,
+                action_head_standard_parameter_ids,
                 True,
                 self.action_head_learning_rate,
             ),
             (
                 "Action Head no_decay",
-                action_head_parameter_ids,
+                action_head_standard_parameter_ids,
                 False,
                 self.action_head_learning_rate,
+            ),
+            (
+                "Point Encoder Backbone decay",
+                point_backbone_parameter_ids,
+                True,
+                self.point_encoder_learning_rate,
+            ),
+            (
+                "Point Encoder Backbone no_decay",
+                point_backbone_parameter_ids,
+                False,
+                self.point_encoder_learning_rate,
+            ),
+            (
+                "Tactile Encoder Backbone decay",
+                tactile_backbone_parameter_ids,
+                True,
+                self.tactile_encoder_learning_rate,
+            ),
+            (
+                "Tactile Encoder Backbone no_decay",
+                tactile_backbone_parameter_ids,
+                False,
+                self.tactile_encoder_learning_rate,
             ),
         )
         optimizer_groups: list[dict[str, Any]] = []

@@ -78,6 +78,9 @@ cover/
 
 # App / framework stuff
 *.log
+.env
+.env.*
+!.env.example
 local_settings.py
 db.sqlite3
 db.sqlite3-journal

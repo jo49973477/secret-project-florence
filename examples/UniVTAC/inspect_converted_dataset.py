@@ -33,8 +33,6 @@ from convert_univtac_to_lerobot import (
     CHUNK_SIZE,
     JOINT_DATASET,
     JOINT_DIMENSION,
-    POINTCLOUD_ARRAY_KEY,
-    POINTCLOUD_OUTPUT_KEY,
     STATE_COLUMN,
     TACTILE_OUTPUT_KEYS,
     ConversionError,
@@ -163,6 +161,7 @@ def check_gr00t_loader(
         step_index=0,
         modality_configs=modality_configs,
         embodiment_tag=embodiment_tag,
+        allow_padding=True,
     )
 
     state_shape = sample.states["joint"].shape
@@ -198,24 +197,43 @@ def check_gr00t_loader(
             np.testing.assert_array_equal(
                 tactile[0], episode_data[f"tactile.{tactile_key}"].iloc[0]
             )
+            np.testing.assert_array_equal(
+                tactile[-1], episode_data[f"tactile.{tactile_key}"].iloc[0]
+            )
+            delta_indices = modality_configs["tactile"].delta_indices
+            fps = float(read_json(dataset_root / "meta/info.json")["fps"])
+            separation_ms = (delta_indices[-1] - delta_indices[0]) * 1000.0 / fps
             print(
-                f"GR00T sample tactile.{tactile_key}: {tactile_array.shape} {tactile_array.dtype}"
+                f"GR00T sample tactile.{tactile_key}:\n"
+                f"  delta_indices = {delta_indices}\n"
+                f"  shape = {list(tactile_array.shape)}\n"
+                f"  dtype = {tactile_array.dtype}\n"
+                f"  temporal separation = {separation_ms:g} ms at {fps:g} FPS\n"
+                "  episode-start behavior = repeat frame 0"
             )
     elif sample.tactile is not None:
         raise ConversionError("RGB-only config unexpectedly returned tactile data")
 
     if "pointcloud" in modality_configs:
-        if sample.pointclouds is None or set(sample.pointclouds) != {"xyz"}:
+        expected_keys = set(modality_configs["pointcloud"].modality_keys)
+        if sample.pointclouds is None or set(sample.pointclouds) != expected_keys:
             raise ConversionError(
                 f"GR00T loader returned invalid point-cloud keys: {sample.pointclouds}"
             )
-        xyz = sample.pointclouds["xyz"]
-        if xyz.shape != (1, 1024, 3) or xyz.dtype != np.float32:
-            raise ConversionError(
-                f"GR00T loader returned invalid pointcloud.xyz: {xyz.shape} {xyz.dtype}"
-            )
-        np.testing.assert_array_equal(xyz[0], episode_data["pointcloud.xyz"].iloc[0])
-        print(f"GR00T sample pointcloud.xyz: {xyz.shape} {xyz.dtype}")
+        for key in expected_keys:
+            points = sample.pointclouds[key]
+            if points.ndim != 3 or points.shape[0] != 1 or points.dtype != np.float32:
+                raise ConversionError(
+                    f"GR00T loader returned invalid pointcloud.{key}: {points.shape} {points.dtype}"
+                )
+            expected_feature_dim = 6 if key == "scene" else 3
+            if points.shape[-1] != expected_feature_dim:
+                raise ConversionError(
+                    f"pointcloud.{key} expected feature dim {expected_feature_dim}, "
+                    f"got {points.shape[-1]}"
+                )
+            np.testing.assert_array_equal(points[0], episode_data[f"pointcloud.{key}"].iloc[0])
+            print(f"GR00T sample pointcloud.{key}: {points.shape} {points.dtype}")
     elif sample.pointclouds is not None:
         raise ConversionError("RGB-only config unexpectedly returned point-cloud data")
 
@@ -314,22 +332,54 @@ def inspect_dataset(args: argparse.Namespace) -> None:
                 )
 
     if "pointcloud" in modality:
+        if len(modality["pointcloud"]) != 1:
+            raise ConversionError(
+                "Inspector expects one semantic point-cloud field, got "
+                f"{list(modality['pointcloud'])}"
+            )
+        pointcloud_key, pointcloud_meta = next(iter(modality["pointcloud"].items()))
+        original_key = pointcloud_meta["original_key"]
+        array_key = pointcloud_meta.get("array_key", pointcloud_key)
+        feature_shape = info["features"][original_key]["shape"]
         pointcloud_relative_path = info["pointcloud_path"].format(
             episode_chunk=chunk_index,
-            pointcloud_key=POINTCLOUD_OUTPUT_KEY,
+            pointcloud_key=original_key,
             episode_index=args.episode_index,
         )
         pointcloud_path = dataset_root / pointcloud_relative_path
         with np.load(pointcloud_path, allow_pickle=False) as archive:
-            xyz = archive[POINTCLOUD_ARRAY_KEY]
-            expected_shape = (episode["length"], 1024, 3)
-            if xyz.shape != expected_shape or xyz.dtype != np.float32:
+            points = archive[array_key]
+            expected_shape = (episode["length"], *feature_shape)
+            if points.shape != expected_shape or points.dtype != np.float32:
                 raise ConversionError(
-                    f"Invalid {pointcloud_path}:{POINTCLOUD_ARRAY_KEY}: "
-                    f"{xyz.shape} {xyz.dtype}; expected {expected_shape} float32"
+                    f"Invalid {pointcloud_path}:{array_key}: "
+                    f"{points.shape} {points.dtype}; expected {expected_shape} float32"
                 )
             print(f"Point cloud: {pointcloud_path}")
-            print(f"  shape/dtype: {xyz.shape} {xyz.dtype}")
+            print(f"  pointclouds.{pointcloud_key}: [1, {feature_shape[0]}, {feature_shape[1]}]")
+            print(f"  shape/dtype: {points.shape} {points.dtype}")
+            print(f"  scene coordinate frame: {pointcloud_meta.get('coordinate_frame')}")
+            print(
+                "  scene source cameras: "
+                f"{','.join(pointcloud_meta.get('source_cameras', [])) or 'not recorded'}"
+            )
+            print(
+                f"  XYZ min/max: {points[..., :3].min(axis=(0, 1))} / "
+                f"{points[..., :3].max(axis=(0, 1))}"
+            )
+            if points.shape[-1] >= 6:
+                print(f"  RGB min/max: {points[..., 3:6].min():g} / {points[..., 3:6].max():g}")
+            counts = pointcloud_meta.get("provenance_counts", {})
+            if counts:
+                print(
+                    "  valid points before dense fill: "
+                    f"{counts.get('valid_points_before_dense_fill')}"
+                )
+                print(
+                    "  head/wrist points before merge: "
+                    f"{counts.get('head_points_before_merge')} / "
+                    f"{counts.get('wrist_points_before_merge')}"
+                )
 
     if args.skip_source_comparison:
         print("Source comparison: skipped by request")

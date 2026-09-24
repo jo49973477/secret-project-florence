@@ -40,12 +40,16 @@ def build_univtac_config(*, multimodal: bool) -> dict[str, ModalityConfig]:
         config.update(
             {
                 "tactile": ModalityConfig(
-                    delta_indices=[0],
+                    # UniVTAC is nominally 10 Hz: t-1 to t is about 100 ms.
+                    # Sparsh used t-5 at 60 Hz (about 83 ms).
+                    delta_indices=[-1, 0],
                     modality_keys=["rgb"],
                 ),
                 "pointcloud": ModalityConfig(
                     delta_indices=[0],
-                    modality_keys=["xyz"],
+                    # One pre-aligned XYZRGB semantic field. Head and wrist points
+                    # are concatenated over N during conversion, never over features.
+                    modality_keys=["scene"],
                 ),
             }
         )

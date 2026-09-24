@@ -76,7 +76,7 @@ class VLAStepData:
     tactile: dict[str, list[np.ndarray]] | None = None
     """Tactile view name -> temporal list of uint8 HWC images."""
     pointclouds: dict[str, np.ndarray] | None = None
-    """Point-cloud name -> float32 array shaped (temporal_horizon, num_points, 3)."""
+    """Point-cloud name -> float32 array shaped (temporal_horizon, num_points, features)."""
 
 
 @dataclass

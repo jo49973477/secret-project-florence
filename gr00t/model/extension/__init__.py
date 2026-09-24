@@ -17,16 +17,20 @@
 
 from .multimodal_dit import MultiModalConditionedDiT
 from .point_encoder import (
+    ConcertoPointEncoder,
     PointEncoder,
     PointNet2Encoder,
     PointTransformerEncoder,
     build_point_encoder,
 )
-from .tactile_encoder import TactileEncoder
+from .tactile_encoder import SparshDinoTactileEncoder, TactileEncoder, build_tactile_encoder
 
 
 __all__ = [
     "MultiModalConditionedDiT",
+    "SparshDinoTactileEncoder",
+    "build_tactile_encoder",
+    "ConcertoPointEncoder",
     "PointEncoder",
     "PointNet2Encoder",
     "PointTransformerEncoder",

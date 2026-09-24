@@ -54,14 +54,41 @@ class FinetuneConfig:
     use_tactile_conditioning: bool = True
     """Enable tactile conditioning when using multimodal_conditioned_dit."""
 
-    point_input_dim: int = 3
+    point_input_dim: int = 6
     """Number of values per input point (3 for XYZ, 6 for XYZRGB)."""
 
     tactile_input_channels: int = 3
     """Number of tactile image input channels."""
 
-    point_encoder_cfg: str = "pointnet2"
+    tactile_encoder_cfg: str = "sparsh_dino_base"
+    """Tactile encoder backend: pretrained sparsh_dino_base (default) or resnet18."""
+
+    tactile_pretrained_model: str = "facebook/sparsh-dino-base"
+    """Hugging Face model ID, local checkpoint file, or local model directory."""
+
+    tactile_checkpoint_filename: str = "dino_vitbase.safetensors"
+    """Exact checkpoint filename within the Hugging Face repository/local directory."""
+
+    tactile_background_path: str | None = None
+    """Optional no-contact RGB background used by official Sparsh subtraction."""
+
+    point_encoder_cfg: str = "concerto_small"
     """Point encoder backend used by multimodal_conditioned_dit."""
+
+    point_encoder_checkpoint_path: str | None = None
+    """Optional local official Concerto .pth file; otherwise use Pointcept/Concerto."""
+
+    point_encoder_repo_id: str = "Pointcept/Concerto"
+    """Hugging Face repository used by the official Concerto loader."""
+
+    point_encoder_download_root: str | None = None
+    """Optional Concerto checkpoint cache directory."""
+
+    point_encoder_grid_size: float = 0.02
+    """Concerto serialization grid size in metres."""
+
+    point_encoder_enable_flash: bool | None = None
+    """Override Concerto FlashAttention use; None preserves checkpoint configuration."""
 
     # --- Model Tuning Flags ---
     tune_llm: bool = False
@@ -192,6 +219,12 @@ class FinetuneConfig:
     action_head_learning_rate: float | None = None
     """Optional LR for GR00T action-head parameters. Falls back to learning_rate."""
 
+    point_encoder_learning_rate: float | None = 1e-5
+    """LR for a trainable pretrained Concerto backbone; projection/adapters use action-head LR."""
+
+    tactile_encoder_learning_rate: float | None = 1e-5
+    """LR for a trainable pretrained Sparsh backbone; projection/adapters use action-head LR."""
+
     action_head_dropout: float | None = None
     """Optional DiT/action-head dropout override. None preserves the normal model setting."""
 
@@ -233,6 +266,24 @@ class FinetuneConfig:
     You need to login to wandb to view the logs.
     """
 
+    telegram_on: bool = False
+    """Enable best-effort Telegram training notifications."""
+
+    telegram_chat_id: str | None = None
+    """Optional chat ID override. Defaults to the TELEGRAM_CHAT_ID environment variable."""
+
+    telegram_notify_start: bool = True
+    """Send a notification when Hugging Face Trainer begins training."""
+
+    telegram_notify_save: bool = True
+    """Send a notification after each regular Hugging Face checkpoint save."""
+
+    telegram_notify_finish: bool = True
+    """Send a notification after training and the final model save succeed."""
+
+    telegram_notify_error: bool = True
+    """Send a notification for catchable training/finalization exceptions."""
+
     max_steps: int = 10000
     """Total number of training steps to run before stopping."""
 
@@ -251,6 +302,9 @@ class FinetuneConfig:
 
     episode_sampling_rate: float = 0.1
     """Sampling rate for the episodes."""
+
+    allow_padding: bool = False
+    """Clamp out-of-range delta indices to the current episode boundary."""
 
     num_shards_per_epoch: int = int(1e5)
     """Number of shards to use for the dataset. reduce this number if vram is limited."""
@@ -282,7 +336,29 @@ class FinetuneConfig:
             else self.action_head_learning_rate
         )
 
+    @property
+    def resolved_point_encoder_learning_rate(self) -> float:
+        return (
+            self.resolved_action_head_learning_rate
+            if self.point_encoder_learning_rate is None
+            else self.point_encoder_learning_rate
+        )
+
+    @property
+    def resolved_tactile_encoder_learning_rate(self) -> float:
+        return (
+            self.resolved_action_head_learning_rate
+            if self.tactile_encoder_learning_rate is None
+            else self.tactile_encoder_learning_rate
+        )
+
     def __post_init__(self) -> None:
+        from gr00t.experiment.telegram_notifier import validate_telegram_configuration
+
+        validate_telegram_configuration(
+            enabled=self.telegram_on,
+            chat_id=self.telegram_chat_id,
+        )
         if self.deepspeed_stage not in (2, 3):
             raise ValueError(f"deepspeed_stage must be 2 or 3, got {self.deepspeed_stage}")
         if self.learning_rate <= 0:
@@ -296,6 +372,16 @@ class FinetuneConfig:
             raise ValueError(
                 "resolved action_head_learning_rate must be positive, got "
                 f"{self.resolved_action_head_learning_rate}"
+            )
+        if self.resolved_point_encoder_learning_rate <= 0:
+            raise ValueError(
+                "resolved point_encoder_learning_rate must be positive, got "
+                f"{self.resolved_point_encoder_learning_rate}"
+            )
+        if self.resolved_tactile_encoder_learning_rate <= 0:
+            raise ValueError(
+                "resolved tactile_encoder_learning_rate must be positive, got "
+                f"{self.resolved_tactile_encoder_learning_rate}"
             )
         for name, value in (
             ("action_head_dropout", self.action_head_dropout),

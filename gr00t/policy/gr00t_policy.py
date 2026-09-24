@@ -173,6 +173,42 @@ class Gr00tPolicy(BasePolicy):
         assert len(language_keys) >= 1, "At least one language key is required"
         assert len(language_delta_indices) == 1, "Only one language delta index is supported"
         self.language_key = language_keys[0]
+        self._previous_tactile: dict[str, np.ndarray] = {}
+
+    def _with_tactile_history(self, observation: dict[str, Any]) -> dict[str, Any]:
+        """Expand a current-only tactile observation to training-time history semantics."""
+        tactile_config = self.modality_configs.get("tactile")
+        if tactile_config is None or len(tactile_config.delta_indices) != 2:
+            return observation
+        if tactile_config.delta_indices != [-1, 0]:
+            raise ValueError(
+                "Stateful tactile inference currently supports delta_indices=[-1,0], got "
+                f"{tactile_config.delta_indices}."
+            )
+        tactile_observation = observation.get("tactile")
+        if tactile_observation is None:
+            return observation
+        updated = dict(observation)
+        updated_tactile = dict(tactile_observation)
+        for key in tactile_config.modality_keys:
+            frames = tactile_observation[key]
+            if frames.shape[1] == 2:
+                paired = frames
+            elif frames.shape[1] == 1:
+                current = frames[:, 0]
+                previous = self._previous_tactile.get(key)
+                if previous is None or previous.shape != current.shape:
+                    previous = current
+                paired = np.stack((previous, current), axis=1)
+            else:
+                raise ValueError(
+                    f"Tactile key {key!r} must provide one current frame or the full "
+                    f"[-1,0] pair, got {frames.shape}."
+                )
+            self._previous_tactile[key] = paired[:, -1].copy()
+            updated_tactile[key] = paired
+        updated["tactile"] = updated_tactile
+        return updated
 
     def _unbatch_observation(self, value: dict[str, Any]) -> list[dict[str, Any]]:
         """Unbatch a batched observation into a list of single observations.
@@ -391,8 +427,12 @@ class Gr00tPolicy(BasePolicy):
                     f"Tactile key '{tactile_key}' must have batch size {bs}. Got {tactile.shape[0]}"
                 )
                 expected_horizon = len(self.modality_configs["tactile"].delta_indices)
-                assert tactile.shape[1] == expected_horizon, (
-                    f"Tactile key '{tactile_key}'s horizon must be {expected_horizon}. "
+                allowed_horizons = {expected_horizon}
+                if self.modality_configs["tactile"].delta_indices == [-1, 0]:
+                    allowed_horizons.add(1)
+                assert tactile.shape[1] in allowed_horizons, (
+                    f"Tactile key '{tactile_key}'s horizon must be one of "
+                    f"{sorted(allowed_horizons)}. "
                     f"Got {tactile.shape[1]}"
                 )
 
@@ -461,6 +501,8 @@ class Gr00tPolicy(BasePolicy):
         Returns:
             Tuple of (actions_dict, info_dict)
         """
+        observation = self._with_tactile_history(observation)
+
         # Step 1: Split batched observation into individual observations
         unbatched_observations = self._unbatch_observation(observation)
         processed_inputs = []
@@ -553,6 +595,7 @@ class Gr00tPolicy(BasePolicy):
         Returns:
             Dictionary containing the info after resetting the policy
         """
+        self._previous_tactile.clear()
         return {}
 
 

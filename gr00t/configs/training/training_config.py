@@ -45,6 +45,8 @@ class TrainingConfig:
     learning_rate: float = 1e-4
     vlm_learning_rate: float | None = None
     action_head_learning_rate: float | None = None
+    point_encoder_learning_rate: float | None = None
+    tactile_encoder_learning_rate: float | None = None
     lr_scheduler_type: str = "cosine"
     weight_decay: float = 1e-5
     warmup_ratio: float = 0.05
@@ -116,6 +118,14 @@ class TrainingConfig:
     use_wandb: bool = False
     wandb_project: str = "finetune-gr00t-n1d7"
 
+    # Telegram notifications. The bot token is intentionally never part of config.
+    telegram_on: bool = False
+    telegram_chat_id: str | None = None
+    telegram_notify_start: bool = True
+    telegram_notify_save: bool = True
+    telegram_notify_finish: bool = True
+    telegram_notify_error: bool = True
+
     # Profiling
     enable_profiling: bool = False
 
@@ -164,6 +174,22 @@ class TrainingConfig:
             else self.action_head_learning_rate
         )
 
+    @property
+    def resolved_point_encoder_learning_rate(self) -> float:
+        return (
+            self.resolved_action_head_learning_rate
+            if self.point_encoder_learning_rate is None
+            else self.point_encoder_learning_rate
+        )
+
+    @property
+    def resolved_tactile_encoder_learning_rate(self) -> float:
+        return (
+            self.resolved_action_head_learning_rate
+            if self.tactile_encoder_learning_rate is None
+            else self.tactile_encoder_learning_rate
+        )
+
     def __post_init__(self) -> None:
         if self.learning_rate <= 0:
             raise ValueError(f"learning_rate must be positive, got {self.learning_rate}")
@@ -176,6 +202,16 @@ class TrainingConfig:
             raise ValueError(
                 "resolved action_head_learning_rate must be positive, got "
                 f"{self.resolved_action_head_learning_rate}"
+            )
+        if self.resolved_point_encoder_learning_rate <= 0:
+            raise ValueError(
+                "resolved point_encoder_learning_rate must be positive, got "
+                f"{self.resolved_point_encoder_learning_rate}"
+            )
+        if self.resolved_tactile_encoder_learning_rate <= 0:
+            raise ValueError(
+                "resolved tactile_encoder_learning_rate must be positive, got "
+                f"{self.resolved_tactile_encoder_learning_rate}"
             )
         if self.gradient_accumulation_steps < 1:
             raise ValueError(

@@ -216,7 +216,11 @@ class Gr00tN1d7Processor(BaseProcessor):
 
     @staticmethod
     def _normalize_tactile_images(images: torch.Tensor) -> torch.Tensor:
-        """Convert uint8 HWC tactile images to contiguous float32 CHW tensors."""
+        """Convert uint8 HWC tactile images to float CHW without model normalization.
+
+        The temporal axes are preserved. Sparsh-specific orientation, crop, resize,
+        background subtraction, and temporal concatenation happen in the encoder.
+        """
         images = images.permute(*range(images.ndim - 3), -1, -3, -2).contiguous()
         if images.dtype == torch.uint8:
             return images.to(torch.float32).div_(255.0)
@@ -225,6 +229,13 @@ class Gr00tN1d7Processor(BaseProcessor):
     @staticmethod
     def _training_pointcloud(content, modality_config: dict[str, ModalityConfig]) -> torch.Tensor:
         pointcloud_config = modality_config["pointcloud"]
+        if "scene" in pointcloud_config.modality_keys and pointcloud_config.modality_keys != [
+            "scene"
+        ]:
+            raise ValueError(
+                "pointcloud.scene is already a head+wrist point-axis merge and must be the only "
+                "point-cloud modality key; feature-wise concatenation would corrupt its semantics"
+            )
         point_arrays = [
             np.asarray(content.pointclouds[key], dtype=np.float32)
             for key in pointcloud_config.modality_keys
@@ -236,6 +247,8 @@ class Gr00tN1d7Processor(BaseProcessor):
         if point_arrays[0].shape[0] != 1:
             raise ValueError("The current point encoder expects one point-cloud timestep")
         points = np.concatenate(point_arrays, axis=-1)[0]
+        if pointcloud_config.modality_keys == ["scene"] and points.shape[-1] != 6:
+            raise ValueError(f"pointcloud.scene must contain XYZRGB [N,6], got {points.shape}")
         return torch.from_numpy(np.ascontiguousarray(points))
 
     @classmethod
@@ -245,9 +258,13 @@ class Gr00tN1d7Processor(BaseProcessor):
             raise ValueError("The current tactile encoder expects exactly one tactile image key")
         tactile_key = tactile_config.modality_keys[0]
         tactile_images = torch.from_numpy(np.asarray(content.tactile[tactile_key]))
-        if tactile_images.ndim != 4 or tactile_images.shape[0] != 1:
-            raise ValueError("Training tactile images must have shape [1, H, W, C]")
-        return cls._normalize_tactile_images(tactile_images)[0]
+        expected_frames = len(tactile_config.delta_indices)
+        if tactile_images.ndim != 4 or tactile_images.shape[0] != expected_frames:
+            raise ValueError(
+                "Training tactile images must have shape [T,H,W,C] with "
+                f"T={expected_frames}, got {tuple(tactile_images.shape)}"
+            )
+        return cls._normalize_tactile_images(tactile_images)
 
     def __init__(
         self,
@@ -520,9 +537,15 @@ class Gr00tN1d7Processor(BaseProcessor):
         transformed_observation["state"] = normalized_states
 
         if "pointcloud" in modality_config:
+            pointcloud_keys = modality_config["pointcloud"].modality_keys
+            if "scene" in pointcloud_keys and pointcloud_keys != ["scene"]:
+                raise ValueError(
+                    "pointcloud.scene is already a point-axis camera merge and must be the only "
+                    "point-cloud modality key"
+                )
             point_arrays = [
                 np.asarray(observation[f"pointcloud.{key}"], dtype=np.float32)
-                for key in modality_config["pointcloud"].modality_keys
+                for key in pointcloud_keys
             ]
             point_ranks = {array.ndim for array in point_arrays}
             if point_ranks == {3}:
@@ -536,6 +559,10 @@ class Gr00tN1d7Processor(BaseProcessor):
             if point_arrays[0].shape[1] != 1:
                 raise ValueError("The current point encoder expects one point-cloud timestep")
             points = np.concatenate(point_arrays, axis=-1)[:, 0]
+            if pointcloud_keys == ["scene"] and points.shape[-1] != 6:
+                raise ValueError(
+                    f"pointcloud.scene must contain XYZRGB [B,N,6], got {points.shape}"
+                )
             transformed_observation["points"] = torch.from_numpy(np.ascontiguousarray(points))
 
         if "tactile" in modality_config:
@@ -545,13 +572,13 @@ class Gr00tN1d7Processor(BaseProcessor):
                     "The current tactile encoder expects exactly one tactile image key"
                 )
             tactile_images = torch.from_numpy(np.asarray(observation[f"tactile.{tactile_keys[0]}"]))
-            if tactile_images.ndim == 4:
-                tactile_images = tactile_images[:, None]
-            if tactile_images.ndim != 5 or tactile_images.shape[1] != 1:
-                raise ValueError("Inference tactile images must have shape [B, 1, H, W, C]")
-            transformed_observation["tactile"] = self._normalize_tactile_images(tactile_images)[
-                :, 0
-            ]
+            expected_frames = len(modality_config["tactile"].delta_indices)
+            if tactile_images.ndim != 5 or tactile_images.shape[1] != expected_frames:
+                raise ValueError(
+                    "Inference tactile images must have shape [B,T,H,W,C] with "
+                    f"T={expected_frames}, got {tuple(tactile_images.shape)}"
+                )
+            transformed_observation["tactile"] = self._normalize_tactile_images(tactile_images)
 
         # Process images: observation values are (B, T, H, W, C) numpy arrays
         image_keys = modality_config["video"].modality_keys

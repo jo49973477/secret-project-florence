@@ -538,12 +538,15 @@ class LeRobotEpisodeLoader:
             pointcloud_path = self.dataset_path / pointcloud_filename
             array_key = key_meta.get("array_key", key)
             points = self._load_numeric_array(pointcloud_path, array_key)
-            if points.ndim != 3 or points.shape[-1] != 3:
-                raise ValueError(
-                    f"Point cloud {pointcloud_path}:{array_key} must have shape [T, N, 3], "
-                    f"got {points.shape}"
-                )
             feature_shape = self.feature_config[original_key].get("shape", [])
+            expected_feature_dim = key_meta.get(
+                "feature_dim", feature_shape[-1] if len(feature_shape) == 2 else 3
+            )
+            if points.ndim != 3 or points.shape[-1] != expected_feature_dim:
+                raise ValueError(
+                    f"Point cloud {pointcloud_path}:{array_key} must have shape "
+                    f"[T, N, {expected_feature_dim}], got {points.shape}"
+                )
             expected_num_points = key_meta.get(
                 "num_points", feature_shape[0] if len(feature_shape) == 2 else None
             )

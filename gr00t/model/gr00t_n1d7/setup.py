@@ -228,6 +228,26 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 backbone_trainable_params_fp32=self.config.model.backbone_trainable_params_fp32,
                 load_bf16=self.config.model.load_bf16,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
+                dit_type=self.config.model.dit_type,
+                use_point_conditioning=self.config.model.use_point_conditioning,
+                use_tactile_conditioning=self.config.model.use_tactile_conditioning,
+                point_input_dim=self.config.model.point_input_dim,
+                tactile_input_channels=self.config.model.tactile_input_channels,
+                point_encoder_cfg=self.config.model.point_encoder_cfg,
+                point_encoder_checkpoint_path=self.config.model.point_encoder_checkpoint_path,
+                point_encoder_repo_id=self.config.model.point_encoder_repo_id,
+                point_encoder_download_root=self.config.model.point_encoder_download_root,
+                point_encoder_grid_size=self.config.model.point_encoder_grid_size,
+                point_encoder_enable_flash=self.config.model.point_encoder_enable_flash,
+                tactile_encoder_cfg=self.config.model.tactile_encoder_cfg,
+                tactile_pretrained_model=self.config.model.tactile_pretrained_model,
+                tactile_checkpoint_filename=self.config.model.tactile_checkpoint_filename,
+                tactile_background_path=self.config.model.tactile_background_path,
+                tactile_pretrained_load_on_init=(self.config.model.tactile_pretrained_load_on_init),
+                tactile_temporal_delta_indices=(self.config.model.tactile_temporal_delta_indices),
+                tune_point_encoder=self.config.model.tune_point_encoder,
+                tune_tactile_encoder=self.config.model.tune_tactile_encoder,
+                tune_multimodal_adapter=self.config.model.tune_multimodal_adapter,
                 output_loading_info=True,
                 **dropout_overrides,
                 **self.transformers_loading_kwargs,
@@ -244,7 +264,35 @@ class Gr00tN1d7Pipeline(ModelPipeline):
 
             unexpected_keys = loading_info.get("unexpected_keys", [])
             mismatched_keys = loading_info.get("mismatched_keys", [])
-            other_missing = [k for k in missing_keys if "mask_token" not in k]
+            newly_enabled_prefixes = ()
+            if self.config.model.dit_type == "multimodal_conditioned_dit":
+                newly_enabled_prefixes += (
+                    "action_head.model.point_cross_attention.",
+                    "action_head.model.point_gates",
+                    "action_head.model.tactile_cross_attention.",
+                    "action_head.model.tactile_gates",
+                )
+                if self.config.model.use_point_conditioning:
+                    newly_enabled_prefixes += ("action_head.point_encoder.",)
+                if self.config.model.use_tactile_conditioning:
+                    newly_enabled_prefixes += ("action_head.tactile_encoder.",)
+            other_missing = [
+                key
+                for key in missing_keys
+                if "mask_token" not in key
+                and not any(key.startswith(prefix) for prefix in newly_enabled_prefixes)
+            ]
+            initialized_sensor_keys = [
+                key
+                for key in missing_keys
+                if any(key.startswith(prefix) for prefix in newly_enabled_prefixes)
+            ]
+            if initialized_sensor_keys:
+                logging.info(
+                    "Initialized %d newly enabled multimodal tensors; pretrained sensor "
+                    "backbones loaded through their verified loaders.",
+                    len(initialized_sensor_keys),
+                )
             errors = []
             if other_missing:
                 errors.append(f"Missing keys ({len(other_missing)}): {other_missing}")

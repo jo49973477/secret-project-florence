@@ -30,6 +30,20 @@ class _ToyActionHead(nn.Module):
         self.norm = nn.LayerNorm(3)
 
 
+class _ToyConcertoEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = nn.Linear(3, 3)
+        self.projection = nn.Linear(3, 3)
+
+    def backbone_parameters(self):
+        return self.backbone.parameters()
+
+
+class _ToySparshEncoder(_ToyConcertoEncoder):
+    pass
+
+
 class _ToySplitModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -113,11 +127,52 @@ def test_resolved_rates_reach_optimizer_groups(tmp_path):
         for parameter in trainer.model.backbone.parameters()
         if parameter.requires_grad
     )
+
+
+def test_concerto_backbone_gets_independent_learning_rate(tmp_path):
+    model = _ToySplitModel()
+    model.config.use_lora = False
+    model.action_head.point_encoder = _ToyConcertoEncoder()
+    trainer = _make_trainer(tmp_path, model=model)
+    trainer.point_encoder_learning_rate = 1e-5
+
+    optimizer = trainer.create_optimizer()
+    rates = _learning_rate_by_parameter_id(optimizer)
+
+    assert all(
+        rates[id(parameter)] == pytest.approx(1e-5)
+        for parameter in model.action_head.point_encoder.backbone.parameters()
+    )
+    assert all(
+        rates[id(parameter)] == pytest.approx(1e-3)
+        for parameter in model.action_head.point_encoder.projection.parameters()
+    )
     assert all(
         rates[id(parameter)] == pytest.approx(1e-3)
         for parameter in trainer.model.action_head.parameters()
+        if parameter not in set(model.action_head.point_encoder.backbone.parameters())
         if parameter.requires_grad
     )
+
+
+def test_sparsh_backbone_gets_independent_learning_rate(tmp_path):
+    model = _ToySplitModel()
+    model.config.use_lora = False
+    model.action_head.tactile_encoder = _ToySparshEncoder()
+    trainer = _make_trainer(tmp_path, model=model)
+    trainer.tactile_encoder_learning_rate = 1e-5
+
+    optimizer = trainer.create_optimizer()
+    rates = _learning_rate_by_parameter_id(optimizer)
+    backbone_ids = {
+        id(parameter) for parameter in model.action_head.tactile_encoder.backbone.parameters()
+    }
+    projection_ids = {
+        id(parameter) for parameter in model.action_head.tactile_encoder.projection.parameters()
+    }
+
+    assert all(rates[parameter_id] == pytest.approx(1e-5) for parameter_id in backbone_ids)
+    assert all(rates[parameter_id] == pytest.approx(1e-3) for parameter_id in projection_ids)
 
 
 def test_split_optimizer_has_complete_unique_coverage_and_expected_lrs(tmp_path):

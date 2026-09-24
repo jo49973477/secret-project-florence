@@ -1,12 +1,23 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Lightweight point-cloud encoders for multimodal action conditioning."""
+"""Point-cloud encoders for multimodal action conditioning.
 
+Concerto is an optional dependency.  It is imported only when a Concerto
+backend is selected so RGB-only and lightweight point-cloud workflows do not
+need the sparse-convolution stack.
+"""
+
+import importlib
+import logging
+from pathlib import Path
 from typing import Optional
 
 import torch
 from torch import nn
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _index_points(points: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
@@ -318,18 +329,282 @@ class PointTransformerEncoder(nn.Module):
         return point_tokens
 
 
+class ConcertoPointEncoder(nn.Module):
+    """Adapt an official pretrained Concerto PTv3 model to GR00T point tokens.
+
+    Input scenes are dense ``[B, N, 6]`` XYZRGB arrays. XYZ is in one common
+    metric frame and RGB is stored in the dataset as ``[0, 255]``. The wrapper
+    applies Concerto's published preprocessing: per-scene ``CenterShift``,
+    grid coordinates at ``grid_size``, RGB division by 255, and zero normals
+    (the official demo's supported ``--wo_normal`` path). Concerto receives
+    ``[centered XYZ, RGB/255, zero normals]`` features.
+    """
+
+    SUPPORTED_MODELS = {"concerto_small", "concerto_base"}
+
+    def __init__(
+        self,
+        input_dim: int = 6,
+        point_dim: int = 256,
+        *,
+        model_name: str = "concerto_small",
+        repo_id: str = "Pointcept/Concerto",
+        checkpoint_path: str | None = None,
+        download_root: str | None = None,
+        grid_size: float = 0.02,
+        enable_flash: bool | None = None,
+        backbone: nn.Module | None = None,
+        backbone_output_dim: int | None = None,
+        pretrained_loaded: bool = False,
+    ) -> None:
+        super().__init__()
+        if input_dim != 6:
+            raise ValueError(
+                "Concerto requires one unified XYZRGB scene field with 6 values per point; "
+                f"received point_input_dim={input_dim}. Use pointnet2/point_transformer for "
+                "legacy XYZ-only data."
+            )
+        if model_name not in self.SUPPORTED_MODELS:
+            raise ValueError(
+                f"Unsupported Concerto model {model_name!r}; expected one of "
+                f"{sorted(self.SUPPORTED_MODELS)}."
+            )
+        if grid_size <= 0:
+            raise ValueError(f"grid_size must be positive, got {grid_size}.")
+
+        self.input_dim = input_dim
+        self.point_dim = point_dim
+        self.model_name = model_name
+        self.repo_id = repo_id
+        self.grid_size = float(grid_size)
+
+        if backbone is None:
+            backbone, backbone_output_dim, checkpoint_label, parameter_count = (
+                self._load_official_backbone(
+                    model_name=model_name,
+                    repo_id=repo_id,
+                    checkpoint_path=checkpoint_path,
+                    download_root=download_root,
+                    enable_flash=enable_flash,
+                )
+            )
+            pretrained_loaded = True
+            LOGGER.info("Point encoder: %s", model_name.replace("_", "-").title())
+            LOGGER.info("Checkpoint: %s", checkpoint_label)
+            LOGGER.info("Loaded pretrained parameters: %s", f"{parameter_count:,}")
+            LOGGER.info("Missing keys: []")
+            LOGGER.info("Unexpected keys: []")
+        elif backbone_output_dim is None:
+            raise ValueError("backbone_output_dim is required when injecting a Concerto backbone")
+
+        if not pretrained_loaded:
+            raise RuntimeError(
+                "Concerto was requested without verified pretrained weights. Randomly initialized "
+                "Concerto backbones are intentionally unsupported."
+            )
+        assert backbone_output_dim is not None
+        self.backbone = backbone
+        self.projection = nn.Sequential(
+            nn.Linear(backbone_output_dim, point_dim),
+            nn.LayerNorm(point_dim),
+        )
+        self.pretrained_loaded = True
+        LOGGER.info(
+            "Trainable: %s", any(parameter.requires_grad for parameter in self.parameters())
+        )
+
+    @staticmethod
+    def _load_official_backbone(
+        *,
+        model_name: str,
+        repo_id: str,
+        checkpoint_path: str | None,
+        download_root: str | None,
+        enable_flash: bool | None,
+    ) -> tuple[nn.Module, int, str, int]:
+        try:
+            concerto = importlib.import_module("concerto")
+        except ImportError as exc:
+            raise ImportError(
+                "Concerto point encoding requires the official Pointcept/Concerto package and "
+                "its spconv + torch-scatter dependencies. Install it as documented in "
+                "examples/UniVTAC/README.md."
+            ) from exc
+
+        checkpoint_name = str(Path(checkpoint_path).expanduser()) if checkpoint_path else model_name
+        custom_config = {}
+        if enable_flash is not None:
+            custom_config["enable_flash"] = enable_flash
+        try:
+            checkpoint = concerto.load(
+                checkpoint_name,
+                repo_id=repo_id,
+                download_root=download_root,
+                custom_config=custom_config or None,
+                ckpt_only=True,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load requested pretrained Concerto checkpoint {checkpoint_name!r} "
+                f"from {repo_id!r}. No random-init fallback is allowed."
+            ) from exc
+
+        if not isinstance(checkpoint, dict) or not {"config", "state_dict"}.issubset(checkpoint):
+            raise RuntimeError(
+                "Official Concerto checkpoint must contain 'config' and 'state_dict' entries."
+            )
+        config = dict(checkpoint["config"])
+        if config.get("in_channels") != 9:
+            raise RuntimeError(
+                "This wrapper follows official XYZ+RGB+normal feature construction and expects "
+                f"a 9-channel Concerto checkpoint, got in_channels={config.get('in_channels')}."
+            )
+        if config.get("enc_mode", False):
+            output_dim = int(config["enc_channels"][-1])
+        else:
+            output_dim = int(config["dec_channels"][0])
+
+        try:
+            model = concerto.model.PointTransformerV3(**config)
+            incompatible = model.load_state_dict(checkpoint["state_dict"], strict=False)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not construct Concerto from pretrained checkpoint {checkpoint_name!r}."
+            ) from exc
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            raise RuntimeError(
+                "Concerto checkpoint is incompatible with its declared architecture: "
+                f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}."
+            )
+        parameter_count = sum(parameter.numel() for parameter in model.parameters())
+        if parameter_count == 0 or not any(
+            torch.count_nonzero(parameter.detach()).item() > 0 for parameter in model.parameters()
+        ):
+            raise RuntimeError("Concerto checkpoint loaded no non-zero pretrained parameters.")
+        return model, output_dim, checkpoint_name, parameter_count
+
+    def backbone_parameters(self):
+        """Return only pretrained backbone parameters for optimizer LR grouping."""
+        return self.backbone.parameters()
+
+    def adapter_parameters(self):
+        """Return newly initialized GR00T projection parameters."""
+        return self.projection.parameters()
+
+    def _prepare_batch(
+        self, points: torch.Tensor, point_mask: torch.Tensor
+    ) -> tuple[dict[str, torch.Tensor | float], list[int]]:
+        coords = []
+        features = []
+        grid_coords = []
+        counts = []
+        for batch_index in range(points.shape[0]):
+            scene = points[batch_index, point_mask[batch_index]]
+            if scene.shape[0] == 0:
+                raise ValueError(f"Concerto scene {batch_index} contains no valid points.")
+            coord = scene[:, :3]
+            coord_min = coord.amin(dim=0)
+            coord_max = coord.amax(dim=0)
+            shift = torch.stack(
+                (
+                    (coord_min[0] + coord_max[0]) / 2,
+                    (coord_min[1] + coord_max[1]) / 2,
+                    coord_min[2],
+                )
+            )
+            coord = coord - shift
+            grid_coord = torch.floor(coord / self.grid_size).to(torch.int32)
+            grid_coord = grid_coord - grid_coord.amin(dim=0)
+            color = scene[:, 3:6] / 255.0
+            normal = torch.zeros_like(coord)
+            coords.append(coord)
+            grid_coords.append(grid_coord)
+            features.append(torch.cat((coord, color, normal), dim=-1))
+            counts.append(int(scene.shape[0]))
+
+        count_tensor = torch.tensor(counts, dtype=torch.long, device=points.device)
+        offset = count_tensor.cumsum(dim=0)
+        batch = torch.arange(points.shape[0], device=points.device).repeat_interleave(count_tensor)
+        return {
+            "coord": torch.cat(coords, dim=0),
+            "grid_coord": torch.cat(grid_coords, dim=0),
+            "feat": torch.cat(features, dim=0),
+            "offset": offset,
+            "batch": batch,
+            "grid_size": self.grid_size,
+        }, counts
+
+    @staticmethod
+    def _pad_tokens(
+        flat_tokens: torch.Tensor, counts: list[int]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        max_tokens = max(counts)
+        batch_size = len(counts)
+        tokens = flat_tokens.new_zeros((batch_size, max_tokens, flat_tokens.shape[-1]))
+        mask = torch.zeros(batch_size, max_tokens, dtype=torch.bool, device=flat_tokens.device)
+        start = 0
+        for batch_index, count in enumerate(counts):
+            tokens[batch_index, :count] = flat_tokens[start : start + count]
+            mask[batch_index, :count] = True
+            start += count
+        if start != flat_tokens.shape[0]:
+            raise RuntimeError(
+                f"Concerto output offsets account for {start} tokens, got {flat_tokens.shape[0]}."
+            )
+        return tokens, mask
+
+    def forward(
+        self,
+        points: torch.Tensor,
+        point_mask: Optional[torch.Tensor] = None,
+        *,
+        return_mask: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if points.ndim != 3 or points.shape[-1] != 6:
+            raise ValueError(
+                f"Concerto points must have shape [B, N, 6], got {tuple(points.shape)}."
+            )
+        if not torch.isfinite(points).all():
+            raise ValueError("Concerto points contain NaN or Inf.")
+        if point_mask is None:
+            point_mask = torch.ones(points.shape[:2], dtype=torch.bool, device=points.device)
+        elif point_mask.shape != points.shape[:2]:
+            raise ValueError(
+                f"point_mask must have shape {tuple(points.shape[:2])}, "
+                f"got {tuple(point_mask.shape)}."
+            )
+        else:
+            point_mask = point_mask.to(device=points.device, dtype=torch.bool)
+
+        concerto_input, _input_counts = self._prepare_batch(points, point_mask)
+        output = self.backbone(concerto_input)
+        if not hasattr(output, "feat") or not hasattr(output, "offset"):
+            raise RuntimeError("Concerto backbone output must expose .feat and .offset tensors.")
+        output_counts = torch.diff(
+            torch.cat((output.offset.new_zeros(1), output.offset.to(torch.long)))
+        ).tolist()
+        point_tokens = self.projection(output.feat)
+        point_tokens, output_mask = self._pad_tokens(point_tokens, output_counts)
+        if return_mask:
+            return point_tokens, output_mask
+        return point_tokens
+
+
 def build_point_encoder(
     encoder_type: str = "pointnet2",
     **encoder_kwargs,
-) -> PointNet2Encoder | PointTransformerEncoder:
+) -> PointNet2Encoder | PointTransformerEncoder | ConcertoPointEncoder:
     """Build one of the lightweight point encoder backends."""
     normalized_type = encoder_type.lower().replace("-", "_")
     if normalized_type in {"pointnet", "pointnet2", "pointnet++"}:
         return PointNet2Encoder(**encoder_kwargs)
     if normalized_type in {"point_transformer", "transformer"}:
         return PointTransformerEncoder(**encoder_kwargs)
+    if normalized_type in ConcertoPointEncoder.SUPPORTED_MODELS:
+        return ConcertoPointEncoder(model_name=normalized_type, **encoder_kwargs)
     raise ValueError(
-        f"Unknown point encoder type {encoder_type!r}. Expected 'pointnet2' or 'point_transformer'."
+        f"Unknown point encoder type {encoder_type!r}. Expected 'pointnet2', "
+        "'point_transformer', 'concerto_small', or 'concerto_base'."
     )
 
 
@@ -357,6 +632,7 @@ class PointEncoder(PointNet2Encoder):
 
 __all__ = [
     "PointEncoder",
+    "ConcertoPointEncoder",
     "PointNet2Encoder",
     "PointTransformerEncoder",
     "build_point_encoder",

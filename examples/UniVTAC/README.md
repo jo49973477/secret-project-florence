@@ -112,16 +112,18 @@ The unchanged RGB baseline remains [univtac_config.py](univtac_config.py). The e
 
 ```python
 "tactile": ModalityConfig(
-    delta_indices=[0],
+    delta_indices=[-1, 0],
     modality_keys=["rgb"],
 ),
 "pointcloud": ModalityConfig(
     delta_indices=[0],
-    modality_keys=["xyz"],
+    modality_keys=["scene"],
 ),
 ```
 
-Both modalities honor their own `delta_indices` in the dataset loader. The current action-head encoders intentionally accept one observation timestep, so model training uses `[0]`; a future multi-frame encoder/aggregator is required before changing this to values such as `[-2, -1, 0]` for training.
+Both modalities honor their own `delta_indices` in the dataset loader. UniVTAC is nominally 10 Hz, so tactile `[-1,0]` is a 100 ms pair. The official Sparsh checkpoint used `I_t ⊕ I_(t-5)` at 60 Hz (about 83 ms); the encoder receives chronological `[previous,current]` frames and reorders them internally to the official current-then-previous six-channel input. For a dataset with FPS `f`, choose a negative delta near `round(0.083 * f)` frames and keep the current frame at zero.
+
+At an episode boundary, padded sampling repeats frame zero; unpadded training excludes reference steps whose deltas leave the episode. Negative pandas indices are rejected, so an episode can never borrow the previous episode's last tactile frame. At rollout time, `Gr00tPolicy` accepts either the complete two-frame pair or a current-only tactile frame. It caches the current frame, repeats it immediately after `reset()`, and uses it as the previous frame on the next call.
 
 ## Generate GR00T statistics
 
@@ -153,7 +155,7 @@ Expected sample values include:
 ```text
 images.head           [1, 270, 480, 3] uint8
 images.wrist          [1, 270, 480, 3] uint8
-tactile.rgb           [1, 240, 320, 3] uint8
+tactile.rgb           [2, 240, 320, 3] uint8
 pointclouds.xyz       [1, 1024, 3] float32
 states.joint          [1, 8] float32
 actions.joint         [40, 8] float32
@@ -171,7 +173,7 @@ If the original HDF5 moved, use `--source-hdf5 /new/path/to/episode.hdf5`; use `
 
 ### RGB baseline
 
-Only the RGB baseline config is supported for current N1.7 fine-tuning:
+The unchanged RGB-only baseline remains available for ablations:
 
 ```bash
 USE_WANDB=0 NUM_GPUS=1 MAX_STEPS=100 GLOBAL_BATCH_SIZE=4 \
@@ -231,34 +233,204 @@ diagnostics/
 
 Interpret these offline diagnostics conservatively. Similar normal, black, and shuffled results suggest that the current policy is weakly dependent on RGB under this offline test; significantly worse ablations indicate that RGB provides predictive information. GR00T performance near persistence suggests that temporal or proprioceptive smoothness may explain much of the score, while a substantial improvement over persistence indicates predictive structure beyond trivial persistence. These tests alone do not establish that RGB is useless or that tactile sensing is necessary.
 
-## Common failures
+## Closed-loop rollout evaluation
 
-Select the multimodal dataset config and DiT explicitly. This example freezes the pre-existing VLM, projector/action path, VLM normalization, and base DiT while training only the point/tactile encoders, sensor cross-attention branches, and residual gates:
+For copy-paste commands with the correct working directory for both terminals, see [CLOSED_LOOP_ROLLOUT.md](CLOSED_LOOP_ROLLOUT.md).
 
-```bash
-uv run python gr00t/experiment/launch_finetune.py \
-  --base-model-path nvidia/GR00T-N1.7-3B \
-  --dataset-path /path/to/univtac_gr00t_multimodal \
-  --embodiment-tag NEW_EMBODIMENT \
-  --modality-config-path examples/UniVTAC/univtac_multimodal_config.py \
-  --dit-type multimodal_conditioned_dit \
-  --point-input-dim 3 \
-  --no-tune-llm \
-  --no-tune-visual \
-  --no-tune-projector \
-  --no-tune-vlln \
-  --no-tune-diffusion-model \
-  --tune-point-encoder \
-  --tune-tactile-encoder \
-  --tune-multimodal-adapter \
-  --output-dir /tmp/gr00t_univtac_multimodal
+The offline diagnostic above compares dataset actions with predictions; model actions never affect its next input. The closed-loop evaluator instead runs the decoded action through UniVTAC's official `task.take_action(..., action_type="qpos")` API, observes the resulting simulator state, and reports the task's own `check_success()` / `eval_success` result. Its primary metric is per-task Success Rate and the unweighted macro-average across tasks.
+
+The model and simulator stay in separate processes:
+
+```text
+UniVTAC / Isaac Sim -> lightweight PolicyClient -> ZeroMQ -> GR00T server
+        ^                                                    |
+        +---------------- decoded 8-D qpos chunk ------------+
 ```
 
-Use `--no-use-point-conditioning` or `--no-use-tactile-conditioning` for a single-sensor ablation. The UniVTAC conversion currently provides XYZ only, hence `--point-input-dim 3`; a dataset/config containing aligned XYZ and RGB point features can use 6.
+All checkpoint preprocessing, action decoding, and unnormalization remain inside `Gr00tPolicy`. The UniVTAC adapter only validates and batches `head`/`wrist` uint8 RGB, the first eight float32 joint coordinates, and `task.instruction`. It executes one predicted action by default, then replans from the new observation. `--execution-horizon` can be set to 1, 4, 8, or 16.
+
+The Isaac environment needs only the client dependencies, not the GR00T package:
+
+```bash
+/path/to/IsaacLab/isaaclab.sh -p -m pip install msgpack pyzmq
+```
+
+Run `isaaclab.sh` from a clean shell with incompatible Conda environments deactivated; the Isaac Sim 6.0 installation uses its own Python 3.12 runtime.
+
+### 1. Start the GR00T inference server
+
+Run this in the GR00T environment from the GR00T repository root. The inspected local checkpoints are `checkpoint-2500`, `checkpoint-3000`, and `checkpoint-3500`:
+
+```bash
+cd /home/yeongyoo/07_Remote/splserver/secret-project-florence
+
+CUDA_VISIBLE_DEVICES=0 \
+bash scripts/run_gr00t_univtac_server.sh \
+  --checkpoint /home/yeongyoo/07_Remote/splserver/outputs/univtac_clean_stats/checkpoint-3500 \
+  --embodiment-tag NEW_EMBODIMENT \
+  --device cuda:0 \
+  --host 127.0.0.1 \
+  --port 5555
+```
+
+Keep this process running. The evaluator's `--checkpoint` value is recorded in every result row and must describe the checkpoint loaded by this server; the simulator process does not load model weights itself.
+
+### 2. Run the real Isaac Sim smoke evaluation
+
+Run the wrapper from this repository while using the UniVTAC/Isaac Python command. `CUDA_VISIBLE_DEVICES=7` is remapped to the worker's logical `cuda:0`:
+
+```bash
+cd /home/yeongyoo/07_Remote/splserver/secret-project-florence
+
+UNIVTAC_ROOT=/path/to/UniVTAC \
+UNIVTAC_DRIVER_PYTHON_COMMAND="/home/yeongyoo/IsaacLab/isaaclab.sh -p" \
+UNIVTAC_PYTHON_COMMAND="/home/yeongyoo/IsaacLab/isaaclab.sh -p" \
+CUDA_VISIBLE_DEVICES=7 \
+bash scripts/run_gr00t_univtac_rollout.sh \
+  --checkpoint /home/yeongyoo/07_Remote/splserver/outputs/univtac_clean_stats/checkpoint-3500 \
+  --server-host 127.0.0.1 \
+  --server-port 5555 \
+  --mode smoke \
+  --episodes-per-task 1 \
+  --tasks lift_can \
+  --execution-horizon 1 \
+  --device cuda:0 \
+  --output-dir outputs/univtac_rollout_eval_smoke
+```
+
+The first rollout prints the exact observation and action shapes/dtypes. It also verifies server reachability, the embedded checkpoint modality config, finite 8-D actions, the simulator's articulation joint limits, multiple closed-loop observations, UniVTAC termination, video finalization, and result-file creation. Omit `--episodes-per-task 1` to use the smoke default of five episodes.
+
+### 3. Run all tasks
+
+The presets are `smoke=5`, `quick=20`, and `full=100` episodes per task. An explicit `--episodes-per-task` always overrides the preset.
+
+```bash
+cd /home/yeongyoo/07_Remote/splserver/secret-project-florence
+
+UNIVTAC_ROOT=/path/to/UniVTAC \
+UNIVTAC_DRIVER_PYTHON_COMMAND="/home/yeongyoo/IsaacLab/isaaclab.sh -p" \
+UNIVTAC_PYTHON_COMMAND="/home/yeongyoo/IsaacLab/isaaclab.sh -p" \
+CUDA_VISIBLE_DEVICES=7 \
+bash scripts/run_gr00t_univtac_rollout.sh \
+  --checkpoint /home/yeongyoo/07_Remote/splserver/outputs/univtac_clean_stats/checkpoint-3500 \
+  --server-host 127.0.0.1 \
+  --server-port 5555 \
+  --mode full \
+  --tasks all \
+  --execution-horizon 1 \
+  --device cuda:0 \
+  --output-dir outputs/univtac_rollout_eval
+```
+
+Selected canonical tasks can be passed after `--tasks`, for example `--tasks lift_can insert_HDMI`. Every task runs in a fresh Isaac process so simulator teardown does not leak state between task classes. Seeds default to `1000000 + episode_index` for every task and are recorded per rollout; use `--seed-start` to change the deterministic sequence. The evaluator refuses to mix a new run with existing result files, so use a new output directory for each checkpoint or configuration.
+
+### 4. Inspect results and videos
+
+```text
+outputs/univtac_rollout_eval/
+├── episodes.csv
+├── summary.csv
+├── summary.json
+├── summary.md
+├── summary.txt
+├── logs/
+└── videos/
+    ├── success/<task>/<task>_seed_<seed>_success.mp4
+    ├── failure/<task>/<task>_seed_<seed>_failure.mp4
+    └── error/<task>/<task>_seed_<seed>_error.mp4
+```
+
+`episodes.csv` records the task, seed, episode index, success, policy action count, execution horizon, checkpoint, instruction, elapsed time, termination reason, video path, simulator-step count, and any error. `summary.csv` and `summary.json` include counts and mean step statistics. The `Average` row is the macro-average of task Success Rates. If evaluated counts differ, an `Overall / Micro Average` is also emitted. `exception` and `invalid_action` rollouts are explicit errors, not silently counted as policy failures or included in the Success Rate denominator.
+
+## Common failures
+
+### Sparsh-DINO tactile representation
+
+The default multimodal tactile backend is `sparsh_dino_base`; `resnet18` remains available as the scratch ablation. The implementation follows Meta's [official Sparsh repository](https://github.com/facebookresearch/sparsh) and the [official model card](https://huggingface.co/facebook/sparsh-dino-base): ViT-B/16, 768 hidden dimensions, one register token, and 300 returned normalized patch tokens at 320×240. The GR00T adapter is `LayerNorm(768) -> Linear(768, DiT dim)` and keeps all patch tokens.
+
+Official preprocessing is applied once inside `SparshDinoTactileEncoder`: RGB channel order, uint8-to-`[0,1]`, landscape-to-portrait rotation, 4:3 center crop, antialiased resize to `(H,W)=(320,240)`, then `I_t ⊕ I_previous`. There is no ImageNet mean/std normalization. The processor only converts HWC to CHW and scales uint8; it does not resize or normalize again. DIGIT and GelSight Mini pretraining used sensor-specific no-contact background subtraction. Supply that calibration image with `--tactile-background-path /path/to/no_contact.png`; without it the wrapper logs an explicit warning and retains raw RGB, matching the official GelSight-2017 path but not GS Mini background-subtracted preprocessing.
+
+Download the exact safe official backbone file when a local checkpoint is preferred:
+
+```bash
+uv run hf download facebook/sparsh-dino-base dino_vitbase.safetensors \
+  --local-dir checkpoints/sparsh-dino-base
+```
+
+Use either `--tactile-pretrained-model facebook/sparsh-dino-base` or the resulting local directory/file. Loading is strict and fails on missing or unexpected keys; it never falls back to random Sparsh weights. Fine-tuned GR00T checkpoints contain the full Sparsh backbone, projection, tactile cross-attention, gates, and optional background calibration tensor. Their saved config disables the original Hub bootstrap, so inference reloads the embedded weights without redownloading Sparsh or requiring the original background file. Meta's extracted Sparsh backbone implementation in `gr00t/model/extension/sparsh_vit.py` and the official model artifact are licensed CC-BY-NC-4.0; review that license independently of GR00T's Apache-2.0 code.
+
+### Architecture
+
+```text
+Head RGB ───────────────┐
+Wrist RGB ───────────────┼→ Qwen3-VL ─────────────┐
+Language ───────────────┘                         │
+                                                  ↓
+                                            GR00T Action DiT
+                                           ↑               ↑
+                                          /                 \
+                           point cross-attn                   tactile cross-attn
+                                ↑                                  ↑
+                         Concerto pretrained                 Sparsh-DINO pretrained
+                                ↑                                  ↑
+                      Head+Wrist scene PC                Tactile(t-1), Tactile(t)
+```
+
+The Concerto and Sparsh branches stay independent until their separate gated cross-attention residuals update action tokens. Tactile images are not sent through Qwen3-VL.
+
+### Multimodal fine-tuning
+
+This command parses through `examples/finetune.sh`, uses LR `1e-5` only for the pretrained Sparsh backbone, and uses the action-head LR (`1e-4`) for the new projection, cross-attention, and gates:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,7 \
+NUM_GPUS=2 \
+GLOBAL_BATCH_SIZE=2 \
+DATALOADER_NUM_WORKERS=0 \
+EPISODE_SAMPLING_RATE=1.0 \
+MAX_STEPS=2000 \
+USE_WANDB=0 \
+uv run bash examples/finetune.sh \
+  --base-model-path nvidia/GR00T-N1.7-3B \
+  --dataset-path /path/to/univtac_multimodal \
+  --embodiment-tag NEW_EMBODIMENT \
+  --modality-config-path examples/UniVTAC/univtac_multimodal_config.py \
+  --output-dir outputs/univtac_sparsh \
+  -- \
+  --dit-type multimodal_conditioned_dit \
+  --point-input-dim 6 \
+  --tactile-encoder-cfg sparsh_dino_base \
+  --tactile-pretrained-model facebook/sparsh-dino-base \
+  --tactile-background-path /path/to/gsmini_no_contact.png \
+  --tactile-encoder-learning-rate 1e-5 \
+  --action-head-learning-rate 1e-4 \
+  --allow-padding \
+  --tune-tactile-encoder \
+  --tune-multimodal-adapter
+```
+
+`--allow-padding` uses GR00T's established in-episode clamping for all delta-indexed modalities;
+therefore the first tactile pair is `[frame 0, frame 0]`, matching rollout reset behavior. The
+background argument reproduces the official GelSight Mini/DIGIT subtraction. Omit it only
+when the stored stream is already background-adjusted or when intentionally using the official
+raw GelSight-2017 preprocessing path.
+
+Use `--no-tune-tactile-encoder` to freeze only the Sparsh backbone; the newly initialized tactile projection and cross-attention remain trainable when `--tune-multimodal-adapter` is enabled. Use `--tactile-encoder-cfg resnet18` for the scratch baseline.
+
+One-batch real-checkpoint CUDA smoke test:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run python scripts/smoke_test_sparsh_tactile.py \
+  --pretrained-model checkpoints/sparsh-dino-base \
+  --batch-size 1 \
+  --dit-dim 1536
+```
+
+Use `--no-use-point-conditioning` or `--no-use-tactile-conditioning` for a single-sensor ablation. The calibrated UniVTAC `scene` conversion is XYZRGB and uses the default `--point-input-dim 6`; legacy XYZ-only point fields must use a lightweight point encoder with `--point-input-dim 3`.
 
 ## Current Limitations
 
-The extension includes a ResNet-18 tactile encoder, lightweight PointNet++/point-transformer choices, and gated action-token cross-attention. It does **not** include PTv3, PointACT-style fusion, a production-scale point-cloud architecture, cross-modal fusion beyond the existing independent residual branches, trained multimodal weights, or multimodal open-loop evaluation. Tactile input is scaled to `[0, 1]`; point coordinates remain in the selected depth camera frame and receive no dataset-statistics normalization.
+The extension includes pretrained Sparsh-DINO-Base plus a scratch ResNet-18 ablation, Concerto/lightweight point-encoder choices, and gated action-token cross-attention. It does **not** fuse point and tactile representations before the action DiT. Point coordinates remain in the selected depth camera frame and receive no dataset-statistics normalization.
 
 ## Backward Compatibility
 

@@ -75,6 +75,29 @@ The neural network architecture of GR00T N1.7 is a combination of vision-languag
 <img src="media/model-architecture.png" width="800" alt="model-architecture">
 </div>
 
+The optional UniVTAC multimodal action-head extension keeps pretrained scene and tactile
+representations out of the Qwen3-VL image path and injects them independently into action tokens:
+
+```text
+Head RGB ────────────────┐
+Wrist RGB ───────────────┼→ Qwen3-VL ──────────────┐
+Language ────────────────┘                         │
+                                                  ↓
+                                            GR00T Action DiT
+                                           ↑               ↑
+                                          /                 \
+                           point cross-attn                   tactile cross-attn
+                                ↑                                  ↑
+                         Concerto pretrained                 Sparsh-DINO pretrained
+                                ↑                                  ↑
+                      Head+Wrist scene PC                Tactile(t-1), Tactile(t)
+```
+
+See [examples/UniVTAC/README.md](examples/UniVTAC/README.md) for exact Sparsh preprocessing,
+checkpoint loading, temporal semantics, training, and smoke-test commands. The extracted Meta
+Sparsh backbone implementation and official checkpoint are published under CC-BY-NC-4.0,
+independently of this repository's Apache-2.0 license; review that license before use.
+
 ### Workflow Overview
 
 1. **Prepare data** — Collect robot demonstrations (video, state, action) and convert them to the [GR00T LeRobot format](#data-format). Demo datasets are included for quick testing.
@@ -478,6 +501,50 @@ uv run torchrun --nproc_per_node=8 --master_port=29500 \
 Replace `demo_data/cube_to_bowl_5` and `examples/SO100/so100_config.py` with your own dataset and modality config. See [`examples/SO100`](examples/SO100/README.md) for a complete walkthrough.
 
 > **Note:** Use `uv run torchrun` (not bare `torchrun`) to ensure the correct virtual environment is used. Add `--use-wandb` to enable Weights & Biases logging. For more extensive configuration, use `gr00t/experiment/launch_train.py`.
+
+### Telegram training notifications
+
+Telegram can send one rank-zero-only message when training starts, after each checkpoint,
+after the final model save succeeds, or when a catchable training exception occurs.
+
+1. Create a bot with Telegram's `@BotFather` and copy its bot token.
+2. Start a conversation with the bot and obtain the numeric chat ID (for example, from the
+   Telegram Bot API `getUpdates` response).
+3. Export both values in the shell that launches training:
+
+```bash
+export TELEGRAM_BOT_TOKEN="..."
+export TELEGRAM_CHAT_ID="..."
+```
+
+4. Test the connection without loading a model:
+
+```bash
+uv run python -m gr00t.experiment.telegram_notifier --test
+```
+
+5. Add `--telegram-on` after the `--` separator used by `examples/finetune.sh`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,7 NUM_GPUS=2 MAX_STEPS=2000 \
+uv run bash examples/finetune.sh \
+  --base-model-path nvidia/GR00T-N1.7-3B \
+  --dataset-path /path/to/dataset \
+  --embodiment-tag NEW_EMBODIMENT \
+  --output-dir outputs/my_experiment \
+  -- \
+  --telegram-on
+```
+
+`--telegram-chat-id` overrides `TELEGRAM_CHAT_ID`. The token has no CLI option and is never
+stored in training/checkpoint configuration. All four events default to enabled; disable an
+individual event with `--no-telegram-notify-start`, `--no-telegram-notify-save`,
+`--no-telegram-notify-finish`, or `--no-telegram-notify-error`.
+
+> **Security:** Never commit `TELEGRAM_BOT_TOKEN` to Git or put it in commands, logs, W&B
+> configuration, or checked-in examples. Telegram delivery is best-effort and cannot be
+> guaranteed after uncatchable termination such as `SIGKILL`, an external OOM-killer action,
+> kernel panic, machine power loss, or loss of networking after the process has died.
 
 ### Training Tips
 

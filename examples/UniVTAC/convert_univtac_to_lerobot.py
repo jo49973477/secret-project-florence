@@ -29,6 +29,7 @@ UniVTAC HDF5                     GR00T LeRobot v2
 ``observation/wrist/rgb[t]``     ``observation.images.wrist`` video frame
 selected tactile RGB ``[t]``     ``observation.tactile.rgb`` video frame
 selected depth stream ``[t]``    ``observation.pointcloud.xyz`` NPZ array
+calibrated head+wrist RGB-D      ``observation.pointcloud.scene`` XYZRGB NPZ
 task directory / ``--task``      task and annotation indices
 ===============================  ==============================================
 
@@ -57,6 +58,26 @@ import pyarrow.parquet as pq
 
 
 try:
+    from examples.UniVTAC.scene_pointcloud import (
+        ScenePointCloudError,
+        ScenePreprocessConfig,
+        build_scene_frame,
+        pose_wxyz_to_matrix,
+        validate_intrinsics,
+        validate_transform,
+    )
+except ModuleNotFoundError:  # Direct execution from examples/UniVTAC.
+    from scene_pointcloud import (
+        ScenePointCloudError,
+        ScenePreprocessConfig,
+        build_scene_frame,
+        pose_wxyz_to_matrix,
+        validate_intrinsics,
+        validate_transform,
+    )
+
+
+try:
     import h5py
 except ImportError as exc:  # pragma: no cover - depends on the user's conversion environment
     raise ImportError(
@@ -77,6 +98,8 @@ CAMERA_DATASETS = {
 TACTILE_OUTPUT_KEYS = {"rgb": "observation.tactile.rgb"}
 POINTCLOUD_OUTPUT_KEY = "observation.pointcloud.xyz"
 POINTCLOUD_ARRAY_KEY = "xyz"
+SCENE_POINTCLOUD_OUTPUT_KEY = "observation.pointcloud.scene"
+SCENE_POINTCLOUD_ARRAY_KEY = "scene"
 
 STATE_COLUMN = "observation.state"
 ACTION_COLUMN = "action"
@@ -170,6 +193,57 @@ class PointCloudMetadata:
     depth_scale: float
     depth_key: str
     coordinate_frame: str
+    field_name: str = "xyz"
+    array_key: str = POINTCLOUD_ARRAY_KEY
+    feature_dim: int = 3
+    scene_info: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class ResolvedSceneCamera:
+    """One camera's verified RGB-D calibration and base-transform source."""
+
+    name: str
+    rgb_dataset: h5py.Dataset
+    depth_dataset: h5py.Dataset
+    depth_key: str
+    intrinsics: np.ndarray
+    intrinsics_source: str
+    depth_scale: float
+    depth_scale_source: str
+    transform_source: str
+    transform_dataset: h5py.Dataset | None = None
+    static_transform: np.ndarray | None = None
+    ee_pose_dataset: h5py.Dataset | None = None
+    transform_ee_camera: np.ndarray | None = None
+
+    def transform_at(self, frame_index: int) -> np.ndarray:
+        if self.transform_dataset is not None:
+            dataset = self.transform_dataset
+            value = dataset[frame_index] if dataset.ndim == 3 else dataset[()]
+            if self.name == "wrist" and dataset.ndim != 3:
+                raise ConversionError(
+                    "Wrist T_base_camera must vary by frame. A static wrist-to-base transform "
+                    f"at {dataset.name!r} is unsafe for a moving camera."
+                )
+            return validate_transform(value, source=f"{dataset.name}[{frame_index}]")
+        if self.static_transform is not None:
+            if self.name == "wrist":
+                raise ConversionError(
+                    "A static T_base_wrist_camera is invalid for the moving UniVTAC wrist camera. "
+                    "Provide a per-frame T_base_camera_key or T_ee_camera plus embodiment/ee."
+                )
+            return self.static_transform
+        if self.ee_pose_dataset is not None and self.transform_ee_camera is not None:
+            transform_base_ee = pose_wxyz_to_matrix(
+                self.ee_pose_dataset[frame_index],
+                source=f"{self.ee_pose_dataset.name}[{frame_index}]",
+            )
+            return validate_transform(
+                transform_base_ee @ self.transform_ee_camera,
+                source=f"{self.ee_pose_dataset.name} @ calibrated T_ee_{self.name}_camera",
+            )
+        raise ConversionError(f"No verified transform source was resolved for {self.name} camera")
 
 
 def _natural_sort_key(path: Path) -> tuple[tuple[int, str | int], ...]:
@@ -658,6 +732,191 @@ def resolve_depth_scale(
     return scale
 
 
+def _load_scene_calibration(path: Path | None) -> dict[str, Any]:
+    if path is None:
+        return {}
+    with path.expanduser().open("r", encoding="utf-8") as file:
+        calibration = json.load(file)
+    if calibration.get("coordinate_frame") != "robot_base":
+        raise ConversionError(
+            "Scene calibration must explicitly declare coordinate_frame='robot_base'."
+        )
+    cameras = calibration.get("cameras")
+    if not isinstance(cameras, dict) or not {"head", "wrist"}.issubset(cameras):
+        raise ConversionError("Scene calibration must define cameras.head and cameras.wrist.")
+    return calibration
+
+
+def _scene_intrinsics(
+    hdf5_file: h5py.File, depth_key: str, camera_cfg: dict[str, Any], camera_name: str
+) -> tuple[np.ndarray, str]:
+    if "intrinsics" in camera_cfg:
+        source = f"scene calibration cameras.{camera_name}.intrinsics"
+        return validate_intrinsics(camera_cfg["intrinsics"], source=source), source
+    matrix = resolve_camera_intrinsics(hdf5_file, depth_key, None)
+    return matrix, f"HDF5 metadata near {depth_key}"
+
+
+def _scene_depth_scale(
+    depth_dataset: h5py.Dataset, camera_cfg: dict[str, Any], camera_name: str
+) -> tuple[float, str]:
+    override = camera_cfg.get("depth_scale")
+    scale = resolve_depth_scale(depth_dataset, override)
+    source = (
+        f"scene calibration cameras.{camera_name}.depth_scale"
+        if override is not None
+        else f"{depth_dataset.name} depth metadata"
+    )
+    return scale, source
+
+
+def _resolve_scene_camera(
+    hdf5_file: h5py.File,
+    camera_name: str,
+    calibration: dict[str, Any],
+) -> ResolvedSceneCamera:
+    camera_cfg = calibration.get("cameras", {}).get(camera_name, {})
+    rgb_key = camera_cfg.get("rgb_key", CAMERA_DATASETS[camera_name])
+    depth_key = camera_cfg.get("depth_key", f"observation/{camera_name}/depth")
+    rgb_dataset = _require_hdf5_dataset(hdf5_file, rgb_key)
+    try:
+        depth_dataset = _require_hdf5_dataset(hdf5_file, depth_key)
+    except ConversionError as exc:
+        raise ConversionError(
+            f"Scene conversion needs {camera_name} RGB-D, but {depth_key!r} is missing. "
+            "UniVTAC's published clean/demo/contact configs record camera:['rgb'] only. "
+            "Collect new episodes with camera:['rgb','depth']; RGB-only recordings cannot be "
+            "safely converted into scene geometry."
+        ) from exc
+    intrinsics, intrinsics_source = _scene_intrinsics(hdf5_file, depth_key, camera_cfg, camera_name)
+    depth_scale, depth_scale_source = _scene_depth_scale(depth_dataset, camera_cfg, camera_name)
+
+    transform_key = camera_cfg.get("T_base_camera_key", f"observation/{camera_name}/T_base_camera")
+    if transform_key in hdf5_file:
+        transform_dataset = _require_hdf5_dataset(hdf5_file, transform_key)
+        if transform_dataset.shape not in {(4, 4), (len(depth_dataset), 4, 4)}:
+            raise ConversionError(
+                f"{transform_key!r} must have shape [4,4] or [T,4,4], got "
+                f"{transform_dataset.shape}."
+            )
+        return ResolvedSceneCamera(
+            name=camera_name,
+            rgb_dataset=rgb_dataset,
+            depth_dataset=depth_dataset,
+            depth_key=depth_key,
+            intrinsics=intrinsics,
+            intrinsics_source=intrinsics_source,
+            depth_scale=depth_scale,
+            depth_scale_source=depth_scale_source,
+            transform_source=f"HDF5 dataset {transform_key}",
+            transform_dataset=transform_dataset,
+        )
+
+    if camera_name == "head" and "T_base_camera" in camera_cfg:
+        transform = validate_transform(
+            camera_cfg["T_base_camera"], source="scene calibration cameras.head.T_base_camera"
+        )
+        return ResolvedSceneCamera(
+            name=camera_name,
+            rgb_dataset=rgb_dataset,
+            depth_dataset=depth_dataset,
+            depth_key=depth_key,
+            intrinsics=intrinsics,
+            intrinsics_source=intrinsics_source,
+            depth_scale=depth_scale,
+            depth_scale_source=depth_scale_source,
+            transform_source="scene calibration static T_base_head_camera",
+            static_transform=transform,
+        )
+
+    if camera_name == "wrist" and "T_ee_camera" in camera_cfg:
+        ee_pose_key = camera_cfg.get("ee_pose_key", "embodiment/ee")
+        ee_pose_dataset = _require_hdf5_dataset(hdf5_file, ee_pose_key)
+        if ee_pose_dataset.ndim != 2 or ee_pose_dataset.shape[1] != 7:
+            raise ConversionError(
+                f"{ee_pose_key!r} must contain UniVTAC base-frame [xyz,qw,qx,qy,qz] poses, "
+                f"got {ee_pose_dataset.shape}."
+            )
+        transform_ee_camera = validate_transform(
+            camera_cfg["T_ee_camera"],
+            source="scene calibration cameras.wrist.T_ee_camera",
+        )
+        return ResolvedSceneCamera(
+            name=camera_name,
+            rgb_dataset=rgb_dataset,
+            depth_dataset=depth_dataset,
+            depth_key=depth_key,
+            intrinsics=intrinsics,
+            intrinsics_source=intrinsics_source,
+            depth_scale=depth_scale,
+            depth_scale_source=depth_scale_source,
+            transform_source=f"{ee_pose_key}(t) @ calibrated T_ee_wrist_camera",
+            ee_pose_dataset=ee_pose_dataset,
+            transform_ee_camera=transform_ee_camera,
+        )
+
+    missing = (
+        "a static verified T_base_camera for head"
+        if camera_name == "head"
+        else "per-frame T_base_camera data, or calibrated T_ee_camera plus embodiment/ee"
+    )
+    raise ConversionError(
+        f"No safe {camera_name} extrinsic was found. Provide {missing} in HDF5 or "
+        "--scene-calibration-json. Camera config positions alone are not silently assumed to "
+        "match this recording."
+    )
+
+
+def write_scene_pointcloud_episode(
+    head: ResolvedSceneCamera,
+    wrist: ResolvedSceneCamera,
+    output_path: Path,
+    *,
+    frame_count: int,
+    config: ScenePreprocessConfig,
+) -> dict[str, Any]:
+    """Stream two RGB-D views into one fixed-size common-frame XYZRGB array."""
+    scene = np.empty((frame_count, config.max_points, 6), dtype=np.float32)
+    provenance_rows = []
+    for frame_index in range(frame_count):
+        head_rgb = decode_univtac_rgb(
+            head.rgb_dataset[frame_index], source=f"{head.rgb_dataset.name}[{frame_index}]"
+        )
+        wrist_rgb = decode_univtac_rgb(
+            wrist.rgb_dataset[frame_index], source=f"{wrist.rgb_dataset.name}[{frame_index}]"
+        )
+        try:
+            scene[frame_index], provenance = build_scene_frame(
+                head_rgb=head_rgb,
+                head_depth=head.depth_dataset[frame_index],
+                head_intrinsics=head.intrinsics,
+                head_depth_scale=head.depth_scale,
+                transform_base_head=head.transform_at(frame_index),
+                wrist_rgb=wrist_rgb,
+                wrist_depth=wrist.depth_dataset[frame_index],
+                wrist_intrinsics=wrist.intrinsics,
+                wrist_depth_scale=wrist.depth_scale,
+                transform_base_wrist=wrist.transform_at(frame_index),
+                config=config,
+                frame_index=frame_index,
+            )
+        except ScenePointCloudError as exc:
+            raise ConversionError(f"Scene frame {frame_index}: {exc}") from exc
+        provenance_rows.append(provenance)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(output_path, **{SCENE_POINTCLOUD_ARRAY_KEY: scene})
+    keys = provenance_rows[0]
+    return {
+        key: {
+            "min": min(row[key] for row in provenance_rows),
+            "max": max(row[key] for row in provenance_rows),
+            "mean": float(np.mean([row[key] for row in provenance_rows])),
+        }
+        for key in keys
+    }
+
+
 def reconstruct_fixed_pointcloud(
     depth: np.ndarray,
     intrinsics: np.ndarray,
@@ -741,6 +1000,9 @@ def prepare_episode(
     pointcloud_intrinsics: list[float] | None,
     pointcloud_depth_scale: float | None,
     pointcloud_num_points: int,
+    include_scene_pointcloud: bool = False,
+    scene_calibration: dict[str, Any] | None = None,
+    scene_preprocess: ScenePreprocessConfig | None = None,
 ) -> PreparedEpisode:
     """Validate one source episode and write all requested aligned modalities."""
     try:
@@ -760,6 +1022,12 @@ def prepare_episode(
             depth_key, depth_dataset = resolve_depth_dataset(hdf5_file, pointcloud_depth_key)
             intrinsics = resolve_camera_intrinsics(hdf5_file, depth_key, pointcloud_intrinsics)
             depth_scale = resolve_depth_scale(depth_dataset, pointcloud_depth_scale)
+        scene_cameras: dict[str, ResolvedSceneCamera] = {}
+        if include_scene_pointcloud:
+            scene_cameras = {
+                camera_name: _resolve_scene_camera(hdf5_file, camera_name, scene_calibration or {})
+                for camera_name in ("head", "wrist")
+            }
         tactile_data = (
             resolve_tactile_dataset(hdf5_file, tactile_rgb_key, depth_key)
             if include_tactile
@@ -821,6 +1089,31 @@ def prepare_episode(
                     f"{joint_sample_count} samples but {depth_key} has {len(depth_dataset)}."
                 )
 
+        for camera_name, scene_camera in scene_cameras.items():
+            if scene_camera.depth_dataset.ndim not in {3, 4}:
+                raise ConversionError(
+                    f"{source_path}:{scene_camera.depth_key} must have shape [T,H,W] or "
+                    f"[T,H,W,1], got {scene_camera.depth_dataset.shape}."
+                )
+            if scene_camera.depth_dataset.ndim == 4 and scene_camera.depth_dataset.shape[-1] != 1:
+                raise ConversionError(
+                    f"{source_path}:{scene_camera.depth_key} must have a singleton final "
+                    f"channel, got {scene_camera.depth_dataset.shape}."
+                )
+            if len(scene_camera.depth_dataset) != joint_sample_count:
+                raise ConversionError(
+                    f"Length mismatch: {scene_camera.depth_key} has "
+                    f"{len(scene_camera.depth_dataset)} frames, expected {joint_sample_count}."
+                )
+            if (
+                scene_camera.ee_pose_dataset is not None
+                and len(scene_camera.ee_pose_dataset) != joint_sample_count
+            ):
+                raise ConversionError(
+                    f"Length mismatch: {scene_camera.ee_pose_dataset.name} has "
+                    f"{len(scene_camera.ee_pose_dataset)} poses, expected {joint_sample_count}."
+                )
+
         # This is the exact state/action convention used by UniVTAC's ACT converter.
         joint_values = np.asarray(joint_dataset[:, :JOINT_DIMENSION], dtype=np.float32)
         state = np.ascontiguousarray(joint_values[:-1])
@@ -879,7 +1172,68 @@ def prepare_episode(
             }
 
         pointcloud_metadata: PointCloudMetadata | None = None
-        if depth_dataset is not None:
+        if scene_cameras:
+            if scene_preprocess is None:
+                raise RuntimeError("scene_preprocess is required for scene conversion")
+            pointcloud_path = (
+                output_root
+                / "pointclouds"
+                / f"chunk-{episode_chunk:03d}"
+                / SCENE_POINTCLOUD_OUTPUT_KEY
+                / f"episode_{episode_index:06d}.npz"
+            )
+            provenance = write_scene_pointcloud_episode(
+                scene_cameras["head"],
+                scene_cameras["wrist"],
+                pointcloud_path,
+                frame_count=frame_count,
+                config=scene_preprocess,
+            )
+            head_intrinsics = scene_cameras["head"].intrinsics
+            pointcloud_metadata = PointCloudMetadata(
+                num_points=scene_preprocess.max_points,
+                intrinsics=(
+                    float(head_intrinsics[0, 0]),
+                    float(head_intrinsics[1, 1]),
+                    float(head_intrinsics[0, 2]),
+                    float(head_intrinsics[1, 2]),
+                ),
+                depth_scale=scene_cameras["head"].depth_scale,
+                depth_key=",".join(scene_cameras[name].depth_key for name in ("head", "wrist")),
+                coordinate_frame="robot_base",
+                field_name="scene",
+                array_key=SCENE_POINTCLOUD_ARRAY_KEY,
+                feature_dim=6,
+                scene_info={
+                    "source_cameras": ["head", "wrist"],
+                    "coordinate_frame": "robot_base",
+                    "rgb_storage_range": [0.0, 255.0],
+                    "rgb_model_normalization": "Concerto NormalizeColor: RGB / 255",
+                    "voxel_size_m": scene_preprocess.voxel_size,
+                    "workspace_min_m": scene_preprocess.workspace_min,
+                    "workspace_max_m": scene_preprocess.workspace_max,
+                    "sampling": "random cap after voxelization; unbiased repeat for dense fill",
+                    "sampling_seed": scene_preprocess.seed,
+                    "camera_calibration": {
+                        name: {
+                            "intrinsics_fx_fy_cx_cy": [
+                                float(scene_cameras[name].intrinsics[0, 0]),
+                                float(scene_cameras[name].intrinsics[1, 1]),
+                                float(scene_cameras[name].intrinsics[0, 2]),
+                                float(scene_cameras[name].intrinsics[1, 2]),
+                            ],
+                            "intrinsics_source": scene_cameras[name].intrinsics_source,
+                            "depth_key": scene_cameras[name].depth_key,
+                            "depth_scale_to_meters": scene_cameras[name].depth_scale,
+                            "depth_scale_source": scene_cameras[name].depth_scale_source,
+                            "transform_source": scene_cameras[name].transform_source,
+                        }
+                        for name in ("head", "wrist")
+                    },
+                    "provenance_counts": provenance,
+                },
+            )
+        elif depth_dataset is not None:
             assert depth_key is not None and intrinsics is not None and depth_scale is not None
             pointcloud_path = (
                 output_root
@@ -1048,15 +1402,17 @@ def build_info_metadata(
             tactile_feature["info"]["source_key"] = tactile_source_key
             features[TACTILE_OUTPUT_KEYS[tactile_key]] = tactile_feature
     if pointcloud_metadata is not None:
-        features[POINTCLOUD_OUTPUT_KEY] = {
+        original_key = f"observation.pointcloud.{pointcloud_metadata.field_name}"
+        features[original_key] = {
             "dtype": "float32",
-            "shape": [pointcloud_metadata.num_points, 3],
-            "names": ["point", "xyz"],
+            "shape": [pointcloud_metadata.num_points, pointcloud_metadata.feature_dim],
+            "names": ["point", "xyzrgb" if pointcloud_metadata.feature_dim == 6 else "xyz"],
             "info": {
-                "array_key": POINTCLOUD_ARRAY_KEY,
+                "array_key": pointcloud_metadata.array_key,
                 "coordinate_frame": pointcloud_metadata.coordinate_frame,
                 "depth_scale_to_meters": pointcloud_metadata.depth_scale,
                 "intrinsics_fx_fy_cx_cy": list(pointcloud_metadata.intrinsics),
+                **(pointcloud_metadata.scene_info or {}),
             },
         }
 
@@ -1144,14 +1500,16 @@ def write_metadata(
         }
     if pointcloud_metadata is not None:
         modality["pointcloud"] = {
-            "xyz": {
-                "original_key": POINTCLOUD_OUTPUT_KEY,
-                "array_key": POINTCLOUD_ARRAY_KEY,
+            pointcloud_metadata.field_name: {
+                "original_key": (f"observation.pointcloud.{pointcloud_metadata.field_name}"),
+                "array_key": pointcloud_metadata.array_key,
                 "coordinate_frame": pointcloud_metadata.coordinate_frame,
                 "depth_source": pointcloud_metadata.depth_key,
                 "depth_scale_to_meters": pointcloud_metadata.depth_scale,
                 "intrinsics_fx_fy_cx_cy": list(pointcloud_metadata.intrinsics),
                 "num_points": pointcloud_metadata.num_points,
+                "feature_dim": pointcloud_metadata.feature_dim,
+                **(pointcloud_metadata.scene_info or {}),
             }
         }
 
@@ -1247,30 +1605,35 @@ def validate_converted_dataset(
             raise ConversionError(f"NaN or Inf found in {parquet_path}")
 
         if pointcloud_metadata is not None:
+            pointcloud_output_key = f"observation.pointcloud.{pointcloud_metadata.field_name}"
             pointcloud_path = (
                 output_root
                 / "pointclouds"
                 / f"chunk-{chunk_index:03d}"
-                / POINTCLOUD_OUTPUT_KEY
+                / pointcloud_output_key
                 / f"episode_{episode.episode_index:06d}.npz"
             )
             with np.load(pointcloud_path, allow_pickle=False) as archive:
-                if POINTCLOUD_ARRAY_KEY not in archive:
+                if pointcloud_metadata.array_key not in archive:
                     raise ConversionError(
-                        f"{pointcloud_path} does not contain {POINTCLOUD_ARRAY_KEY!r}."
+                        f"{pointcloud_path} does not contain {pointcloud_metadata.array_key!r}."
                     )
-                xyz = archive[POINTCLOUD_ARRAY_KEY]
-                expected_shape = (episode.length, pointcloud_metadata.num_points, 3)
-                if xyz.shape != expected_shape:
+                points = archive[pointcloud_metadata.array_key]
+                expected_shape = (
+                    episode.length,
+                    pointcloud_metadata.num_points,
+                    pointcloud_metadata.feature_dim,
+                )
+                if points.shape != expected_shape:
                     raise ConversionError(
-                        f"Incorrect point-cloud shape in {pointcloud_path}: {xyz.shape}; "
+                        f"Incorrect point-cloud shape in {pointcloud_path}: {points.shape}; "
                         f"expected {expected_shape}."
                     )
-                if xyz.dtype != np.float32:
+                if points.dtype != np.float32:
                     raise ConversionError(
-                        f"Incorrect point-cloud dtype in {pointcloud_path}: {xyz.dtype}."
+                        f"Incorrect point-cloud dtype in {pointcloud_path}: {points.dtype}."
                     )
-                if not np.isfinite(xyz).all():
+                if not np.isfinite(points).all():
                     raise ConversionError(f"NaN or Inf found in {pointcloud_path}")
 
         expected_global_index += episode.length
@@ -1297,11 +1660,14 @@ def _remove_episode_outputs(output_root: Path, episode_index: int) -> None:
             / f"episode_{episode_index:06d}.mp4"
             for original_key in TACTILE_OUTPUT_KEYS.values()
         ),
-        output_root
-        / "pointclouds"
-        / f"chunk-{chunk_index:03d}"
-        / POINTCLOUD_OUTPUT_KEY
-        / f"episode_{episode_index:06d}.npz",
+        *(
+            output_root
+            / "pointclouds"
+            / f"chunk-{chunk_index:03d}"
+            / pointcloud_key
+            / f"episode_{episode_index:06d}.npz"
+            for pointcloud_key in (POINTCLOUD_OUTPUT_KEY, SCENE_POINTCLOUD_OUTPUT_KEY)
+        ),
     ]
     for candidate in candidates:
         candidate.unlink(missing_ok=True)
@@ -1340,7 +1706,22 @@ def _validate_pointcloud_schema(
         return episode_metadata
     if episode_metadata is None:
         raise ConversionError(f"Point cloud is missing from {source_path}")
-    if episode_metadata != reference_metadata:
+    reference_schema = dict(reference_metadata.scene_info or {})
+    episode_schema = dict(episode_metadata.scene_info or {})
+    reference_schema.pop("provenance_counts", None)
+    episode_schema.pop("provenance_counts", None)
+    same_schema = (
+        reference_metadata.num_points == episode_metadata.num_points
+        and reference_metadata.intrinsics == episode_metadata.intrinsics
+        and reference_metadata.depth_scale == episode_metadata.depth_scale
+        and reference_metadata.depth_key == episode_metadata.depth_key
+        and reference_metadata.coordinate_frame == episode_metadata.coordinate_frame
+        and reference_metadata.field_name == episode_metadata.field_name
+        and reference_metadata.array_key == episode_metadata.array_key
+        and reference_metadata.feature_dim == episode_metadata.feature_dim
+        and reference_schema == episode_schema
+    )
+    if not same_schema:
         raise ConversionError(
             f"Point-cloud schema/calibration changed in {source_path}: expected "
             f"{reference_metadata}, got {episode_metadata}."
@@ -1377,6 +1758,25 @@ def convert_dataset(args: argparse.Namespace) -> None:
     if args.pointcloud_num_points <= 0:
         raise ValueError(
             f"pointcloud-num-points must be positive, got {args.pointcloud_num_points}"
+        )
+    if args.include_pointcloud and args.include_scene_pointcloud:
+        raise ValueError(
+            "--include-pointcloud is the legacy single-depth XYZ path and cannot be combined "
+            "with --include-scene-pointcloud"
+        )
+    scene_calibration = _load_scene_calibration(args.scene_calibration_json)
+    scene_preprocess = None
+    if args.include_scene_pointcloud:
+        scene_preprocess = ScenePreprocessConfig(
+            workspace_min=(
+                tuple(args.scene_workspace_min) if args.scene_workspace_min is not None else None
+            ),
+            workspace_max=(
+                tuple(args.scene_workspace_max) if args.scene_workspace_max is not None else None
+            ),
+            voxel_size=args.scene_voxel_size,
+            max_points=args.scene_num_points,
+            seed=args.scene_seed,
         )
     if args.tactile_rgb_key is not None and not args.include_tactile:
         raise ValueError("--tactile-rgb-key requires --include-tactile")
@@ -1418,6 +1818,9 @@ def convert_dataset(args: argparse.Namespace) -> None:
                     pointcloud_intrinsics=args.pointcloud_intrinsics,
                     pointcloud_depth_scale=args.pointcloud_depth_scale,
                     pointcloud_num_points=args.pointcloud_num_points,
+                    include_scene_pointcloud=args.include_scene_pointcloud,
+                    scene_calibration=scene_calibration,
+                    scene_preprocess=scene_preprocess,
                 )
                 validated_video_metadata = _validate_video_schema(
                     reference_video_metadata,
@@ -1537,7 +1940,8 @@ def convert_dataset(args: argparse.Namespace) -> None:
             )
     if reference_pointcloud_metadata is not None:
         print(
-            f"Point cloud: ({reference_pointcloud_metadata.num_points}, 3) float32 "
+            f"Point cloud: ({reference_pointcloud_metadata.num_points}, "
+            f"{reference_pointcloud_metadata.feature_dim}) float32 "
             f"in {reference_pointcloud_metadata.coordinate_frame}"
         )
     print(f"Output: {output_root}")
@@ -1575,7 +1979,55 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--include-pointcloud",
         action="store_true",
-        help="Reconstruct and store fixed-size camera-frame point clouds from depth.",
+        help="Legacy: reconstruct one camera-frame XYZ cloud from one selected depth stream.",
+    )
+    parser.add_argument(
+        "--include-scene-pointcloud",
+        action="store_true",
+        help=(
+            "Build observation.pointcloud.scene as common robot-base XYZRGB from calibrated "
+            "head+wrist RGB-D. Fails if depth or calibration is unavailable."
+        ),
+    )
+    parser.add_argument(
+        "--scene-calibration-json",
+        type=Path,
+        help=(
+            "Verified calibration sidecar. HDF5 calibration datasets are used when present; "
+            "never inferred from unverified task defaults."
+        ),
+    )
+    parser.add_argument(
+        "--scene-workspace-min",
+        type=float,
+        nargs=3,
+        metavar=("X_MIN", "Y_MIN", "Z_MIN"),
+        help="Optional robot-base workspace crop lower bounds in metres.",
+    )
+    parser.add_argument(
+        "--scene-workspace-max",
+        type=float,
+        nargs=3,
+        metavar=("X_MAX", "Y_MAX", "Z_MAX"),
+        help="Optional robot-base workspace crop upper bounds in metres.",
+    )
+    parser.add_argument(
+        "--scene-voxel-size",
+        type=float,
+        default=0.01,
+        help="Common-frame voxel size in metres, applied after camera merge (default: 0.01).",
+    )
+    parser.add_argument(
+        "--scene-num-points",
+        type=int,
+        default=8192,
+        help="Dense scene point count after crop/voxelization (default: 8192).",
+    )
+    parser.add_argument(
+        "--scene-seed",
+        type=int,
+        default=0,
+        help="Reproducible post-voxel random sampling seed (default: 0).",
     )
     parser.add_argument(
         "--pointcloud-depth-key",

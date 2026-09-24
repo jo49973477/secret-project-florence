@@ -27,7 +27,7 @@ import tree
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
 from gr00t.model.extension.multimodal_dit import MultiModalConditionedDiT
 from gr00t.model.extension.point_encoder import build_point_encoder
-from gr00t.model.extension.tactile_encoder import TactileEncoder
+from gr00t.model.extension.tactile_encoder import SparshDinoTactileEncoder, build_tactile_encoder
 from gr00t.model.modules.dit import AlternateVLDiT, DiT, SelfAttentionTransformer
 from gr00t.model.modules.embodiment_conditioned_mlp import (
     CategorySpecificMLP,
@@ -153,12 +153,33 @@ class Gr00tN1d7ActionHead(nn.Module):
                     config.point_encoder_cfg,
                     input_dim=config.point_input_dim,
                     point_dim=self.model.inner_dim,
+                    **(
+                        {
+                            "checkpoint_path": config.point_encoder_checkpoint_path,
+                            "repo_id": config.point_encoder_repo_id,
+                            "download_root": config.point_encoder_download_root,
+                            "grid_size": config.point_encoder_grid_size,
+                            "enable_flash": config.point_encoder_enable_flash,
+                        }
+                        if config.point_encoder_cfg in {"concerto_small", "concerto_base"}
+                        else {}
+                    ),
                 )
             if config.use_tactile_conditioning:
-                self.tactile_encoder = TactileEncoder(
+                self.tactile_encoder = build_tactile_encoder(
+                    config.tactile_encoder_cfg,
                     input_channels=config.tactile_input_channels,
-                    token_dim=self.model.inner_dim,
+                    output_dim=self.model.inner_dim,
+                    pretrained_model=config.tactile_pretrained_model,
+                    checkpoint_filename=config.tactile_checkpoint_filename,
+                    background_path=config.tactile_background_path,
+                    load_pretrained=config.tactile_pretrained_load_on_init,
+                    backbone_trainable=config.tune_tactile_encoder,
                 )
+                # A saved GR00T checkpoint contains the complete Sparsh state.
+                # Persisting this flag prevents an unnecessary Hub download on reload.
+                if isinstance(self.tactile_encoder, SparshDinoTactileEncoder):
+                    config.tactile_pretrained_load_on_init = False
 
         self.vlln = (
             nn.LayerNorm(config.backbone_embedding_dim) if config.use_vlln else nn.Identity()
@@ -245,7 +266,13 @@ class Gr00tN1d7ActionHead(nn.Module):
         if self.point_encoder is not None:
             self.point_encoder.requires_grad_(tune_point_encoder)
         if self.tactile_encoder is not None:
-            self.tactile_encoder.requires_grad_(tune_tactile_encoder)
+            if isinstance(self.tactile_encoder, SparshDinoTactileEncoder):
+                self.tactile_encoder.set_trainable(
+                    backbone=tune_tactile_encoder,
+                    projection=tune_multimodal_adapter,
+                )
+            else:
+                self.tactile_encoder.requires_grad_(tune_tactile_encoder)
         if not tune_vlln:
             self.vlln.requires_grad_(False)
             self.vl_self_attention.requires_grad_(False)
@@ -343,7 +370,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 - embodiment_id: [B] (embodiment IDs)
                 - action_mask: [B, action_horizon, action_dim]
                 - points: optional [B, N, point_input_dim]
-                - tactile: optional [B, C, H, W]
+                - tactile: optional [B, T_tactile, C, H, W]
 
         Returns:
             BatchFeature containing:

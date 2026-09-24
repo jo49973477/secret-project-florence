@@ -27,6 +27,7 @@ from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
 from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7ActionHead
 import pytest
 import torch
+from torch import nn
 from transformers.feature_extraction_utils import BatchFeature
 
 
@@ -102,18 +103,20 @@ def _make_action_input(config, batch_size=2):
     if config.dit_type == "multimodal_conditioned_dit" and config.use_point_conditioning:
         data["points"] = torch.randn(batch_size, 16, config.point_input_dim)
     if config.dit_type == "multimodal_conditioned_dit" and config.use_tactile_conditioning:
-        data["tactile"] = torch.randn(batch_size, config.tactile_input_channels, 32, 32)
+        data["tactile"] = torch.randn(batch_size, 2, config.tactile_input_channels, 32, 32)
     return BatchFeature(data=data)
 
 
 def _small_multimodal_config(**overrides) -> Gr00tN1d7Config:
-    return _small_config(
-        dit_type="multimodal_conditioned_dit",
-        point_encoder_cfg="point_transformer",
-        point_input_dim=3,
-        tactile_input_channels=3,
-        **overrides,
-    )
+    defaults = {
+        "dit_type": "multimodal_conditioned_dit",
+        "point_encoder_cfg": "point_transformer",
+        "point_input_dim": 3,
+        "tactile_input_channels": 3,
+        "tactile_encoder_cfg": "resnet18",
+    }
+    defaults.update(overrides)
+    return _small_config(**defaults)
 
 
 def test_checkpoint_config_accepts_explicit_dropout_overrides(tmp_path):
@@ -369,6 +372,45 @@ class TestMultimodalActionHead:
 
         assert not head.point_encoder.training
         assert not head.tactile_encoder.training
+
+    def test_frozen_sparsh_keeps_new_projection_and_cross_attention_trainable(self, monkeypatch):
+        import gr00t.model.gr00t_n1d7.gr00t_n1d7 as action_head_module
+
+        class FakeSparsh(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.backbone = nn.Linear(3, 4)
+                self.projection = nn.Linear(4, 8)
+
+            def set_trainable(self, *, backbone: bool, projection: bool) -> None:
+                self.backbone.requires_grad_(backbone)
+                self.projection.requires_grad_(projection)
+
+        monkeypatch.setattr(action_head_module, "SparshDinoTactileEncoder", FakeSparsh)
+        monkeypatch.setattr(
+            action_head_module,
+            "build_tactile_encoder",
+            lambda *args, **kwargs: FakeSparsh(),
+        )
+        config = _small_multimodal_config(
+            use_point_conditioning=False,
+            tactile_encoder_cfg="sparsh_dino_base",
+            tune_tactile_encoder=False,
+            tune_multimodal_adapter=True,
+        )
+
+        head = Gr00tN1d7ActionHead(config)
+
+        assert not any(
+            parameter.requires_grad for parameter in head.tactile_encoder.backbone.parameters()
+        )
+        assert all(
+            parameter.requires_grad for parameter in head.tactile_encoder.projection.parameters()
+        )
+        assert all(
+            parameter.requires_grad for parameter in head.model.tactile_cross_attention.parameters()
+        )
+        assert head.model.tactile_gates.requires_grad
 
     def test_inference_encodes_static_modalities_once(self):
         config = _small_multimodal_config(num_inference_timesteps=3)

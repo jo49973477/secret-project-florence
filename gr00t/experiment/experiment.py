@@ -29,6 +29,8 @@ import wandb
 
 from gr00t.configs.base_config import Config
 from gr00t.configs.training.training_config import check_resume_compatibility
+from gr00t.experiment.telegram_callback import TelegramTrainingCallback, TrainingNotificationContext
+from gr00t.experiment.telegram_notifier import TelegramNotifier
 
 # Use custom trainer that profiles data loading & forward times
 from gr00t.experiment.trainer import Gr00tTrainer, ProfCallback
@@ -189,6 +191,15 @@ def save_initial_actions_artifact(train_dataset, save_cfg_dir: Path):
     logging.info(f"Saved {len(initial_actions)} initial actions to {initial_actions_path}")
 
 
+def _notification_dataset_path(config: Config) -> str | None:
+    paths = [
+        str(path)
+        for dataset in config.data.datasets
+        for path in getattr(dataset, "dataset_paths", [])
+    ]
+    return os.pathsep.join(paths) if paths else None
+
+
 def run(config: Config):
     """Main training function."""
     warn_configs(config)
@@ -212,6 +223,14 @@ def run(config: Config):
     else:
         output_dir = Path(config.training.output_dir) / config.training.experiment_name
         experiment_name = config.training.experiment_name
+
+    telegram_notifier = None
+    if config.training.telegram_on:
+        # The token is resolved only into this runtime object. It is never attached
+        # to config, so config/checkpoint/W&B serialization cannot expose it.
+        telegram_notifier = TelegramNotifier.from_environment(
+            chat_id=config.training.telegram_chat_id
+        )
 
     run_on_rank0(output_dir.mkdir, parents=True, exist_ok=True, label="output_dir.mkdir")
 
@@ -270,10 +289,16 @@ def run(config: Config):
     # Create training arguments
     resolved_vlm_lr = config.training.resolved_vlm_learning_rate
     resolved_action_head_lr = config.training.resolved_action_head_learning_rate
+    resolved_point_encoder_lr = config.training.resolved_point_encoder_learning_rate
+    resolved_tactile_encoder_lr = config.training.resolved_tactile_encoder_learning_rate
     logging.info(
-        "Resolved optimizer learning rates: VLM=%g, Action Head=%g (base learning_rate=%g)",
+        "Resolved optimizer learning rates: VLM=%g, Action Head=%g, Point Encoder=%g, "
+        "Tactile Encoder=%g "
+        "(base learning_rate=%g)",
         resolved_vlm_lr,
         resolved_action_head_lr,
+        resolved_point_encoder_lr,
+        resolved_tactile_encoder_lr,
         config.training.learning_rate,
     )
     training_args = TrainingArguments(
@@ -320,6 +345,8 @@ def run(config: Config):
         multiprocessing_context=config.data.multiprocessing_context,
         vlm_learning_rate=resolved_vlm_lr,
         action_head_learning_rate=resolved_action_head_lr,
+        point_encoder_learning_rate=resolved_point_encoder_lr,
+        tactile_encoder_learning_rate=resolved_tactile_encoder_lr,
     )
 
     trainer.add_callback(
@@ -329,6 +356,31 @@ def run(config: Config):
             processor_dir=processor_dir,
         )
     )
+
+    telegram_callback = None
+    if telegram_notifier is not None:
+        telegram_callback = TelegramTrainingCallback(
+            notifier=telegram_notifier,
+            context=TrainingNotificationContext(
+                experiment_name=experiment_name,
+                output_dir=str(output_dir),
+                model_path=config.training.start_from_checkpoint,
+                dataset_path=_notification_dataset_path(config),
+                num_gpus=config.training.num_gpus,
+                global_batch_size=config.training.global_batch_size,
+                learning_rate=config.training.learning_rate,
+                deepspeed_stage=(
+                    config.training.deepspeed_stage if deepspeed_config is not None else None
+                ),
+            ),
+            notify_start=config.training.telegram_notify_start,
+            notify_save=config.training.telegram_notify_save,
+            notify_finish=config.training.telegram_notify_finish,
+            notify_error=config.training.telegram_notify_error,
+            # HF fires on_train_end before the explicit final save below.
+            defer_finish_until_final_save=True,
+        )
+        trainer.add_callback(telegram_callback)
 
     if config.training.save_best_eval_metric_name != "":
         trainer.add_callback(
@@ -343,53 +395,63 @@ def run(config: Config):
     if hasattr(train_dataset, "get_initial_actions"):
         run_on_rank0(save_initial_actions_artifact, train_dataset, save_cfg_dir)
 
-    # Train
+    # Train and finalize. Catch ordinary Python exceptions only: Telegram is
+    # best-effort, then the original failure is re-raised with its traceback.
     logging.info("🚀 Starting training...")
-    if config.training.enable_profiling:
-        from functools import partial
+    try:
+        if config.training.enable_profiling:
+            from functools import partial
 
-        logging.info(f"{global_rank} Starting training with profiling...")
+            logging.info(f"{global_rank} Starting training with profiling...")
 
-        def on_trace_ready_handler(trainer, profile_dir, prof):
-            output_path = (
-                profile_dir / f"trace_rank_{global_rank}_iter_{trainer.state.global_step}.json"
-            )
-            prof.export_chrome_trace(str(output_path))
-            logging.info(f"Trace saved to {output_path}")
+            def on_trace_ready_handler(trainer, profile_dir, prof):
+                output_path = (
+                    profile_dir / f"trace_rank_{global_rank}_iter_{trainer.state.global_step}.json"
+                )
+                prof.export_chrome_trace(str(output_path))
+                logging.info(f"Trace saved to {output_path}")
 
-        profile_dir = output_dir / "profiling"
-        run_on_rank0(profile_dir.mkdir, parents=True, exist_ok=True, label="profile_dir.mkdir")
+            profile_dir = output_dir / "profiling"
+            run_on_rank0(profile_dir.mkdir, parents=True, exist_ok=True, label="profile_dir.mkdir")
 
-        with torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
-            schedule=torch.profiler.schedule(skip_first=10, wait=1, warmup=1, active=3, repeat=1),
-            # profile_memory=True,
-            with_stack=True,
-            # record_shapes=True,
-            on_trace_ready=partial(on_trace_ready_handler, trainer, profile_dir),
-        ) as prof:
-            trainer.add_callback(ProfCallback(prof=prof))
+            with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                schedule=torch.profiler.schedule(
+                    skip_first=10, wait=1, warmup=1, active=3, repeat=1
+                ),
+                # profile_memory=True,
+                with_stack=True,
+                # record_shapes=True,
+                on_trace_ready=partial(on_trace_ready_handler, trainer, profile_dir),
+            ) as prof:
+                trainer.add_callback(ProfCallback(prof=prof))
+                trainer.train(resume_from_checkpoint=config.training.resume_from_checkpoint)
+        else:
             trainer.train(resume_from_checkpoint=config.training.resume_from_checkpoint)
-    else:
-        trainer.train(resume_from_checkpoint=config.training.resume_from_checkpoint)
 
-    # Save final model
-    trainer.save_model()
-    logging.info(f"Model saved to {output_dir}")
+        # The success notification is intentionally after this final save.
+        trainer.save_model()
+        logging.info(f"Model saved to {output_dir}")
 
-    if config.training.assert_loss_less_than is not None:
-        final_loss = trainer.loss
-        if final_loss.item() > config.training.assert_loss_less_than:
-            raise AssertionError(
-                f"Loss too high: {final_loss.item()} vs {config.training.assert_loss_less_than})"
-            )
+        if config.training.assert_loss_less_than is not None:
+            final_loss = trainer.loss
+            if final_loss.item() > config.training.assert_loss_less_than:
+                raise AssertionError(
+                    f"Loss too high: {final_loss.item()} vs {config.training.assert_loss_less_than})"
+                )
 
-    # # Cleanup
-    if hasattr(train_dataset, "close"):
-        train_dataset.close()
-    if eval_dataset is not None and hasattr(eval_dataset, "close"):
-        eval_dataset.close()
+        if hasattr(train_dataset, "close"):
+            train_dataset.close()
+        if eval_dataset is not None and hasattr(eval_dataset, "close"):
+            eval_dataset.close()
+
+        if telegram_callback is not None:
+            telegram_callback.notify_finish(args=trainer.args, state=trainer.state)
+    except Exception as exc:
+        if telegram_callback is not None:
+            telegram_callback.notify_failure(exc, args=trainer.args, state=trainer.state)
+        raise
     logging.info("Training completed!")

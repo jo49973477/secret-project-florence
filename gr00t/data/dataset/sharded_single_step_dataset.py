@@ -40,6 +40,12 @@ def extract_step_data(
         indices_to_load = [step_index + delta_index for delta_index in config.delta_indices]
         if allow_padding:
             indices_to_load = [max(0, min(idx, len(episode_data) - 1)) for idx in indices_to_load]
+        elif any(idx < 0 or idx >= len(episode_data) for idx in indices_to_load):
+            raise IndexError(
+                f"{modality} delta_indices={config.delta_indices} at step {step_index} "
+                f"leave episode bounds [0,{len(episode_data) - 1}]. Enable allow_padding "
+                "to repeat boundary frames."
+            )
         for key in config.modality_keys:
             if f"{modality}.{key}" in episode_data.columns:
                 modality_data = episode_data[f"{modality}.{key}"].iloc[indices_to_load]
@@ -195,7 +201,7 @@ class ShardedSingleStepDataset(ShardedDataset):
         episode_splits = []
         total_steps = 0
         for ep_idx in shuffled_episode_indices:
-            step_indices = np.arange(0, self.get_effective_episode_length(ep_idx))
+            step_indices = self.get_valid_step_indices(ep_idx)
             self.rng.shuffle(step_indices)
             total_steps += len(step_indices)
             for i in range(num_splits):
@@ -242,9 +248,22 @@ class ShardedSingleStepDataset(ShardedDataset):
         self.shard_lengths = shard_lengths
 
     def get_effective_episode_length(self, episode_index: int) -> int:
-        """Get the effective episode length accounting for action horizon."""
+        """Get the count of timesteps valid for every configured delta index."""
+        return len(self.get_valid_step_indices(episode_index))
+
+    def get_valid_step_indices(self, episode_index: int) -> np.ndarray:
+        """Return in-episode reference indices, never wrapping negative ``iloc`` values."""
         original_length = self.episode_loader.get_episode_length(episode_index)
-        return max(0, original_length - self.action_horizon + 1)
+        if self.allow_padding:
+            return np.arange(original_length)
+        all_deltas = [
+            delta
+            for modality_config in self.modality_configs.values()
+            for delta in modality_config.delta_indices
+        ]
+        start = max(0, -min(all_deltas))
+        stop = min(original_length, original_length - max(all_deltas))
+        return np.arange(start, max(start, stop))
 
     def __len__(self):
         """Return the number of shards in the dataset."""

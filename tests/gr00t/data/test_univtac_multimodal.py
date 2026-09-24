@@ -13,6 +13,7 @@ from gr00t.data.dataset.sharded_single_step_dataset import extract_step_data
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.stats import generate_stats
 from gr00t.data.types import ModalityConfig, VLAStepData
+from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7Processor
 import numpy as np
 import pandas as pd
 import pytest
@@ -179,6 +180,92 @@ def test_loader_and_extract_step_preserve_external_modalities(
     assert sample.pointclouds["xyz"].dtype == np.float32
     np.testing.assert_array_equal(sample.tactile["rgb"][0], tactile_frames[0])
     np.testing.assert_array_equal(sample.pointclouds["xyz"][1], episode["pointcloud.xyz"].iloc[1])
+
+
+def test_tactile_negative_delta_repeats_boundary_without_cross_episode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _make_external_modality_dataset(tmp_path)
+    tactile_frames = np.stack([np.full((4, 6, 3), value, dtype=np.uint8) for value in (11, 22, 33)])
+
+    monkeypatch.setattr(
+        "gr00t.data.dataset.lerobot_episode_loader.get_frames_by_indices",
+        lambda _path, indices, decoder_kwargs: tactile_frames[indices],
+    )
+    configs = {
+        "state": ModalityConfig(delta_indices=[0], modality_keys=["joint"]),
+        "action": ModalityConfig(delta_indices=[0], modality_keys=["joint"]),
+        "language": ModalityConfig(delta_indices=[0], modality_keys=["task"]),
+        "tactile": ModalityConfig(delta_indices=[-1, 0], modality_keys=["rgb"]),
+    }
+    episode = LeRobotEpisodeLoader(tmp_path, configs)[0]
+
+    with pytest.raises(IndexError, match="leave episode bounds"):
+        extract_step_data(
+            episode,
+            step_index=0,
+            modality_configs=configs,
+            embodiment_tag=EmbodimentTag.NEW_EMBODIMENT,
+        )
+    padded = extract_step_data(
+        episode,
+        step_index=0,
+        modality_configs=configs,
+        embodiment_tag=EmbodimentTag.NEW_EMBODIMENT,
+        allow_padding=True,
+    )
+
+    assert padded.tactile is not None
+    np.testing.assert_array_equal(padded.tactile["rgb"][0], tactile_frames[0])
+    np.testing.assert_array_equal(padded.tactile["rgb"][1], tactile_frames[0])
+
+
+def test_scene_survives_loader_step_data_and_processor(tmp_path: Path) -> None:
+    _make_external_modality_dataset(tmp_path)
+    info_path = tmp_path / "meta/info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info["features"].pop("observation.pointcloud.xyz")
+    info["features"]["observation.pointcloud.scene"] = {
+        "dtype": "float32",
+        "shape": [5, 6],
+    }
+    _write_json(info_path, info)
+    modality_path = tmp_path / "meta/modality.json"
+    modality = json.loads(modality_path.read_text(encoding="utf-8"))
+    modality["pointcloud"] = {
+        "scene": {
+            "original_key": "observation.pointcloud.scene",
+            "array_key": "scene",
+            "num_points": 5,
+            "feature_dim": 6,
+        }
+    }
+    _write_json(modality_path, modality)
+    scene_path = tmp_path / "pointclouds/chunk-000/observation.pointcloud.scene/episode_000000.npz"
+    scene_path.parent.mkdir(parents=True)
+    scene = np.arange(3 * 5 * 6, dtype=np.float32).reshape(3, 5, 6)
+    np.savez_compressed(scene_path, scene=scene)
+
+    configs = {
+        "state": ModalityConfig(delta_indices=[0], modality_keys=["joint"]),
+        "action": ModalityConfig(delta_indices=[0], modality_keys=["joint"]),
+        "language": ModalityConfig(delta_indices=[0], modality_keys=["task"]),
+        "pointcloud": ModalityConfig(delta_indices=[0], modality_keys=["scene"]),
+    }
+    loader = LeRobotEpisodeLoader(tmp_path, configs)
+    episode = loader[0]
+    sample = extract_step_data(
+        episode,
+        step_index=1,
+        modality_configs=configs,
+        embodiment_tag=EmbodimentTag.NEW_EMBODIMENT,
+    )
+    processed = Gr00tN1d7Processor._training_pointcloud(sample, configs)
+
+    assert sample.pointclouds is not None
+    assert sample.pointclouds["scene"].shape == (1, 5, 6)
+    assert tuple(processed.shape) == (5, 6)
+    np.testing.assert_array_equal(processed.numpy(), scene[1])
 
 
 def test_loader_rejects_pointcloud_episode_length_mismatch(

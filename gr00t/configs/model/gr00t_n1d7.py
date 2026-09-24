@@ -104,7 +104,18 @@ class Gr00tN1d7Config(PretrainedConfig):
     use_tactile_conditioning: bool = True
     point_input_dim: int = 3
     tactile_input_channels: int = 3
+    tactile_encoder_cfg: str = "sparsh_dino_base"
+    tactile_pretrained_model: str = "facebook/sparsh-dino-base"
+    tactile_checkpoint_filename: str = "dino_vitbase.safetensors"
+    tactile_background_path: str | None = None
+    tactile_pretrained_load_on_init: bool = True
+    tactile_temporal_delta_indices: list[int] = field(default_factory=lambda: [-1, 0])
     point_encoder_cfg: str = "pointnet2"  # candidates: ["pointnet2", "pointnet", "point_transformer", "pointnet++", "transformer"]
+    point_encoder_checkpoint_path: str | None = None
+    point_encoder_repo_id: str = "Pointcept/Concerto"
+    point_encoder_download_root: str | None = None
+    point_encoder_grid_size: float = 0.02
+    point_encoder_enable_flash: bool | None = None
 
     diffusion_model_cfg: dict = field(
         default_factory=lambda: {

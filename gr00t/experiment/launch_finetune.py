@@ -67,6 +67,28 @@ if __name__ == "__main__":
     if ft_config.modality_config_path is not None:
         load_modality_config(ft_config.modality_config_path)
 
+    from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
+
+    tactile_modality = MODALITY_CONFIGS.get(embodiment_tag, {}).get("tactile")
+    tactile_delta_indices = (
+        list(tactile_modality.delta_indices) if tactile_modality is not None else [-1, 0]
+    )
+    if (
+        ft_config.dit_type == "multimodal_conditioned_dit"
+        and ft_config.use_tactile_conditioning
+        and ft_config.tactile_encoder_cfg == "sparsh_dino_base"
+        and (
+            len(tactile_delta_indices) != 2
+            or tactile_delta_indices[-1] != 0
+            or tactile_delta_indices[0] >= 0
+        )
+    ):
+        raise ValueError(
+            "Sparsh-DINO requires two chronological tactile frames [previous,current]; "
+            "configure tactile delta_indices=[negative_offset,0], got "
+            f"{tactile_delta_indices}."
+        )
+
     dataset_paths = [path for path in ft_config.dataset_path.split(os.pathsep) if path]
 
     config = get_default_config().load_dict(
@@ -98,7 +120,18 @@ if __name__ == "__main__":
     config.model.use_tactile_conditioning = ft_config.use_tactile_conditioning
     config.model.point_input_dim = ft_config.point_input_dim
     config.model.tactile_input_channels = ft_config.tactile_input_channels
+    config.model.tactile_encoder_cfg = ft_config.tactile_encoder_cfg
+    config.model.tactile_pretrained_model = ft_config.tactile_pretrained_model
+    config.model.tactile_checkpoint_filename = ft_config.tactile_checkpoint_filename
+    config.model.tactile_background_path = ft_config.tactile_background_path
+    config.model.tactile_pretrained_load_on_init = True
+    config.model.tactile_temporal_delta_indices = tactile_delta_indices
     config.model.point_encoder_cfg = ft_config.point_encoder_cfg
+    config.model.point_encoder_checkpoint_path = ft_config.point_encoder_checkpoint_path
+    config.model.point_encoder_repo_id = ft_config.point_encoder_repo_id
+    config.model.point_encoder_download_root = ft_config.point_encoder_download_root
+    config.model.point_encoder_grid_size = ft_config.point_encoder_grid_size
+    config.model.point_encoder_enable_flash = ft_config.point_encoder_enable_flash
     config.model.tune_projector = ft_config.tune_projector
     config.model.tune_diffusion_model = ft_config.tune_diffusion_model
     config.model.tune_vlln = ft_config.tune_vlln
@@ -141,6 +174,8 @@ if __name__ == "__main__":
     config.training.learning_rate = ft_config.learning_rate
     config.training.vlm_learning_rate = ft_config.vlm_learning_rate
     config.training.action_head_learning_rate = ft_config.action_head_learning_rate
+    config.training.point_encoder_learning_rate = ft_config.point_encoder_learning_rate
+    config.training.tactile_encoder_learning_rate = ft_config.tactile_encoder_learning_rate
     config.training.gradient_accumulation_steps = ft_config.gradient_accumulation_steps
     config.training.output_dir = ft_config.output_dir
     config.training.save_steps = ft_config.save_steps
@@ -148,6 +183,12 @@ if __name__ == "__main__":
     config.training.num_gpus = ft_config.num_gpus
     config.training.deepspeed_stage = ft_config.deepspeed_stage
     config.training.use_wandb = ft_config.use_wandb
+    config.training.telegram_on = ft_config.telegram_on
+    config.training.telegram_chat_id = ft_config.telegram_chat_id
+    config.training.telegram_notify_start = ft_config.telegram_notify_start
+    config.training.telegram_notify_save = ft_config.telegram_notify_save
+    config.training.telegram_notify_finish = ft_config.telegram_notify_finish
+    config.training.telegram_notify_error = ft_config.telegram_notify_error
     config.training.max_steps = ft_config.max_steps
     config.training.weight_decay = ft_config.weight_decay
     config.training.warmup_ratio = ft_config.warmup_ratio
@@ -155,6 +196,7 @@ if __name__ == "__main__":
 
     config.data.shard_size = ft_config.shard_size
     config.data.episode_sampling_rate = ft_config.episode_sampling_rate
+    config.data.allow_padding = ft_config.allow_padding
     config.data.num_shards_per_epoch = ft_config.num_shards_per_epoch
     config.data.ds_weights_alpha = ft_config.ds_weights_alpha
 
