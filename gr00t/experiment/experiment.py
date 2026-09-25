@@ -29,11 +29,15 @@ import wandb
 
 from gr00t.configs.base_config import Config
 from gr00t.configs.training.training_config import check_resume_compatibility
-from gr00t.experiment.telegram_callback import TelegramTrainingCallback, TrainingNotificationContext
+from gr00t.experiment.discord_notifier import DiscordNotifier
 from gr00t.experiment.telegram_notifier import TelegramNotifier
 
 # Use custom trainer that profiles data loading & forward times
 from gr00t.experiment.trainer import Gr00tTrainer, ProfCallback
+from gr00t.experiment.training_notification_callback import (
+    TrainingNotificationCallback,
+    TrainingNotificationContext,
+)
 from gr00t.experiment.utils import BestMetricCheckpointCallback, CheckpointFormatCallback
 from gr00t.model import MODEL_REGISTRY
 from gr00t.utils.dist_utils import run_on_rank0, run_or_wait_on_rank0
@@ -232,6 +236,11 @@ def run(config: Config):
             chat_id=config.training.telegram_chat_id
         )
 
+    discord_notifier = None
+    if config.training.discord_on:
+        # The credential-bearing URL exists only in this runtime transport object.
+        discord_notifier = DiscordNotifier.from_environment()
+
     run_on_rank0(output_dir.mkdir, parents=True, exist_ok=True, label="output_dir.mkdir")
 
     save_cfg_dir = output_dir / "experiment_cfg"
@@ -357,30 +366,45 @@ def run(config: Config):
         )
     )
 
-    telegram_callback = None
+    notification_context = TrainingNotificationContext(
+        experiment_name=experiment_name,
+        output_dir=str(output_dir),
+        model_path=config.training.start_from_checkpoint,
+        dataset_path=_notification_dataset_path(config),
+        num_gpus=config.training.num_gpus,
+        global_batch_size=config.training.global_batch_size,
+        learning_rate=config.training.learning_rate,
+        deepspeed_stage=config.training.deepspeed_stage if deepspeed_config is not None else None,
+    )
+    notification_callbacks: list[TrainingNotificationCallback] = []
     if telegram_notifier is not None:
-        telegram_callback = TelegramTrainingCallback(
-            notifier=telegram_notifier,
-            context=TrainingNotificationContext(
-                experiment_name=experiment_name,
-                output_dir=str(output_dir),
-                model_path=config.training.start_from_checkpoint,
-                dataset_path=_notification_dataset_path(config),
-                num_gpus=config.training.num_gpus,
-                global_batch_size=config.training.global_batch_size,
-                learning_rate=config.training.learning_rate,
-                deepspeed_stage=(
-                    config.training.deepspeed_stage if deepspeed_config is not None else None
-                ),
-            ),
-            notify_start=config.training.telegram_notify_start,
-            notify_save=config.training.telegram_notify_save,
-            notify_finish=config.training.telegram_notify_finish,
-            notify_error=config.training.telegram_notify_error,
-            # HF fires on_train_end before the explicit final save below.
-            defer_finish_until_final_save=True,
+        notification_callbacks.append(
+            TrainingNotificationCallback(
+                notifier=telegram_notifier,
+                context=notification_context,
+                notify_start=config.training.telegram_notify_start,
+                notify_save=config.training.telegram_notify_save,
+                notify_finish=config.training.telegram_notify_finish,
+                notify_error=config.training.telegram_notify_error,
+                # HF fires on_train_end before the explicit final save below.
+                defer_finish_until_final_save=True,
+            )
         )
-        trainer.add_callback(telegram_callback)
+    if discord_notifier is not None:
+        notification_callbacks.append(
+            TrainingNotificationCallback(
+                notifier=discord_notifier,
+                context=notification_context,
+                notify_start=config.training.discord_notify_start,
+                notify_save=config.training.discord_notify_save,
+                notify_finish=config.training.discord_notify_finish,
+                notify_error=config.training.discord_notify_error,
+                # HF fires on_train_end before the explicit final save below.
+                defer_finish_until_final_save=True,
+            )
+        )
+    for notification_callback in notification_callbacks:
+        trainer.add_callback(notification_callback)
 
     if config.training.save_best_eval_metric_name != "":
         trainer.add_callback(
@@ -395,7 +419,7 @@ def run(config: Config):
     if hasattr(train_dataset, "get_initial_actions"):
         run_on_rank0(save_initial_actions_artifact, train_dataset, save_cfg_dir)
 
-    # Train and finalize. Catch ordinary Python exceptions only: Telegram is
+    # Train and finalize. Catch ordinary Python exceptions only: notifications are
     # best-effort, then the original failure is re-raised with its traceback.
     logging.info("🚀 Starting training...")
     try:
@@ -448,10 +472,10 @@ def run(config: Config):
         if eval_dataset is not None and hasattr(eval_dataset, "close"):
             eval_dataset.close()
 
-        if telegram_callback is not None:
-            telegram_callback.notify_finish(args=trainer.args, state=trainer.state)
+        for notification_callback in notification_callbacks:
+            notification_callback.notify_finish(args=trainer.args, state=trainer.state)
     except Exception as exc:
-        if telegram_callback is not None:
-            telegram_callback.notify_failure(exc, args=trainer.args, state=trainer.state)
+        for notification_callback in notification_callbacks:
+            notification_callback.notify_failure(exc, args=trainer.args, state=trainer.state)
         raise
     logging.info("Training completed!")

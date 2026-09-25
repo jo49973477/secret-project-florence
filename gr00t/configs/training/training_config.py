@@ -126,6 +126,13 @@ class TrainingConfig:
     telegram_notify_finish: bool = True
     telegram_notify_error: bool = True
 
+    # Discord notifications. The webhook URL is intentionally never part of config.
+    discord_on: bool = False
+    discord_notify_start: bool = True
+    discord_notify_save: bool = True
+    discord_notify_finish: bool = True
+    discord_notify_error: bool = True
+
     # Profiling
     enable_profiling: bool = False
 

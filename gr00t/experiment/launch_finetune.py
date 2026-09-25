@@ -189,6 +189,11 @@ if __name__ == "__main__":
     config.training.telegram_notify_save = ft_config.telegram_notify_save
     config.training.telegram_notify_finish = ft_config.telegram_notify_finish
     config.training.telegram_notify_error = ft_config.telegram_notify_error
+    config.training.discord_on = ft_config.discord_on
+    config.training.discord_notify_start = ft_config.discord_notify_start
+    config.training.discord_notify_save = ft_config.discord_notify_save
+    config.training.discord_notify_finish = ft_config.discord_notify_finish
+    config.training.discord_notify_error = ft_config.discord_notify_error
     config.training.max_steps = ft_config.max_steps
     config.training.weight_decay = ft_config.weight_decay
     config.training.warmup_ratio = ft_config.warmup_ratio

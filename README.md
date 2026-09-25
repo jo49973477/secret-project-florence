@@ -546,6 +546,50 @@ individual event with `--no-telegram-notify-start`, `--no-telegram-notify-save`,
 > guaranteed after uncatchable termination such as `SIGKILL`, an external OOM-killer action,
 > kernel panic, machine power loss, or loss of networking after the process has died.
 
+### Discord training notifications
+
+Discord webhooks can receive the same rank-zero-only training start, checkpoint, successful
+finish, and catchable failure messages as Telegram. Telegram and Discord can be enabled
+independently or together.
+
+1. In Discord, open **Server Settings**.
+2. Select **Integrations**.
+3. Select **Webhooks**.
+4. Select **New Webhook**.
+5. Copy the Webhook URL, then export it in the shell that launches training:
+
+```bash
+export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
+```
+
+Test the connection without loading GR00T or a model:
+
+```bash
+uv run python -m gr00t.experiment.discord_notifier --test
+```
+
+Enable Discord after the `--` separator used by `examples/finetune.sh`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,7 NUM_GPUS=2 MAX_STEPS=2000 \
+uv run bash examples/finetune.sh \
+  --base-model-path nvidia/GR00T-N1.7-3B \
+  --dataset-path /path/to/dataset \
+  --embodiment-tag NEW_EMBODIMENT \
+  --output-dir outputs/my_experiment \
+  -- \
+  --discord-on
+```
+
+All four events default to enabled. Disable an individual event with
+`--no-discord-notify-start`, `--no-discord-notify-save`,
+`--no-discord-notify-finish`, or `--no-discord-notify-error`.
+
+> **Security:** Never commit `DISCORD_WEBHOOK_URL`. Treat it like a password. The URL is read
+> only from the environment and is never a command-line or training-config field. Discord
+> delivery is best-effort and cannot report failures after uncatchable process or server
+> termination such as `SIGKILL`, an external OOM-killer action, kernel panic, or power loss.
+
 ### Training Tips
 
 - Maximize batch size for your hardware and train for a few thousand steps.

@@ -284,6 +284,21 @@ class FinetuneConfig:
     telegram_notify_error: bool = True
     """Send a notification for catchable training/finalization exceptions."""
 
+    discord_on: bool = False
+    """Enable best-effort Discord webhook training notifications."""
+
+    discord_notify_start: bool = True
+    """Send a Discord notification when Hugging Face Trainer begins training."""
+
+    discord_notify_save: bool = True
+    """Send a Discord notification after each regular Hugging Face checkpoint save."""
+
+    discord_notify_finish: bool = True
+    """Send a Discord notification after training and the final model save succeed."""
+
+    discord_notify_error: bool = True
+    """Send a Discord notification for catchable training/finalization exceptions."""
+
     max_steps: int = 10000
     """Total number of training steps to run before stopping."""
 
@@ -353,12 +368,14 @@ class FinetuneConfig:
         )
 
     def __post_init__(self) -> None:
+        from gr00t.experiment.discord_notifier import validate_discord_configuration
         from gr00t.experiment.telegram_notifier import validate_telegram_configuration
 
         validate_telegram_configuration(
             enabled=self.telegram_on,
             chat_id=self.telegram_chat_id,
         )
+        validate_discord_configuration(enabled=self.discord_on)
         if self.deepspeed_stage not in (2, 3):
             raise ValueError(f"deepspeed_stage must be 2 or 3, got {self.deepspeed_stage}")
         if self.learning_rate <= 0:
