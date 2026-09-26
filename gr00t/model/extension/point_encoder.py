@@ -8,13 +8,17 @@ backend is selected so RGB-only and lightweight point-cloud workflows do not
 need the sparse-convolution stack.
 """
 
+from contextlib import nullcontext
 import importlib
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
 import torch
 from torch import nn
+
+from gr00t.utils.model_load_diagnostics import log_model_load_memory
 
 
 LOGGER = logging.getLogger(__name__)
@@ -353,6 +357,8 @@ class ConcertoPointEncoder(nn.Module):
         download_root: str | None = None,
         grid_size: float = 0.02,
         enable_flash: bool | None = None,
+        load_pretrained: bool = True,
+        architecture_config: dict | None = None,
         backbone: nn.Module | None = None,
         backbone_output_dim: int | None = None,
         pretrained_loaded: bool = False,
@@ -371,22 +377,31 @@ class ConcertoPointEncoder(nn.Module):
             )
         if grid_size <= 0:
             raise ValueError(f"grid_size must be positive, got {grid_size}.")
+        constructing_official_backbone = backbone is None
 
         self.input_dim = input_dim
         self.point_dim = point_dim
         self.model_name = model_name
         self.repo_id = repo_id
         self.grid_size = float(grid_size)
+        self.checkpoint_path = checkpoint_path
+        self.download_root = download_root
+        self.enable_flash = enable_flash
+        self.architecture_config: dict | None = None
 
-        if backbone is None:
-            backbone, backbone_output_dim, checkpoint_label, parameter_count = (
-                self._load_official_backbone(
-                    model_name=model_name,
-                    repo_id=repo_id,
-                    checkpoint_path=checkpoint_path,
-                    download_root=download_root,
-                    enable_flash=enable_flash,
-                )
+        if backbone is None and load_pretrained:
+            (
+                backbone,
+                backbone_output_dim,
+                checkpoint_label,
+                parameter_count,
+                self.architecture_config,
+            ) = self._load_official_backbone(
+                model_name=model_name,
+                repo_id=repo_id,
+                checkpoint_path=checkpoint_path,
+                download_root=download_root,
+                enable_flash=enable_flash,
             )
             pretrained_loaded = True
             LOGGER.info("Point encoder: %s", model_name.replace("_", "-").title())
@@ -394,24 +409,130 @@ class ConcertoPointEncoder(nn.Module):
             LOGGER.info("Loaded pretrained parameters: %s", f"{parameter_count:,}")
             LOGGER.info("Missing keys: []")
             LOGGER.info("Unexpected keys: []")
+        elif backbone is None:
+            if architecture_config is None:
+                raise RuntimeError(
+                    "Deferred Concerto construction requires the exact architecture config "
+                    "saved in the multimodal GR00T checkpoint."
+                )
+            concerto = self._import_concerto()
+            self.architecture_config = dict(architecture_config)
+            backbone_output_dim = self._output_dim_from_config(self.architecture_config)
+            with torch.device("cpu"):
+                backbone = concerto.model.PointTransformerV3(**self.architecture_config)
+            LOGGER.info("Point encoder architecture: %s", model_name.replace("_", "-").title())
+            LOGGER.info("Checkpoint: embedded GR00T checkpoint")
         elif backbone_output_dim is None:
             raise ValueError("backbone_output_dim is required when injecting a Concerto backbone")
+        else:
+            self.architecture_config = dict(architecture_config) if architecture_config else None
 
-        if not pretrained_loaded:
+        if load_pretrained and not pretrained_loaded:
             raise RuntimeError(
                 "Concerto was requested without verified pretrained weights. Randomly initialized "
                 "Concerto backbones are intentionally unsupported."
             )
         assert backbone_output_dim is not None
         self.backbone = backbone
+        self._configure_zero3_sparse_conv_leaves()
+        if constructing_official_backbone and torch.cuda.is_available():
+            # Fail during setup, rather than at the first sparse GEMM, when
+            # the installed spconv build cannot execute our FP16 island.
+            cppcore = importlib.import_module("spconv.pytorch.cppcore")
+            if torch.float16 not in cppcore._TORCH_DTYPE_TO_TV:
+                raise RuntimeError(
+                    "Installed spconv does not support FP16 sparse features; "
+                    "Concerto CUDA precision cannot be initialized safely."
+                )
         self.projection = nn.Sequential(
             nn.Linear(backbone_output_dim, point_dim),
             nn.LayerNorm(point_dim),
         )
-        self.pretrained_loaded = True
+        self.pretrained_loaded = pretrained_loaded
+        self._precision_diagnostics_logged = False
+        if pretrained_loaded:
+            self._mark_hf_initialized()
         LOGGER.info(
             "Trainable: %s", any(parameter.requires_grad for parameter in self.parameters())
         )
+
+    @staticmethod
+    def _import_concerto():
+        try:
+            return importlib.import_module("concerto")
+        except ImportError as exc:
+            raise ImportError(
+                "Concerto point encoding requires the official Pointcept/Concerto package and "
+                "its spconv + torch-scatter dependencies. Install it as documented in "
+                "examples/UniVTAC/README.md."
+            ) from exc
+
+    @staticmethod
+    def _output_dim_from_config(config: dict) -> int:
+        if config.get("in_channels") != 9:
+            raise RuntimeError(
+                "This wrapper follows official XYZ+RGB+normal feature construction and expects "
+                f"a 9-channel Concerto checkpoint, got in_channels={config.get('in_channels')}."
+            )
+        if config.get("enc_mode", False):
+            return int(config["enc_channels"][-1])
+        return int(config["dec_channels"][0])
+
+    def _mark_hf_initialized(self) -> None:
+        for module in self.backbone.modules():
+            module._is_hf_initialized = True
+
+    def _configure_zero3_sparse_conv_leaves(self) -> None:
+        """Keep spconv weights gathered through sparse backward under ZeRO-3.
+
+        The official PointSequential calls SubMConv3d with a SparseConvTensor.
+        DeepSpeed cannot find tensors inside that custom input/output type, so
+        hooks on the conv itself cannot re-gather its partitioned weight for
+        backward. Its PointSequential parent accepts/returns a dict-like Point
+        containing ``feat``; making that parent a leaf lets ZeRO gather the
+        small CPE block as one unit and hook its visible feature tensor.
+        """
+        for name, module in self.backbone.named_modules():
+            if not name.endswith(".cpe") or module.__class__.__name__ != "PointSequential":
+                continue
+            if any(child.__class__.__module__.startswith("spconv.") for child in module.children()):
+                # DeepSpeed's set_z3_leaf_module sets this same attribute.
+                # Avoid importing DeepSpeed for non-DeepSpeed inference.
+                module._z3_leaf = True
+                original_forward = module.forward
+
+                def forward_with_synced_sparse_input(point, *, _forward=original_forward):
+                    # ZeRO's input hook replaces Point.feat with a tensor that
+                    # triggers its post-backward hook. Concerto's parallel
+                    # SparseConvTensor must use that same tensor, or the sparse
+                    # path bypasses the hook and releases weights too early.
+                    sparse = point.sparse_conv_feat
+                    if sparse.features is not point.feat:
+                        point.sparse_conv_feat = sparse.replace_feature(point.feat)
+                    return _forward(point)
+
+                # Keep the original module/parameter hierarchy and state-dict
+                # names; only adapt the operation boundary.
+                module.forward = forward_with_synced_sparse_input
+
+    def validate_pretrained_backbone(self, source: str) -> None:
+        """Validate weights loaded externally or embedded in a GR00T checkpoint."""
+        parameters = list(self.backbone.named_parameters())
+        if not parameters:
+            raise RuntimeError(f"Concerto {source} loaded no pretrained parameters.")
+        meta_parameters = [name for name, parameter in parameters if parameter.is_meta]
+        meta_buffers = [name for name, buffer in self.backbone.named_buffers() if buffer.is_meta]
+        if meta_parameters or meta_buffers:
+            raise RuntimeError(
+                f"Concerto {source} left meta tensors unresolved: "
+                f"parameters={meta_parameters[:10]}, buffers={meta_buffers[:10]}"
+            )
+        if not any(
+            torch.count_nonzero(parameter.detach()).item() > 0 for _, parameter in parameters
+        ):
+            raise RuntimeError(f"Concerto {source} loaded no non-zero pretrained parameters.")
+        self.pretrained_loaded = True
+        self._mark_hf_initialized()
 
     @staticmethod
     def _load_official_backbone(
@@ -421,15 +542,8 @@ class ConcertoPointEncoder(nn.Module):
         checkpoint_path: str | None,
         download_root: str | None,
         enable_flash: bool | None,
-    ) -> tuple[nn.Module, int, str, int]:
-        try:
-            concerto = importlib.import_module("concerto")
-        except ImportError as exc:
-            raise ImportError(
-                "Concerto point encoding requires the official Pointcept/Concerto package and "
-                "its spconv + torch-scatter dependencies. Install it as documented in "
-                "examples/UniVTAC/README.md."
-            ) from exc
+    ) -> tuple[nn.Module, int, str, int, dict]:
+        concerto = ConcertoPointEncoder._import_concerto()
 
         checkpoint_name = str(Path(checkpoint_path).expanduser()) if checkpoint_path else model_name
         custom_config = {}
@@ -454,19 +568,66 @@ class ConcertoPointEncoder(nn.Module):
                 "Official Concerto checkpoint must contain 'config' and 'state_dict' entries."
             )
         config = dict(checkpoint["config"])
-        if config.get("in_channels") != 9:
+        output_dim = ConcertoPointEncoder._output_dim_from_config(config)
+
+        state_dict = checkpoint["state_dict"]
+        checkpoint_meta_tensors = [
+            name
+            for name, tensor in state_dict.items()
+            if isinstance(tensor, torch.Tensor) and tensor.is_meta
+        ]
+        if checkpoint_meta_tensors:
             raise RuntimeError(
-                "This wrapper follows official XYZ+RGB+normal feature construction and expects "
-                f"a 9-channel Concerto checkpoint, got in_channels={config.get('in_channels')}."
+                f"Concerto checkpoint itself contains meta tensors: {checkpoint_meta_tensors[:10]}"
             )
-        if config.get("enc_mode", False):
-            output_dim = int(config["enc_channels"][-1])
-        else:
-            output_dim = int(config["dec_channels"][0])
 
         try:
-            model = concerto.model.PointTransformerV3(**config)
-            incompatible = model.load_state_dict(checkpoint["state_dict"], strict=False)
+            log_model_load_memory("before Concerto architecture construction")
+            # Transformers' empty-weight context can force registered parameters back onto
+            # meta even inside this explicit device context. Construct on CPU first, then
+            # materialize below if that registration hook was active.
+            with torch.device("cpu"):
+                model = concerto.model.PointTransformerV3(**config)
+            log_model_load_memory("after Concerto architecture construction")
+
+            construction_meta_parameters = [
+                name for name, parameter in model.named_parameters() if parameter.is_meta
+            ]
+            construction_meta_buffers = [
+                name for name, buffer in model.named_buffers() if buffer.is_meta
+            ]
+            checkpointless_meta_buffers = [
+                name for name in construction_meta_buffers if name not in state_dict
+            ]
+            if checkpointless_meta_buffers:
+                raise RuntimeError(
+                    "Concerto construction produced meta buffers that are not available in the "
+                    f"checkpoint: {checkpointless_meta_buffers[:10]}"
+                )
+
+            materialized_from_meta = bool(construction_meta_parameters or construction_meta_buffers)
+            if materialized_from_meta:
+                # Preserve initialized non-persistent buffers, which are absent from state_dict.
+                preserved_buffers = {
+                    name: buffer.detach().clone()
+                    for name, buffer in model.named_buffers()
+                    if not buffer.is_meta and name not in state_dict
+                }
+                model.to_empty(device=torch.device("cpu"))
+                materialized_buffers = dict(model.named_buffers())
+                with torch.no_grad():
+                    for name, value in preserved_buffers.items():
+                        materialized_buffers[name].copy_(value)
+
+            log_model_load_memory("before Concerto checkpoint load")
+            incompatible = model.load_state_dict(
+                state_dict,
+                strict=False,
+                # assign=True re-registers parameters and the outer Transformers hook sends
+                # them back to meta. Once materialized, copy checkpoint values in place instead.
+                assign=not materialized_from_meta,
+            )
+            log_model_load_memory("after Concerto checkpoint load")
         except Exception as exc:
             raise RuntimeError(
                 f"Could not construct Concerto from pretrained checkpoint {checkpoint_name!r}."
@@ -477,11 +638,28 @@ class ConcertoPointEncoder(nn.Module):
                 f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}."
             )
         parameter_count = sum(parameter.numel() for parameter in model.parameters())
-        if parameter_count == 0 or not any(
+        if parameter_count == 0:
+            raise RuntimeError("Concerto checkpoint loaded no pretrained parameters.")
+        meta_parameters = [
+            name for name, parameter in model.named_parameters() if parameter.is_meta
+        ]
+        if meta_parameters:
+            raise RuntimeError(
+                "Concerto checkpoint loading left meta parameters unresolved: "
+                f"{meta_parameters[:10]}"
+            )
+        meta_buffers = [name for name, buffer in model.named_buffers() if buffer.is_meta]
+        if meta_buffers:
+            raise RuntimeError(
+                f"Concerto checkpoint loading left meta buffers unresolved: {meta_buffers[:10]}"
+            )
+        if not any(
             torch.count_nonzero(parameter.detach()).item() > 0 for parameter in model.parameters()
         ):
             raise RuntimeError("Concerto checkpoint loaded no non-zero pretrained parameters.")
-        return model, output_dim, checkpoint_name, parameter_count
+        del state_dict
+        del checkpoint
+        return model, output_dim, checkpoint_name, parameter_count, config
 
     def backbone_parameters(self):
         """Return only pretrained backbone parameters for optimizer LR grouping."""
@@ -564,8 +742,14 @@ class ConcertoPointEncoder(nn.Module):
             raise ValueError(
                 f"Concerto points must have shape [B, N, 6], got {tuple(points.shape)}."
             )
-        if not torch.isfinite(points).all():
-            raise ValueError("Concerto points contain NaN or Inf.")
+        # Preserve metric XYZ and voxel boundaries in FP32. In particular,
+        # never center/floor BF16 coordinates supplied by a mixed-precision
+        # caller, and keep these operations outside the outer AMP region.
+        geometry_context = torch.autocast(points.device.type, enabled=False)
+        with geometry_context:
+            geometry_points = points.to(dtype=torch.float32)
+            if not torch.isfinite(geometry_points).all():
+                raise ValueError("Concerto points contain NaN or Inf.")
         if point_mask is None:
             point_mask = torch.ones(points.shape[:2], dtype=torch.bool, device=points.device)
         elif point_mask.shape != points.shape[:2]:
@@ -576,14 +760,72 @@ class ConcertoPointEncoder(nn.Module):
         else:
             point_mask = point_mask.to(device=points.device, dtype=torch.bool)
 
-        concerto_input, _input_counts = self._prepare_batch(points, point_mask)
-        output = self.backbone(concerto_input)
+        with torch.autocast(points.device.type, enabled=False):
+            concerto_input, _input_counts = self._prepare_batch(geometry_points, point_mask)
+        log_precision = not self._precision_diagnostics_logged and any(
+            os.environ.get(name, "").lower() in {"1", "true", "yes"}
+            for name in ("GR00T_DTYPE_DEBUG", "GROOT_DEBUG_CONCERTO_PRECISION")
+        )
+        if log_precision:
+            sparse_weight_dtype = next(
+                (
+                    module.weight.dtype
+                    for module in self.backbone.modules()
+                    if module.__class__.__name__.startswith("SubMConv")
+                ),
+                None,
+            )
+            LOGGER.info(
+                "Concerto precision before backbone: raw_points=%s geometry=%s feat=%s coord=%s "
+                "grid_coord=%s offset=%s batch=%s sparse_weight=%s outer_cuda_amp=%s "
+                "outer_cuda_amp_dtype=%s",
+                points.dtype,
+                geometry_points.dtype,
+                concerto_input["feat"].dtype,
+                concerto_input["coord"].dtype,
+                concerto_input["grid_coord"].dtype,
+                concerto_input["offset"].dtype,
+                concerto_input["batch"].dtype,
+                sparse_weight_dtype,
+                torch.is_autocast_enabled("cuda"),
+                torch.get_autocast_dtype("cuda"),
+            )
+
+        # This spconv build has no BF16 tensorview mapping. Its sparse autograd
+        # functions use custom_fwd(cast_inputs=float16) when CUDA autocast is
+        # active, casting both gathered ZeRO weights and features for the GEMM.
+        # No Parameter objects or module storage are replaced here.
+        autocast_context = (
+            torch.autocast("cuda", dtype=torch.float16) if points.is_cuda else nullcontext()
+        )
+        with autocast_context:
+            if log_precision:
+                LOGGER.info(
+                    "Concerto backbone CUDA autocast: enabled=%s dtype=%s",
+                    torch.is_autocast_enabled("cuda"),
+                    torch.get_autocast_dtype("cuda"),
+                )
+            output = self.backbone(concerto_input)
         if not hasattr(output, "feat") or not hasattr(output, "offset"):
             raise RuntimeError("Concerto backbone output must expose .feat and .offset tensors.")
         output_counts = torch.diff(
             torch.cat((output.offset.new_zeros(1), output.offset.to(torch.long)))
         ).tolist()
-        point_tokens = self.projection(output.feat)
+        # DeepSpeed BF16 mode casts projection weights to BF16, while the
+        # sparse backbone returns FP16. Match the registered projection weight
+        # before the dense layer; this differentiable cast preserves gradients.
+        projection_input = output.feat.to(dtype=self.projection[0].weight.dtype)
+        point_tokens = self.projection(projection_input)
+        if log_precision:
+            LOGGER.info(
+                "Concerto precision after backbone: feat=%s projection_input=%s "
+                "projection_weight=%s point_tokens=%s",
+                output.feat.dtype,
+                projection_input.dtype,
+                self.projection[0].weight.dtype,
+                point_tokens.dtype,
+            )
+            self._precision_diagnostics_logged = True
         point_tokens, output_mask = self._pad_tokens(point_tokens, output_counts)
         if return_mask:
             return point_tokens, output_mask

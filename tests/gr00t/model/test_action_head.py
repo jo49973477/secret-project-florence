@@ -150,6 +150,94 @@ def test_checkpoint_config_accepts_explicit_dropout_overrides(tmp_path):
     assert head.vl_self_attention.config.dropout == 0.0
 
 
+def test_sensor_bootstrap_is_deferred_until_explicit_post_load_stage() -> None:
+    events = []
+
+    class FakePointEncoder(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.full((1,), 0.375))
+            self.architecture_config = {"in_channels": 9, "enc_mode": True, "enc_channels": [4]}
+
+    class FakeTactileEncoder(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.full((1,), 0.625))
+
+    def point_builder(*args, **kwargs):
+        events.append("concerto")
+        return FakePointEncoder()
+
+    def tactile_builder(*args, **kwargs):
+        events.append("sparsh")
+        return FakeTactileEncoder()
+
+    config = _small_multimodal_config(
+        point_input_dim=6,
+        point_encoder_cfg="concerto_small",
+        tactile_encoder_cfg="sparsh_dino_base",
+        point_encoder_deferred_bootstrap=True,
+        tactile_encoder_deferred_bootstrap=True,
+    )
+
+    with (
+        patch(
+            "gr00t.model.gr00t_n1d7.gr00t_n1d7.build_point_encoder",
+            side_effect=point_builder,
+        ) as build_point,
+        patch(
+            "gr00t.model.gr00t_n1d7.gr00t_n1d7.build_tactile_encoder",
+            side_effect=tactile_builder,
+        ) as build_tactile,
+    ):
+        head = Gr00tN1d7ActionHead(config)
+        assert head.point_encoder is None
+        assert head.tactile_encoder is None
+        build_point.assert_not_called()
+        build_tactile.assert_not_called()
+
+        events.append("base_checkpoint_complete")
+        head.bootstrap_deferred_sensor_backbones()
+
+    assert events == ["base_checkpoint_complete", "concerto", "sparsh"]
+    assert head.point_encoder.weight.item() == pytest.approx(0.375)
+    assert head.tactile_encoder.weight.item() == pytest.approx(0.625)
+    assert config.point_encoder_deferred_bootstrap is False
+    assert config.tactile_encoder_deferred_bootstrap is False
+    assert config.point_encoder_pretrained_load_on_init is False
+    assert config.tactile_pretrained_load_on_init is False
+
+
+def test_embedded_sensor_weights_are_not_rebootstrapped() -> None:
+    point = nn.Linear(1, 1, bias=False)
+    tactile = nn.Linear(1, 1, bias=False)
+    config = _small_multimodal_config(
+        point_encoder_deferred_bootstrap=False,
+        tactile_encoder_deferred_bootstrap=False,
+    )
+
+    with (
+        patch(
+            "gr00t.model.gr00t_n1d7.gr00t_n1d7.build_point_encoder",
+            return_value=point,
+        ) as build_point,
+        patch(
+            "gr00t.model.gr00t_n1d7.gr00t_n1d7.build_tactile_encoder",
+            return_value=tactile,
+        ) as build_tactile,
+    ):
+        head = Gr00tN1d7ActionHead(config)
+        with torch.no_grad():
+            head.point_encoder.weight.fill_(0.375)
+            head.tactile_encoder.weight.fill_(0.625)
+        head.bootstrap_deferred_sensor_backbones()
+
+    build_point.assert_called_once()
+    build_tactile.assert_called_once()
+    assert head.point_encoder.weight.item() == pytest.approx(0.375)
+    assert head.tactile_encoder.weight.item() == pytest.approx(0.625)
+
+
 class TestActionHeadForward:
     """Test training forward pass."""
 
@@ -339,6 +427,13 @@ class TestMultimodalActionHead:
         assert all(
             parameter.requires_grad for parameter in head.model.tactile_cross_attention.parameters()
         )
+        for norm_group in (
+            head.model.point_action_norms,
+            head.model.point_modality_norms,
+            head.model.tactile_action_norms,
+            head.model.tactile_modality_norms,
+        ):
+            assert all(parameter.requires_grad for parameter in norm_group.parameters())
         assert head.model.point_gates.requires_grad
         assert head.model.tactile_gates.requires_grad
 
@@ -358,6 +453,13 @@ class TestMultimodalActionHead:
         assert not any(
             parameter.requires_grad for parameter in head.model.tactile_cross_attention.parameters()
         )
+        for norm_group in (
+            head.model.point_action_norms,
+            head.model.point_modality_norms,
+            head.model.tactile_action_norms,
+            head.model.tactile_modality_norms,
+        ):
+            assert not any(parameter.requires_grad for parameter in norm_group.parameters())
         assert not head.model.point_gates.requires_grad
         assert not head.model.tactile_gates.requires_grad
 

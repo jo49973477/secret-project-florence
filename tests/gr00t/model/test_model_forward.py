@@ -151,6 +151,22 @@ class TestGr00tN1d7Forward:
         assert output["loss"].dim() == 0, "loss should be scalar"
         assert torch.isfinite(output["loss"]), "loss should be finite"
 
+    def test_forward_uses_zero3_traversable_module_inputs(self, small_model):
+        model, config = small_model
+        seen_action_inputs = []
+
+        def record_action_inputs(_module, args):
+            seen_action_inputs.extend(type(value) for value in args)
+
+        handle = model.action_head.register_forward_pre_hook(record_action_inputs)
+        try:
+            model(_make_dummy_inputs(config))
+        finally:
+            handle.remove()
+
+        assert type(model.backbone.call_args.args[0]) is dict
+        assert seen_action_inputs == [dict, dict]
+
     def test_prepare_input_preserves_multimodal_tensors(self, small_model):
         model, config = small_model
         inputs = _make_dummy_inputs(config)

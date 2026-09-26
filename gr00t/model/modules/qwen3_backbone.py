@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 import logging
+import os
 
 from huggingface_hub.errors import GatedRepoError
 from peft import LoraConfig, inject_adapter_in_model
@@ -278,6 +280,7 @@ class Qwen3Backbone(torch.nn.Module):
             )
 
         super().__init__()
+        self._dtype_diagnostics_logged = False
 
         # Add attention kwargs
         extra_kwargs = {}
@@ -503,19 +506,38 @@ class Qwen3Backbone(torch.nn.Module):
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
 
-    def forward(self, vl_input: BatchFeature) -> BatchFeature:
+    def forward(self, vl_input: dict) -> dict:
         self.set_frozen_modules_to_eval_mode()
         # 0. Set frozen module to eval
         keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
         vl_input = {k: vl_input[k] for k in keys_to_use}
-        outputs = self.model(**vl_input, output_hidden_states=True)
-        outputs = outputs.hidden_states[-1]
+        # Inference does not run inside Trainer AMP. Keep the Qwen/FlashAttention
+        # forward in BF16 on CUDA even when its checkpoint was constructed in
+        # FP32 for memory-efficient loading. Autocast never replaces ZeRO params.
+        compute_context = (
+            torch.autocast("cuda", dtype=torch.bfloat16)
+            if vl_input["input_ids"].is_cuda
+            else nullcontext()
+        )
+        with compute_context:
+            outputs = self.model(**vl_input, output_hidden_states=True)
+            outputs = outputs.hidden_states[-1]
+            if not self._dtype_diagnostics_logged and os.environ.get(
+                "GR00T_DTYPE_DEBUG", ""
+            ).lower() in {"1", "true", "yes"}:
+                logger.info(
+                    "Qwen dtype: pixels=%s parameter=%s hidden=%s cuda_amp=%s cuda_amp_dtype=%s",
+                    getattr(vl_input.get("pixel_values"), "dtype", None),
+                    next(self.model.parameters()).dtype,
+                    outputs.dtype,
+                    torch.is_autocast_enabled("cuda"),
+                    torch.get_autocast_dtype("cuda"),
+                )
+                self._dtype_diagnostics_logged = True
         image_mask = vl_input["input_ids"] == self.model.config.image_token_id
         attention_mask = vl_input["attention_mask"] == 1
-        return BatchFeature(
-            data={
-                "backbone_features": outputs,
-                "backbone_attention_mask": attention_mask,
-                "image_mask": image_mask,
-            }
-        )  # [B, T2, hidden_size]
+        return {
+            "backbone_features": outputs,
+            "backbone_attention_mask": attention_mask,
+            "image_mask": image_mask,
+        }  # [B, T2, hidden_size]

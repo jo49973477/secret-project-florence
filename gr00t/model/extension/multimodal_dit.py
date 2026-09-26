@@ -21,6 +21,8 @@ query point-cloud and tactile tokens. Zero-initialized residual gates make the
 new branches an identity operation when the module is first constructed.
 """
 
+import logging
+import os
 from typing import Optional
 
 from diffusers.configuration_utils import register_to_config
@@ -34,6 +36,9 @@ from gr00t.model.modules.dit import (
     _mask_hidden_states,
     _sdpa_context,
 )
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _validate_token_mask(
@@ -73,8 +78,6 @@ class ModalityCrossAttention(nn.Module):
                 f"action_dim ({action_dim}) must be divisible by num_heads ({num_heads})."
             )
 
-        self.action_norm = nn.LayerNorm(action_dim)
-        self.modality_norm = nn.LayerNorm(modality_dim)
         self.attention = nn.MultiheadAttention(
             embed_dim=action_dim,
             num_heads=num_heads,
@@ -120,16 +123,13 @@ class ModalityCrossAttention(nn.Module):
 
             key_padding_mask = ~safe_valid_token_mask
 
-        normalized_actions = self.action_norm(action_hidden_states)
-        normalized_modality = self.modality_norm(encoder_hidden_states)
-
         # Q: action tokens. K/V: point or tactile tokens. This direction lets
         # each future action timestep retrieve the sensor evidence it needs.
         with _sdpa_context():
             action_update, _ = self.attention(
-                query=normalized_actions,
-                key=normalized_modality,
-                value=normalized_modality,
+                query=action_hidden_states,
+                key=encoder_hidden_states,
+                value=encoder_hidden_states,
                 key_padding_mask=key_padding_mask,
                 need_weights=False,
             )
@@ -224,27 +224,31 @@ class MultiModalConditionedDiT(AlternateVLDiT):
             self.register_to_config(compute_dtype=str(compute_dtype))
 
         modality_attention_heads = modality_attention_heads or num_attention_heads
-        self.point_cross_attention = nn.ModuleList(
-            [
-                ModalityCrossAttention(
-                    action_dim=self.inner_dim,
-                    modality_dim=self.inner_dim,
-                    num_heads=modality_attention_heads,
-                    dropout=modality_dropout,
-                )
-                for _ in range(num_layers)
-            ]
+        # Share expensive projections across depth, while keeping the cheap
+        # normalization calibration layer-specific.
+        self.point_cross_attention = ModalityCrossAttention(
+            action_dim=self.inner_dim,
+            modality_dim=self.inner_dim,
+            num_heads=modality_attention_heads,
+            dropout=modality_dropout,
         )
-        self.tactile_cross_attention = nn.ModuleList(
-            [
-                ModalityCrossAttention(
-                    action_dim=self.inner_dim,
-                    modality_dim=self.inner_dim,
-                    num_heads=modality_attention_heads,
-                    dropout=modality_dropout,
-                )
-                for _ in range(num_layers)
-            ]
+        self.tactile_cross_attention = ModalityCrossAttention(
+            action_dim=self.inner_dim,
+            modality_dim=self.inner_dim,
+            num_heads=modality_attention_heads,
+            dropout=modality_dropout,
+        )
+        self.point_action_norms = nn.ModuleList(
+            nn.LayerNorm(self.inner_dim) for _ in range(num_layers)
+        )
+        self.point_modality_norms = nn.ModuleList(
+            nn.LayerNorm(self.inner_dim) for _ in range(num_layers)
+        )
+        self.tactile_action_norms = nn.ModuleList(
+            nn.LayerNorm(self.inner_dim) for _ in range(num_layers)
+        )
+        self.tactile_modality_norms = nn.ModuleList(
+            nn.LayerNorm(self.inner_dim) for _ in range(num_layers)
         )
 
         # Each modality starts as an exact no-op. The pretrained GR00T path is
@@ -252,11 +256,51 @@ class MultiModalConditionedDiT(AlternateVLDiT):
         # newly initialized residual branches at each transformer layer.
         self.point_gates = nn.Parameter(torch.zeros(num_layers))
         self.tactile_gates = nn.Parameter(torch.zeros(num_layers))
+        self._precision_diagnostics_logged = False
+
+        counts = self.parameter_counts()
+        LOGGER.info(
+            "MultiModalConditionedDiT parameters: base=%s, point_adapter=%s, "
+            "tactile_adapter=%s, total=%s",
+            f"{counts['base_dit']:,}",
+            f"{counts['point_adapter']:,}",
+            f"{counts['tactile_adapter']:,}",
+            f"{counts['total']:,}",
+        )
+
+    def parameter_counts(self) -> dict[str, int]:
+        """Return actual parameter counts for the base and each adapter branch."""
+        point_names = (
+            "point_cross_attention.",
+            "point_action_norms.",
+            "point_modality_norms.",
+            "point_gates",
+        )
+        tactile_names = (
+            "tactile_cross_attention.",
+            "tactile_action_norms.",
+            "tactile_modality_norms.",
+            "tactile_gates",
+        )
+        counts = {"point_adapter": 0, "tactile_adapter": 0, "total": 0}
+        for name, parameter in self.named_parameters():
+            count = parameter.numel()
+            counts["total"] += count
+            if any(name.startswith(f"{prefix}") for prefix in point_names):
+                counts["point_adapter"] += count
+            elif any(name.startswith(f"{prefix}") for prefix in tactile_names):
+                counts["tactile_adapter"] += count
+        counts["base_dit"] = counts["total"] - counts["point_adapter"] - counts["tactile_adapter"]
+        return counts
 
     def set_multimodal_adapter_trainable(self, trainable: bool) -> None:
         """Control only the new cross-attention branches and residual gates."""
         self.point_cross_attention.requires_grad_(trainable)
         self.tactile_cross_attention.requires_grad_(trainable)
+        self.point_action_norms.requires_grad_(trainable)
+        self.point_modality_norms.requires_grad_(trainable)
+        self.tactile_action_norms.requires_grad_(trainable)
+        self.tactile_modality_norms.requires_grad_(trainable)
         self.point_gates.requires_grad_(trainable)
         self.tactile_gates.requires_grad_(trainable)
 
@@ -313,16 +357,19 @@ class MultiModalConditionedDiT(AlternateVLDiT):
 
         # action_hidden_states: [B, N_action, D_dit] (Q)
         # point_tokens:         [B, N_point, D_dit]  (K/V)
-        point_update = self.point_cross_attention[block_index](
-            action_hidden_states,
-            encoder_hidden_states=point_tokens,
+        point_update = self.point_cross_attention(
+            self.point_action_norms[block_index](action_hidden_states),
+            encoder_hidden_states=self.point_modality_norms[block_index](point_tokens),
             encoder_attention_mask=point_attention_mask,
         )
 
         # Zero-initialized gated residual: new checkpoints begin with exactly
         # the pretrained GR00T behavior, then learn the conditioning strength.
-        gated_point_update = self.point_gates[block_index] * point_update
-        action_hidden_states = action_hidden_states + gated_point_update
+        gate = self.point_gates[block_index].to(dtype=point_update.dtype)
+        gated_point_update = gate * point_update
+        action_hidden_states = action_hidden_states + gated_point_update.to(
+            dtype=action_hidden_states.dtype
+        )
         return action_hidden_states
 
     def _apply_tactile_conditioning(
@@ -337,16 +384,19 @@ class MultiModalConditionedDiT(AlternateVLDiT):
 
         # action_hidden_states: [B, N_action, D_dit]   (Q)
         # tactile_tokens:       [B, N_tactile, D_dit] (K/V)
-        tactile_update = self.tactile_cross_attention[block_index](
-            action_hidden_states,
-            encoder_hidden_states=tactile_tokens,
+        tactile_update = self.tactile_cross_attention(
+            self.tactile_action_norms[block_index](action_hidden_states),
+            encoder_hidden_states=self.tactile_modality_norms[block_index](tactile_tokens),
             encoder_attention_mask=tactile_attention_mask,
         )
 
         # This gate independently controls how much tactile evidence enters
         # the action stream at the current layer.
-        gated_tactile_update = self.tactile_gates[block_index] * tactile_update
-        action_hidden_states = action_hidden_states + gated_tactile_update
+        gate = self.tactile_gates[block_index].to(dtype=tactile_update.dtype)
+        gated_tactile_update = gate * tactile_update
+        action_hidden_states = action_hidden_states + gated_tactile_update.to(
+            dtype=action_hidden_states.dtype
+        )
         return action_hidden_states
 
     def forward(
@@ -410,6 +460,27 @@ class MultiModalConditionedDiT(AlternateVLDiT):
             raise ValueError("hidden_states and point_tokens must share a batch size.")
         if tactile_tokens is not None and tactile_tokens.shape[0] != batch_size:
             raise ValueError("hidden_states and tactile_tokens must share a batch size.")
+        # Point and tactile encoders have independent compute islands. Join the
+        # DiT activation stream explicitly before LayerNorm and MHA Q/K/V.
+        if point_tokens is not None:
+            point_tokens = point_tokens.to(dtype=hidden_states.dtype)
+        if tactile_tokens is not None:
+            tactile_tokens = tactile_tokens.to(dtype=hidden_states.dtype)
+        if not self._precision_diagnostics_logged and os.environ.get(
+            "GR00T_DTYPE_DEBUG", ""
+        ).lower() in {"1", "true", "yes"}:
+            LOGGER.info(
+                "Multimodal DiT dtype: hidden=%s vlm=%s point=%s tactile=%s "
+                "point_gate=%s tactile_gate=%s adapter_weight=%s",
+                hidden_states.dtype,
+                encoder_hidden_states.dtype,
+                getattr(point_tokens, "dtype", None),
+                getattr(tactile_tokens, "dtype", None),
+                self.point_gates.dtype,
+                self.tactile_gates.dtype,
+                self.point_cross_attention.attention.out_proj.weight.dtype,
+            )
+            self._precision_diagnostics_logged = True
         for token_name, tokens in (
             ("point_tokens", point_tokens),
             ("tactile_tokens", tactile_tokens),

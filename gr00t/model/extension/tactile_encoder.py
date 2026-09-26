@@ -3,7 +3,9 @@
 
 """Tactile encoders for action-token conditioning."""
 
+from contextlib import nullcontext
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -14,7 +16,9 @@ from torch import nn
 import torch.nn.functional as F
 from torchvision.models import ResNet18_Weights, resnet18
 
-from .sparsh_vit import SparshVisionTransformer
+from gr00t.utils.model_load_diagnostics import log_model_load_memory
+
+from .sparsh_vit import SparshLayerNorm, SparshVisionTransformer
 
 
 LOGGER = logging.getLogger(__name__)
@@ -155,9 +159,11 @@ class SparshDinoTactileEncoder(nn.Module):
         super().__init__()
         self.pretrained_model = pretrained_model
         self.checkpoint_filename = checkpoint_filename
+        log_model_load_memory("before Sparsh architecture construction")
         self.backbone = SparshVisionTransformer()
+        log_model_load_memory("after Sparsh architecture construction")
         self.projection = nn.Sequential(
-            nn.LayerNorm(self.backbone_dim),
+            SparshLayerNorm(self.backbone_dim),
             nn.Linear(self.backbone_dim, output_dim),
         )
         # A fine-tuned GR00T checkpoint embeds this calibration tensor. When
@@ -170,11 +176,15 @@ class SparshDinoTactileEncoder(nn.Module):
         )
         self.background_path = background_path
         self.pretrained_loaded = False
+        self._precision_diagnostics_logged = False
         self.resolved_checkpoint: str | None = None
 
         if load_pretrained:
+            log_model_load_memory("before Sparsh checkpoint resolve")
             checkpoint = self._resolve_checkpoint(pretrained_model, checkpoint_filename)
+            log_model_load_memory("before Sparsh checkpoint load")
             self._load_pretrained_weights(checkpoint)
+            log_model_load_memory("after Sparsh checkpoint load")
             # Transformers skips its generic missing-key initialization for modules
             # marked this way, preserving weights loaded from the external checkpoint.
             for module in self.backbone.modules():
@@ -319,6 +329,27 @@ class SparshDinoTactileEncoder(nn.Module):
             )
         if not state_dict or "patch_embed.proj.weight" not in state_dict:
             raise RuntimeError("Sparsh checkpoint did not contain the official patch embedding.")
+        del state_dict
+
+    def validate_pretrained_backbone(self, source: str) -> None:
+        """Validate Sparsh tensors loaded from an embedded GR00T checkpoint."""
+        parameters = list(self.backbone.named_parameters())
+        if not parameters:
+            raise RuntimeError(f"Sparsh {source} loaded no pretrained parameters.")
+        meta_parameters = [name for name, parameter in parameters if parameter.is_meta]
+        meta_buffers = [name for name, buffer in self.backbone.named_buffers() if buffer.is_meta]
+        if meta_parameters or meta_buffers:
+            raise RuntimeError(
+                f"Sparsh {source} left meta tensors unresolved: "
+                f"parameters={meta_parameters[:10]}, buffers={meta_buffers[:10]}"
+            )
+        if not any(
+            torch.count_nonzero(parameter.detach()).item() > 0 for _, parameter in parameters
+        ):
+            raise RuntimeError(f"Sparsh {source} loaded no non-zero pretrained parameters.")
+        for module in self.backbone.modules():
+            module._is_hf_initialized = True
+        self.pretrained_loaded = True
 
     def backbone_parameters(self):
         return self.backbone.parameters()
@@ -391,10 +422,59 @@ class SparshDinoTactileEncoder(nn.Module):
         return torch.cat((images[:, 1], images[:, 0]), dim=1)
 
     def forward(self, tactile_sequence: torch.Tensor) -> torch.Tensor:
-        sparsh_input = self.preprocess(tactile_sequence)
-        input_dtype = next(self.backbone.parameters()).dtype
-        patch_tokens = self.backbone(sparsh_input.to(dtype=input_dtype))
-        return self.projection(patch_tokens)
+        log_precision = not self._precision_diagnostics_logged and os.environ.get(
+            "GR00T_DTYPE_DEBUG", ""
+        ).lower() in {"1", "true", "yes"}
+        # Background subtraction, clipping, and resizing are image-processing
+        # operations, not ViT compute. Keep them in FP32 even under outer AMP.
+        with torch.autocast(tactile_sequence.device.type, enabled=False):
+            sparsh_input = self.preprocess(tactile_sequence)
+
+        # Dense Sparsh kernels support BF16 autocast. This local context also
+        # covers inference, which does not have Trainer's AMP context. Never
+        # infer the input contract from the first (possibly ZeRO-sharded) weight.
+        context = (
+            torch.autocast("cuda", dtype=torch.bfloat16)
+            if tactile_sequence.is_cuda
+            else nullcontext()
+        )
+        first_norm_inputs: list[torch.dtype] = []
+        norm_hook = None
+        if log_precision and hasattr(self.backbone, "blocks") and self.backbone.blocks:
+            norm_hook = self.backbone.blocks[0].norm1.register_forward_pre_hook(
+                lambda _module, inputs: first_norm_inputs.append(inputs[0].dtype)
+            )
+        try:
+            with context:
+                cuda_amp_enabled = torch.is_autocast_enabled("cuda")
+                cuda_amp_dtype = torch.get_autocast_dtype("cuda")
+                patch_tokens = self.backbone(sparsh_input)
+                # The projection's affine norm uses FP32 accumulation, with
+                # its registered weights and optimizer ownership untouched.
+                projected = self.projection(patch_tokens)
+        finally:
+            if norm_hook is not None:
+                norm_hook.remove()
+
+        if log_precision:
+            LOGGER.info(
+                "Sparsh dtype: raw=%s preprocess=%s patch=%s projection=%s "
+                "first_norm_input=%s patch_weight=%s norm_weight=%s "
+                "cuda_amp=%s cuda_amp_dtype=%s",
+                tactile_sequence.dtype,
+                sparsh_input.dtype,
+                patch_tokens.dtype,
+                projected.dtype,
+                first_norm_inputs[0] if first_norm_inputs else None,
+                self.backbone.patch_embed.proj.weight.dtype,
+                self.backbone.blocks[0].norm1.weight.dtype
+                if hasattr(self.backbone, "blocks")
+                else None,
+                cuda_amp_enabled,
+                cuda_amp_dtype,
+            )
+            self._precision_diagnostics_logged = True
+        return projected
 
 
 def build_tactile_encoder(

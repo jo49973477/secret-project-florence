@@ -24,6 +24,7 @@ from transformers.trainer_callback import TrainerControl, TrainerState
 from transformers.training_args import TrainingArguments
 
 from gr00t.utils.dist_utils import run_on_rank0, run_or_wait_on_rank0
+from gr00t.experiment.checkpoint_memory import monitor_checkpoint_memory
 
 
 logger = logging.getLogger(__name__)
@@ -83,30 +84,31 @@ class CheckpointFormatCallback(TrainerCallback):
 
     def on_save(self, args, state, control, **kwargs):
         """Called after the trainer saves a checkpoint."""
-        if state.is_world_process_zero:
-            checkpoint_dir = Path(args.output_dir) / f"checkpoint-{state.global_step}"
+        with monitor_checkpoint_memory(f"checkpoint-format-callback.step-{state.global_step}"):
+            if state.is_world_process_zero:
+                checkpoint_dir = Path(args.output_dir) / f"checkpoint-{state.global_step}"
 
-            # Copy experiment config directory if provided
-            if self.exp_cfg_dir is not None:
-                exp_cfg_dst = checkpoint_dir / self.exp_cfg_dir.name
-                if self.exp_cfg_dir.exists():
-                    print(
-                        f"Copying experiment config directory {self.exp_cfg_dir} to {exp_cfg_dst}"
-                    )
-                    shutil.copytree(self.exp_cfg_dir, exp_cfg_dst, dirs_exist_ok=True)
+                # Copy experiment config directory if provided
+                if self.exp_cfg_dir is not None:
+                    exp_cfg_dst = checkpoint_dir / self.exp_cfg_dir.name
+                    if self.exp_cfg_dir.exists():
+                        print(
+                            f"Copying experiment config directory {self.exp_cfg_dir} to {exp_cfg_dst}"
+                        )
+                        shutil.copytree(self.exp_cfg_dir, exp_cfg_dst, dirs_exist_ok=True)
 
-            # Copy processor directory if provided
-            if self.processor_dir is not None:
-                if self.processor_dir.exists():
-                    print(f"Copying processor directory {self.processor_dir} to {checkpoint_dir}")
-                    shutil.copytree(self.processor_dir, checkpoint_dir, dirs_exist_ok=True)
+                # Copy processor directory if provided
+                if self.processor_dir is not None:
+                    if self.processor_dir.exists():
+                        print(f"Copying processor directory {self.processor_dir} to {checkpoint_dir}")
+                        shutil.copytree(self.processor_dir, checkpoint_dir, dirs_exist_ok=True)
 
-            # Copy wandb_config.json if provided
-            wandb_config_src = Path(args.output_dir) / "wandb_config.json"
-            wandb_config_dst = checkpoint_dir / "wandb_config.json"
-            if wandb_config_src.exists():
-                print(f"Copying wandb_config.json from {wandb_config_src} to {wandb_config_dst}")
-                shutil.copy2(wandb_config_src, wandb_config_dst)
+                # Copy wandb_config.json if provided
+                wandb_config_src = Path(args.output_dir) / "wandb_config.json"
+                wandb_config_dst = checkpoint_dir / "wandb_config.json"
+                if wandb_config_src.exists():
+                    print(f"Copying wandb_config.json from {wandb_config_src} to {wandb_config_dst}")
+                    shutil.copy2(wandb_config_src, wandb_config_dst)
 
 
 class BestMetricCheckpointCallback(TrainerCallback):

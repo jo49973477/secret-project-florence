@@ -92,6 +92,45 @@ def test_zero_gates_preserve_original_alternate_vl_dit_output() -> None:
     torch.testing.assert_close(multimodal_output, original_output, rtol=0, atol=0)
 
 
+def test_bf16_sensor_token_boundary_and_fp32_gates_do_not_promote_dit() -> None:
+    model = _multimodal_dit().to(dtype=torch.bfloat16)
+    with torch.no_grad():
+        model.point_gates.fill_(0.25)
+        model.tactile_gates.fill_(0.25)
+        # Keep gate storage FP32 to mimic mixed precision/optimizer ownership.
+        model.point_gates.data = model.point_gates.data.float()
+        model.tactile_gates.data = model.tactile_gates.data.float()
+    seen = {"point": [], "tactile": []}
+    point_hook = model.point_modality_norms[0].register_forward_pre_hook(
+        lambda _module, inputs: seen["point"].append(inputs[0].dtype)
+    )
+    tactile_hook = model.tactile_modality_norms[0].register_forward_pre_hook(
+        lambda _module, inputs: seen["tactile"].append(inputs[0].dtype)
+    )
+    point_tokens = torch.randn(1, 5, 8, dtype=torch.float32, requires_grad=True)
+    tactile_tokens = torch.randn(1, 2, 8, dtype=torch.float32, requires_grad=True)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        output, states = model(
+            torch.randn(1, 3, 8, dtype=torch.bfloat16),
+            torch.randn(1, 4, 6, dtype=torch.bfloat16),
+            timestep=torch.tensor([2]),
+            point_tokens=point_tokens,
+            tactile_tokens=tactile_tokens,
+            return_all_hidden_states=True,
+            **_vlm_masks(batch_size=1, sequence_length=4),
+        )
+        output.float().square().mean().backward()
+    point_hook.remove()
+    tactile_hook.remove()
+
+    assert seen == {"point": [torch.bfloat16] * 2, "tactile": [torch.bfloat16] * 2}
+    assert output.dtype == torch.bfloat16
+    assert all(state.dtype == torch.bfloat16 for state in states)
+    assert torch.isfinite(output).all()
+    assert point_tokens.grad is not None and torch.isfinite(point_tokens.grad).all()
+    assert tactile_tokens.grad is not None and torch.isfinite(tactile_tokens.grad).all()
+
+
 def test_modality_attention_updates_only_action_slice() -> None:
     """The sensor branches must not directly overwrite state-token outputs."""
     torch.manual_seed(11)
@@ -168,6 +207,106 @@ def test_fully_masked_modality_rows_produce_finite_outputs_and_gradients() -> No
     assert model.tactile_gates.grad is not None
     assert torch.isfinite(model.point_gates.grad).all()
     assert torch.isfinite(model.tactile_gates.grad).all()
+
+
+def test_shared_attention_parameter_count_and_per_layer_norms() -> None:
+    num_layers = 5
+    model = MultiModalConditionedDiT(**(_dit_config() | {"num_layers": num_layers}))
+
+    assert isinstance(model.point_cross_attention, torch.nn.Module)
+    assert isinstance(model.tactile_cross_attention, torch.nn.Module)
+    assert not isinstance(model.point_cross_attention, torch.nn.ModuleList)
+    assert not isinstance(model.tactile_cross_attention, torch.nn.ModuleList)
+    assert (
+        sum(
+            isinstance(module, torch.nn.MultiheadAttention)
+            for module in model.point_cross_attention.modules()
+        )
+        == 1
+    )
+    assert (
+        sum(
+            isinstance(module, torch.nn.MultiheadAttention)
+            for module in model.tactile_cross_attention.modules()
+        )
+        == 1
+    )
+    assert len(model.point_action_norms) == num_layers
+    assert len(model.point_modality_norms) == num_layers
+    assert len(model.tactile_action_norms) == num_layers
+    assert len(model.tactile_modality_norms) == num_layers
+    assert model.point_gates.numel() == num_layers
+    assert model.tactile_gates.numel() == num_layers
+    assert torch.count_nonzero(model.point_gates) == 0
+    assert torch.count_nonzero(model.tactile_gates) == 0
+
+    dim = model.inner_dim
+    shared_attention_parameters = sum(
+        parameter.numel() for parameter in model.point_cross_attention.parameters()
+    )
+    one_attention_and_norm_pair = shared_attention_parameters + 4 * dim
+    old_per_layer_parameters = num_layers * one_attention_and_norm_pair + num_layers
+    new_per_modality_parameters = shared_attention_parameters + num_layers * 4 * dim + num_layers
+    counts = model.parameter_counts()
+    assert counts["point_adapter"] == new_per_modality_parameters
+    assert counts["tactile_adapter"] == new_per_modality_parameters
+    assert (
+        counts["total"] == counts["base_dit"] + counts["point_adapter"] + counts["tactile_adapter"]
+    )
+    assert new_per_modality_parameters < old_per_layer_parameters
+
+
+def test_32_layer_gr00t_adapter_parameter_counts_on_meta_device() -> None:
+    """Count the observed 32-layer GR00T dimensions without allocating weights."""
+    from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
+
+    config = Gr00tN1d7Config()
+    with torch.device("meta"):
+        model = MultiModalConditionedDiT(
+            **(config.diffusion_model_cfg | {"num_layers": 32}),
+            cross_attention_dim=config.backbone_embedding_dim,
+            attend_text_every_n_blocks=config.attend_text_every_n_blocks,
+        )
+
+    counts = model.parameter_counts()
+    assert model.config.num_layers == 32
+    assert model.inner_dim == 1536
+    assert counts["point_adapter"] == 9_639_968
+    assert counts["tactile_adapter"] == 9_639_968
+    assert counts["total"] == counts["base_dit"] + 19_279_936
+
+
+def test_point_and_tactile_each_condition_actions_independently() -> None:
+    torch.manual_seed(29)
+    model = MultiModalConditionedDiT(**(_dit_config() | {"num_layers": 1})).eval()
+    with torch.no_grad():
+        model.point_gates.fill_(1.0)
+        model.tactile_gates.fill_(1.0)
+
+    hidden_states = torch.randn(2, 5, 8)
+    vlm_hidden_states = torch.randn(2, 6, 6)
+    timesteps = torch.tensor([2, 7])
+    masks = _vlm_masks()
+
+    with torch.no_grad():
+        baseline = model(hidden_states, vlm_hidden_states, timestep=timesteps, **masks)
+        point_conditioned = model(
+            hidden_states,
+            vlm_hidden_states,
+            timestep=timesteps,
+            point_tokens=torch.randn(2, 4, 8),
+            **masks,
+        )
+        tactile_conditioned = model(
+            hidden_states,
+            vlm_hidden_states,
+            timestep=timesteps,
+            tactile_tokens=torch.randn(2, 3, 8),
+            **masks,
+        )
+
+    assert not torch.allclose(point_conditioned, baseline)
+    assert not torch.allclose(tactile_conditioned, baseline)
 
 
 def test_modality_encoder_shapes() -> None:

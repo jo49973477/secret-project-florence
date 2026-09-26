@@ -47,7 +47,7 @@ def test_missing_webhook_url(monkeypatch, capsys):
 
 
 @pytest.mark.parametrize("status", [200, 204])
-def test_successful_send_has_json_body_and_content_type(status):
+def test_successful_send_has_json_body_and_required_headers(status):
     calls = []
 
     def opener(request, *, timeout):
@@ -62,7 +62,21 @@ def test_successful_send_has_json_body_and_content_type(status):
     assert request.method == "POST"
     assert timeout == 1.5
     assert request.get_header("Content-type") == "application/json"
+    assert request.get_header("User-agent") == "secret-project-florence/1.0"
     assert json.loads(request.data.decode("utf-8")) == {"content": "hello GR00T"}
+
+
+def test_http_error_reports_safe_status_without_leaking_webhook(caplog):
+    def opener(request, *, timeout):
+        raise urllib.error.HTTPError(request.full_url, 403, "Forbidden", {}, None)
+
+    notifier = DiscordNotifier(webhook_url=WEBHOOK_URL, opener=opener)
+    with caplog.at_level(logging.WARNING):
+        assert notifier.send("message") is False
+
+    assert "Discord notification failed (HTTP 403); training will continue." in caplog.text
+    assert WEBHOOK_URL not in caplog.text
+    assert "super-secret-token" not in caplog.text
 
 
 def test_network_failure_returns_false_without_leaking_webhook(caplog):

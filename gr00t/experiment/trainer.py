@@ -40,6 +40,8 @@ import torch
 from transformers.trainer import TRAINER_STATE_NAME, Trainer, TrainerState, get_last_checkpoint
 from transformers.trainer_callback import TrainerCallback
 
+from gr00t.experiment.checkpoint_memory import monitor_checkpoint_memory
+
 
 class ProfCallback(TrainerCallback):
     def __init__(self, prof):
@@ -170,6 +172,62 @@ class Gr00tTrainer(Trainer):
         self.point_encoder_learning_rate = kwargs.pop("point_encoder_learning_rate", None)
         self.tactile_encoder_learning_rate = kwargs.pop("tactile_encoder_learning_rate", None)
         super().__init__(*args, **kwargs)
+
+    def _save_checkpoint(self, *args: Any, **kwargs: Any) -> None:
+        """Capture memory across the complete native Trainer checkpoint operation."""
+        step = getattr(self.state, "global_step", "unknown")
+        with monitor_checkpoint_memory(f"checkpoint-{step}.complete"):
+            return super()._save_checkpoint(*args, **kwargs)
+
+    def save_model(self, output_dir: str | None = None, *args: Any, **kwargs: Any) -> None:
+        """Measure model saving separately from optimizer, scheduler, and RNG state."""
+        destination = output_dir or self.args.output_dir
+        internal = kwargs.get("_internal_call", False)
+        if internal and self._is_zero3_enabled():
+            # Transformers' ZeRO-3 save_model fallback calls engine.save_checkpoint
+            # when gathering is disabled. _save_optimizer_and_scheduler below
+            # calls it again, where DeepSpeed writes model + optimizer + scheduler
+            # shards together. Skip this first call to avoid duplicate full saves.
+            with monitor_checkpoint_memory(
+                f"model-save.{Path(destination).name}.internal-zero3-skipped"
+            ):
+                logging.info(
+                    "Skipping HF model consolidation for native ZeRO-3 checkpoint %s",
+                    destination,
+                )
+            return
+        with monitor_checkpoint_memory(
+            f"model-save.{Path(destination).name}.internal-{int(internal)}"
+        ):
+            return super().save_model(output_dir, *args, **kwargs)
+
+    def _is_zero3_enabled(self) -> bool:
+        """Read the active DeepSpeed stage from the plugin or Trainer config."""
+        if not self.is_deepspeed_enabled:
+            return False
+        plugin = getattr(getattr(self.accelerator, "state", None), "deepspeed_plugin", None)
+        if getattr(plugin, "zero_stage", None) == 3:
+            return True
+        ds_config = getattr(self.args, "deepspeed", None)
+        if isinstance(ds_config, str):
+            try:
+                with open(ds_config) as config_file:
+                    ds_config = json.load(config_file)
+            except (OSError, json.JSONDecodeError):
+                ds_config = None
+        if isinstance(ds_config, dict):
+            return ds_config.get("zero_optimization", {}).get("stage") == 3
+        hf_config = getattr(self.args, "hf_deepspeed_config", None)
+        config = getattr(hf_config, "config", {})
+        return config.get("zero_optimization", {}).get("stage") == 3
+
+    def _save_optimizer_and_scheduler(self, *args: Any, **kwargs: Any) -> None:
+        with monitor_checkpoint_memory(f"optimizer-scheduler-save.step-{self.state.global_step}"):
+            return super()._save_optimizer_and_scheduler(*args, **kwargs)
+
+    def _save_rng_state(self, *args: Any, **kwargs: Any) -> None:
+        with monitor_checkpoint_memory(f"rng-save.step-{self.state.global_step}"):
+            return super()._save_rng_state(*args, **kwargs)
 
     def create_optimizer(self):
         """Create identity-safe VLM/action-head optimizer parameter groups.

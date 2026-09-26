@@ -8,6 +8,7 @@ checkpoint_resume_is_resumable() {
     local base="${checkpoint##*/}"
     local optimizer_state=""
     local scheduler_state=""
+    local model_state=""
     local rng_state=""
 
     [[ -d "${checkpoint}" ]] || return 1
@@ -25,8 +26,9 @@ checkpoint_resume_is_resumable() {
         scheduler_state="$(find "${checkpoint}" -type f -name '*model_states.pt' -print -quit)"
     fi
     rng_state="$(find "${checkpoint}" -maxdepth 1 -type f -name 'rng_state*.pth' -print -quit)"
+    model_state="$(find "${checkpoint}" -type f \( -name '*model_states.pt' -o -name 'pytorch_model*.bin' -o -name '*.safetensors' \) -print -quit)"
 
-    [[ -n "${optimizer_state}" && -n "${scheduler_state}" && -n "${rng_state}" ]]
+    [[ -n "${optimizer_state}" && -n "${scheduler_state}" && -n "${rng_state}" && -n "${model_state}" ]]
 }
 
 checkpoint_resume_find_latest() {
@@ -57,6 +59,7 @@ checkpoint_resume_validate_target() {
     local base="${checkpoint##*/}"
     local optimizer_state=""
     local scheduler_state=""
+    local model_state=""
     local rng_state=""
     local -a missing=()
 
@@ -79,9 +82,11 @@ checkpoint_resume_validate_target() {
         scheduler_state="$(find "${checkpoint}" -type f -name '*model_states.pt' -print -quit)"
     fi
     rng_state="$(find "${checkpoint}" -maxdepth 1 -type f -name 'rng_state*.pth' -print -quit)"
+    model_state="$(find "${checkpoint}" -type f \( -name '*model_states.pt' -o -name 'pytorch_model*.bin' -o -name '*.safetensors' \) -print -quit)"
 
     [[ -n "${optimizer_state}" ]] || missing+=("optimizer state")
     [[ -n "${scheduler_state}" ]] || missing+=("scheduler state")
+    [[ -n "${model_state}" ]] || missing+=("model partitions")
     [[ -n "${rng_state}" ]] || missing+=("RNG state")
 
     if (( ${#missing[@]} > 0 )); then

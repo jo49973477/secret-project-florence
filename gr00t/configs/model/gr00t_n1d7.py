@@ -109,8 +109,12 @@ class Gr00tN1d7Config(PretrainedConfig):
     tactile_checkpoint_filename: str = "dino_vitbase.safetensors"
     tactile_background_path: str | None = None
     tactile_pretrained_load_on_init: bool = True
+    tactile_encoder_deferred_bootstrap: bool = False
     tactile_temporal_delta_indices: list[int] = field(default_factory=lambda: [-1, 0])
     point_encoder_cfg: str = "pointnet2"  # candidates: ["pointnet2", "pointnet", "point_transformer", "pointnet++", "transformer"]
+    point_encoder_pretrained_load_on_init: bool = True
+    point_encoder_deferred_bootstrap: bool = False
+    point_encoder_model_config: dict | None = None
     point_encoder_checkpoint_path: str | None = None
     point_encoder_repo_id: str = "Pointcept/Concerto"
     point_encoder_download_root: str | None = None

@@ -15,11 +15,12 @@
 
 import json
 import logging
+import os
 from pathlib import Path
 
 import numpy as np
 import torch
-from transformers import AutoModel, AutoProcessor
+from transformers import AutoConfig, AutoModel, AutoProcessor
 
 from gr00t.configs.base_config import Config
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
@@ -30,8 +31,19 @@ from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import (
     EMBODIMENT_TAG_TO_PROJECTOR_INDEX,
     Gr00tN1d7Processor,
 )
+from gr00t.model.gr00t_n1d7.sensor_loading import (
+    MULTIMODAL_ADAPTER_PREFIXES,
+    checkpoint_sensor_layout,
+    has_legacy_layerwise_attention_keys,
+    unexpected_missing_keys,
+)
 from gr00t.model.registry import register_model
-from gr00t.utils.dist_utils import run_or_wait_on_rank0
+from gr00t.utils.dist_utils import (
+    is_dist_avail_and_initialized,
+    run_or_wait_on_rank0,
+    run_serialized_across_ranks,
+)
+from gr00t.utils.model_load_diagnostics import log_model_load_memory
 
 
 # Convert tensors to lists for JSON serialization
@@ -203,6 +215,35 @@ class Gr00tN1d7Pipeline(ModelPipeline):
         """Setup model with proper vocabulary expansion."""
         skip_weight_loading = getattr(self.config.training, "skip_weight_loading", False)
         if self.config.training.start_from_checkpoint is not None and not skip_weight_loading:
+            checkpoint_config = AutoConfig.from_pretrained(
+                self.config.training.start_from_checkpoint,
+                **self.transformers_loading_kwargs,
+            )
+            checkpoint_multimodal, checkpoint_has_point, checkpoint_has_tactile = (
+                checkpoint_sensor_layout(checkpoint_config)
+            )
+            requested_multimodal = self.config.model.dit_type == "multimodal_conditioned_dit"
+            requested_point = requested_multimodal and self.config.model.use_point_conditioning
+            requested_tactile = requested_multimodal and self.config.model.use_tactile_conditioning
+            point_model_config = getattr(checkpoint_config, "point_encoder_model_config", None)
+            legacy_point_resume = checkpoint_has_point and point_model_config is None
+            if legacy_point_resume:
+                logging.warning(
+                    "This multimodal checkpoint predates persisted Concerto architecture config; "
+                    "the official checkpoint will be read once to reconstruct its architecture. "
+                    "Newly saved checkpoints do not require this compatibility path."
+                )
+
+            point_deferred = requested_point and not checkpoint_has_point
+            tactile_deferred = requested_tactile and not checkpoint_has_tactile
+            point_load_on_init = (
+                legacy_point_resume
+                if requested_multimodal
+                else self.config.model.point_encoder_pretrained_load_on_init
+            )
+            tactile_load_on_init = (
+                False if requested_multimodal else self.config.model.tactile_pretrained_load_on_init
+            )
             dropout_overrides = {
                 key: value
                 for key, value in (
@@ -217,71 +258,82 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 )
                 if value is not None
             }
-            model, loading_info = AutoModel.from_pretrained(
-                self.config.training.start_from_checkpoint,
-                tune_llm=self.config.model.tune_llm,
-                tune_visual=self.config.model.tune_visual,
-                tune_projector=self.config.model.tune_projector,
-                tune_diffusion_model=self.config.model.tune_diffusion_model,
-                tune_vlln=self.config.model.tune_vlln,
-                state_dropout_prob=self.config.model.state_dropout_prob,
-                backbone_trainable_params_fp32=self.config.model.backbone_trainable_params_fp32,
-                load_bf16=self.config.model.load_bf16,
-                transformers_loading_kwargs=self.transformers_loading_kwargs,
-                dit_type=self.config.model.dit_type,
-                use_point_conditioning=self.config.model.use_point_conditioning,
-                use_tactile_conditioning=self.config.model.use_tactile_conditioning,
-                point_input_dim=self.config.model.point_input_dim,
-                tactile_input_channels=self.config.model.tactile_input_channels,
-                point_encoder_cfg=self.config.model.point_encoder_cfg,
-                point_encoder_checkpoint_path=self.config.model.point_encoder_checkpoint_path,
-                point_encoder_repo_id=self.config.model.point_encoder_repo_id,
-                point_encoder_download_root=self.config.model.point_encoder_download_root,
-                point_encoder_grid_size=self.config.model.point_encoder_grid_size,
-                point_encoder_enable_flash=self.config.model.point_encoder_enable_flash,
-                tactile_encoder_cfg=self.config.model.tactile_encoder_cfg,
-                tactile_pretrained_model=self.config.model.tactile_pretrained_model,
-                tactile_checkpoint_filename=self.config.model.tactile_checkpoint_filename,
-                tactile_background_path=self.config.model.tactile_background_path,
-                tactile_pretrained_load_on_init=(self.config.model.tactile_pretrained_load_on_init),
-                tactile_temporal_delta_indices=(self.config.model.tactile_temporal_delta_indices),
-                tune_point_encoder=self.config.model.tune_point_encoder,
-                tune_tactile_encoder=self.config.model.tune_tactile_encoder,
-                tune_multimodal_adapter=self.config.model.tune_multimodal_adapter,
-                output_loading_info=True,
-                **dropout_overrides,
-                **self.transformers_loading_kwargs,
+
+            def load_base_checkpoint():
+                log_model_load_memory("before AutoModel.from_pretrained")
+                loaded = AutoModel.from_pretrained(
+                    self.config.training.start_from_checkpoint,
+                    tune_llm=self.config.model.tune_llm,
+                    tune_visual=self.config.model.tune_visual,
+                    tune_projector=self.config.model.tune_projector,
+                    tune_diffusion_model=self.config.model.tune_diffusion_model,
+                    tune_vlln=self.config.model.tune_vlln,
+                    state_dropout_prob=self.config.model.state_dropout_prob,
+                    backbone_trainable_params_fp32=(
+                        self.config.model.backbone_trainable_params_fp32
+                    ),
+                    load_bf16=self.config.model.load_bf16,
+                    transformers_loading_kwargs=self.transformers_loading_kwargs,
+                    dit_type=self.config.model.dit_type,
+                    use_point_conditioning=self.config.model.use_point_conditioning,
+                    use_tactile_conditioning=self.config.model.use_tactile_conditioning,
+                    point_input_dim=self.config.model.point_input_dim,
+                    tactile_input_channels=self.config.model.tactile_input_channels,
+                    point_encoder_cfg=self.config.model.point_encoder_cfg,
+                    point_encoder_checkpoint_path=self.config.model.point_encoder_checkpoint_path,
+                    point_encoder_repo_id=self.config.model.point_encoder_repo_id,
+                    point_encoder_download_root=self.config.model.point_encoder_download_root,
+                    point_encoder_grid_size=self.config.model.point_encoder_grid_size,
+                    point_encoder_enable_flash=self.config.model.point_encoder_enable_flash,
+                    point_encoder_pretrained_load_on_init=point_load_on_init,
+                    point_encoder_deferred_bootstrap=point_deferred,
+                    point_encoder_model_config=point_model_config,
+                    tactile_encoder_cfg=self.config.model.tactile_encoder_cfg,
+                    tactile_pretrained_model=self.config.model.tactile_pretrained_model,
+                    tactile_checkpoint_filename=self.config.model.tactile_checkpoint_filename,
+                    tactile_background_path=self.config.model.tactile_background_path,
+                    tactile_pretrained_load_on_init=tactile_load_on_init,
+                    tactile_encoder_deferred_bootstrap=tactile_deferred,
+                    tactile_temporal_delta_indices=(
+                        self.config.model.tactile_temporal_delta_indices
+                    ),
+                    tune_point_encoder=self.config.model.tune_point_encoder,
+                    tune_tactile_encoder=self.config.model.tune_tactile_encoder,
+                    tune_multimodal_adapter=self.config.model.tune_multimodal_adapter,
+                    output_loading_info=True,
+                    **dropout_overrides,
+                    **self.transformers_loading_kwargs,
+                )
+                log_model_load_memory("after AutoModel.from_pretrained")
+                return loaded
+
+            serialize_loading = (
+                requested_multimodal
+                and is_dist_avail_and_initialized()
+                and torch.distributed.get_world_size() > 1
+                and os.environ.get("GROOT_SERIALIZE_MODEL_LOADING", "1").lower()
+                not in {"0", "false", "no"}
             )
+            if serialize_loading:
+                logging.info("Serializing multimodal model loading across distributed ranks.")
+                model, loading_info = run_serialized_across_ranks(
+                    load_base_checkpoint,
+                    label="GR00T checkpoint load",
+                )
+            else:
+                model, loading_info = load_base_checkpoint()
 
             missing_keys = loading_info.get("missing_keys", [])
-            mask_token_missing = any("mask_token" in key for key in missing_keys)
-            if mask_token_missing and model.action_head.mask_token is not None:
-                with torch.no_grad():
-                    model.action_head.mask_token.data.copy_(
-                        0.02 * torch.randn_like(model.action_head.mask_token)
-                    )
-                logging.info("mask_token not in checkpoint - initialized")
-
             unexpected_keys = loading_info.get("unexpected_keys", [])
             mismatched_keys = loading_info.get("mismatched_keys", [])
-            newly_enabled_prefixes = ()
-            if self.config.model.dit_type == "multimodal_conditioned_dit":
-                newly_enabled_prefixes += (
-                    "action_head.model.point_cross_attention.",
-                    "action_head.model.point_gates",
-                    "action_head.model.tactile_cross_attention.",
-                    "action_head.model.tactile_gates",
-                )
-                if self.config.model.use_point_conditioning:
-                    newly_enabled_prefixes += ("action_head.point_encoder.",)
-                if self.config.model.use_tactile_conditioning:
-                    newly_enabled_prefixes += ("action_head.tactile_encoder.",)
-            other_missing = [
-                key
-                for key in missing_keys
-                if "mask_token" not in key
-                and not any(key.startswith(prefix) for prefix in newly_enabled_prefixes)
-            ]
+            newly_enabled_prefixes: tuple[str, ...] = ()
+            if requested_multimodal and not checkpoint_multimodal:
+                newly_enabled_prefixes += MULTIMODAL_ADAPTER_PREFIXES
+            if point_deferred:
+                newly_enabled_prefixes += ("action_head.point_encoder.",)
+            if tactile_deferred:
+                newly_enabled_prefixes += ("action_head.tactile_encoder.",)
+            other_missing = unexpected_missing_keys(missing_keys, newly_enabled_prefixes)
             initialized_sensor_keys = [
                 key
                 for key in missing_keys
@@ -289,8 +341,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
             ]
             if initialized_sensor_keys:
                 logging.info(
-                    "Initialized %d newly enabled multimodal tensors; pretrained sensor "
-                    "backbones loaded through their verified loaders.",
+                    "Accepted %d expected missing tensors from newly enabled multimodal modules.",
                     len(initialized_sensor_keys),
                 )
             errors = []
@@ -301,10 +352,34 @@ class Gr00tN1d7Pipeline(ModelPipeline):
             if mismatched_keys:
                 errors.append(f"Mismatched keys ({len(mismatched_keys)}): {mismatched_keys}")
             if errors:
+                if has_legacy_layerwise_attention_keys(unexpected_keys):
+                    errors.append(
+                        "Architecture mismatch: this checkpoint uses the experimental "
+                        "per-layer multimodal cross-attention layout, which is incompatible "
+                        "with the shared-attention architecture."
+                    )
                 raise RuntimeError(
                     "Checkpoint weight mismatch for "
                     f"{self.config.training.start_from_checkpoint}:\n" + "\n".join(errors)
                 )
+
+            if checkpoint_has_point or checkpoint_has_tactile:
+                model.action_head.validate_embedded_sensor_backbones()
+
+            if point_deferred or tactile_deferred:
+
+                def bootstrap_sensor_backbones():
+                    log_model_load_memory("before external sensor bootstrap")
+                    model.action_head.bootstrap_deferred_sensor_backbones()
+                    log_model_load_memory("after external sensor bootstrap")
+
+                if serialize_loading:
+                    run_serialized_across_ranks(
+                        bootstrap_sensor_backbones,
+                        label="external sensor bootstrap",
+                    )
+                else:
+                    bootstrap_sensor_backbones()
 
             if self.config.model.use_lora and not model.config.use_lora:
                 model.enable_lora(

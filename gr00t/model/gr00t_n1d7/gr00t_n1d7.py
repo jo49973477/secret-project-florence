@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import logging
+import os
 from typing import Any, Tuple
 
 import torch
@@ -33,6 +34,7 @@ from gr00t.model.modules.embodiment_conditioned_mlp import (
     CategorySpecificMLP,
     MultiEmbodimentActionEncoder,
 )
+from gr00t.utils.model_load_diagnostics import log_model_load_memory
 
 
 logger = logging.getLogger(__name__)
@@ -65,6 +67,7 @@ class Gr00tN1d7ActionHead(nn.Module):
     def __init__(self, config: Gr00tN1d7Config):
         super().__init__()
         self.config = config
+        self._dtype_diagnostics_logged = False
         self.hidden_size = config.hidden_size
         self.input_embedding_dim = config.input_embedding_dim
 
@@ -148,7 +151,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         self.point_encoder = None
         self.tactile_encoder = None
         if config.dit_type == "multimodal_conditioned_dit":
-            if config.use_point_conditioning:
+            if config.use_point_conditioning and not config.point_encoder_deferred_bootstrap:
                 self.point_encoder = build_point_encoder(
                     config.point_encoder_cfg,
                     input_dim=config.point_input_dim,
@@ -160,12 +163,14 @@ class Gr00tN1d7ActionHead(nn.Module):
                             "download_root": config.point_encoder_download_root,
                             "grid_size": config.point_encoder_grid_size,
                             "enable_flash": config.point_encoder_enable_flash,
+                            "load_pretrained": config.point_encoder_pretrained_load_on_init,
+                            "architecture_config": config.point_encoder_model_config,
                         }
                         if config.point_encoder_cfg in {"concerto_small", "concerto_base"}
                         else {}
                     ),
                 )
-            if config.use_tactile_conditioning:
+            if config.use_tactile_conditioning and not config.tactile_encoder_deferred_bootstrap:
                 self.tactile_encoder = build_tactile_encoder(
                     config.tactile_encoder_cfg,
                     input_channels=config.tactile_input_channels,
@@ -221,6 +226,66 @@ class Gr00tN1d7ActionHead(nn.Module):
             tune_tactile_encoder=config.tune_tactile_encoder,
             tune_multimodal_adapter=config.tune_multimodal_adapter,
         )
+
+    def bootstrap_deferred_sensor_backbones(self) -> None:
+        """Load official sensor backbones after the base GR00T checkpoint has finished."""
+        config = self.config
+        if config.point_encoder_deferred_bootstrap:
+            if self.point_encoder is not None:
+                raise RuntimeError("Deferred Concerto bootstrap found an existing point encoder.")
+            self.point_encoder = build_point_encoder(
+                config.point_encoder_cfg,
+                input_dim=config.point_input_dim,
+                point_dim=self.model.inner_dim,
+                checkpoint_path=config.point_encoder_checkpoint_path,
+                repo_id=config.point_encoder_repo_id,
+                download_root=config.point_encoder_download_root,
+                grid_size=config.point_encoder_grid_size,
+                enable_flash=config.point_encoder_enable_flash,
+                load_pretrained=True,
+            )
+            if not hasattr(self.point_encoder, "architecture_config"):
+                raise RuntimeError("Deferred point bootstrap did not create a Concerto encoder.")
+            config.point_encoder_model_config = dict(self.point_encoder.architecture_config)
+            config.point_encoder_pretrained_load_on_init = False
+            config.point_encoder_deferred_bootstrap = False
+
+        if config.tactile_encoder_deferred_bootstrap:
+            if self.tactile_encoder is not None:
+                raise RuntimeError("Deferred Sparsh bootstrap found an existing tactile encoder.")
+            self.tactile_encoder = build_tactile_encoder(
+                config.tactile_encoder_cfg,
+                input_channels=config.tactile_input_channels,
+                output_dim=self.model.inner_dim,
+                pretrained_model=config.tactile_pretrained_model,
+                checkpoint_filename=config.tactile_checkpoint_filename,
+                background_path=config.tactile_background_path,
+                load_pretrained=True,
+                backbone_trainable=config.tune_tactile_encoder,
+            )
+            config.tactile_pretrained_load_on_init = False
+            config.tactile_encoder_deferred_bootstrap = False
+
+        self.set_trainable_parameters(
+            tune_projector=config.tune_projector,
+            tune_diffusion_model=config.tune_diffusion_model,
+            tune_vlln=config.tune_vlln,
+            tune_point_encoder=config.tune_point_encoder,
+            tune_tactile_encoder=config.tune_tactile_encoder,
+            tune_multimodal_adapter=config.tune_multimodal_adapter,
+        )
+
+    def validate_embedded_sensor_backbones(self) -> None:
+        """Validate sensor weights restored from a multimodal GR00T checkpoint."""
+        if self.point_encoder is not None and hasattr(
+            self.point_encoder, "validate_pretrained_backbone"
+        ):
+            self.point_encoder.validate_pretrained_backbone("embedded GR00T checkpoint")
+            self.config.point_encoder_pretrained_load_on_init = False
+            self.config.point_encoder_model_config = dict(self.point_encoder.architecture_config)
+        if isinstance(self.tactile_encoder, SparshDinoTactileEncoder):
+            self.tactile_encoder.validate_pretrained_backbone("embedded GR00T checkpoint")
+            self.config.tactile_pretrained_load_on_init = False
 
     def set_trainable_parameters(
         self,
@@ -327,6 +392,15 @@ class Gr00tN1d7ActionHead(nn.Module):
 
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
         backbone_features = backbone_output["backbone_features"]
+        # Qwen has its own CUDA BF16 compute boundary. The action head may be
+        # FP32 at inference or BF16 under ZeRO; join at the DiT's actual weight
+        # dtype rather than assuming the VLM and head are stored identically.
+        head_dtype = (
+            self.vlln.weight.dtype
+            if isinstance(self.vlln, nn.LayerNorm)
+            else self.state_encoder.layer1.W.dtype
+        )
+        backbone_features = backbone_features.to(dtype=head_dtype)
         backbone_features = self.vlln(backbone_features)
         backbone_features = self.vl_self_attention(backbone_features)
         backbone_output["backbone_features"] = backbone_features
@@ -356,7 +430,9 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         return point_tokens, point_attention_mask, tactile_tokens
 
-    def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
+    def forward(
+        self, backbone_output: dict | BatchFeature, action_input: dict | BatchFeature
+    ) -> dict:
         """
         Forward pass through the action head.
 
@@ -373,11 +449,16 @@ class Gr00tN1d7ActionHead(nn.Module):
                 - tactile: optional [B, T_tactile, C, H, W]
 
         Returns:
-            BatchFeature containing:
+            Dict containing:
                 - loss: action prediction loss
         """
         # Set frozen modules to eval
         self.set_frozen_modules_to_eval_mode()
+
+        # Keep the public BatchFeature convenience API inside this forward,
+        # while exposing only plain dicts to DeepSpeed's module hooks.
+        backbone_output = BatchFeature(data=backbone_output)
+        action_input = BatchFeature(data=action_input)
 
         backbone_output = self.process_backbone_output(backbone_output)
 
@@ -487,8 +568,33 @@ class Gr00tN1d7ActionHead(nn.Module):
         pred_actions = pred[:, -actions.shape[1] :] * action_mask
 
         # Slice out only the action portion of pred and target.
-        action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
-        loss = action_loss.sum() / (action_mask.sum() + 1e-6)
+        # Keep the DiT in its model dtype; accumulate the flow-matching error
+        # and mask denominator in FP32 to avoid BF16 reduction/rounding loss.
+        action_loss = F.mse_loss(pred_actions.float(), velocity.float(), reduction="none")
+        action_loss = action_loss * action_mask.float()
+        loss = action_loss.sum() / (action_mask.float().sum() + 1e-6)
+
+        if not self._dtype_diagnostics_logged and os.environ.get(
+            "GR00T_DTYPE_DEBUG", ""
+        ).lower() in {"1", "true", "yes"}:
+            logger.info(
+                "GR00T action dtype: vlm=%s state=%s action=%s point=%s tactile=%s "
+                "dit_input=%s predicted=%s target=%s loss=%s",
+                vl_embeds.dtype,
+                state_features.dtype,
+                actions.dtype,
+                getattr(point_tokens, "dtype", None)
+                if self.config.dit_type == "multimodal_conditioned_dit"
+                else None,
+                getattr(tactile_tokens, "dtype", None)
+                if self.config.dit_type == "multimodal_conditioned_dit"
+                else None,
+                sa_embs.dtype,
+                pred_actions.dtype,
+                velocity.dtype,
+                loss.dtype,
+            )
+            self._dtype_diagnostics_logged = True
 
         return {
             "loss": loss,
@@ -784,6 +890,8 @@ class Gr00tN1d7(PreTrainedModel):
         """
         super().__init__(config)
         self.config = config
+        self._dtype_diagnostics_logged = False
+        log_model_load_memory("Gr00tN1d7 construction start")
 
         backbone_cls = get_backbone_cls(config)
         self.backbone = backbone_cls(
@@ -803,9 +911,11 @@ class Gr00tN1d7(PreTrainedModel):
             lora_bias=config.lora_bias,
             transformers_loading_kwargs=transformers_loading_kwargs,
         )
+        log_model_load_memory("after GR00T VLM backbone construction")
 
         # Initialize action head
         self.action_head = Gr00tN1d7ActionHead(config)
+        log_model_load_memory("after GR00T action-head construction")
         from .processing_gr00t_n1d7 import Gr00tN1d7DataCollator
 
         self.collator = Gr00tN1d7DataCollator(
@@ -813,6 +923,7 @@ class Gr00tN1d7(PreTrainedModel):
             model_type=config.backbone_model_type,
             transformers_loading_kwargs=transformers_loading_kwargs,
         )
+        log_model_load_memory("Gr00tN1d7 construction complete")
 
     def enable_lora(
         self,
@@ -856,19 +967,60 @@ class Gr00tN1d7(PreTrainedModel):
         backbone_inputs = self.backbone.prepare_input(inputs)
         action_inputs = self.action_head.prepare_input(inputs)
 
-        # Move to device and dtype
-        def to_device_with_dtype(x):
-            if torch.is_floating_point(x):
-                return x.to(self.device, dtype=self.dtype)
-            else:
+        # Move raw fields without applying one global parameter's dtype to all
+        # modalities. Each consumer below owns the precision of its inputs.
+        def to_model_device(x):
+            return x.to(self.device)
+
+        backbone_inputs = tree.map_structure(to_model_device, backbone_inputs)
+        dense_head_dtype = self.action_head.state_encoder.layer1.W.dtype
+        point_encoder_cfg = self.config.point_encoder_cfg.lower().replace("-", "_")
+        tactile_encoder_cfg = self.config.tactile_encoder_cfg.lower().replace("-", "_")
+        field_dtypes = {
+            "state": dense_head_dtype,
+            "action": self.action_head.action_encoder.W1.W.dtype,
+            "points": (
+                torch.float32
+                if point_encoder_cfg in {"concerto_small", "concerto_base"}
+                else dense_head_dtype
+            ),
+            "tactile": (
+                torch.float32 if tactile_encoder_cfg == "sparsh_dino_base" else dense_head_dtype
+            ),
+        }
+
+        def move_action_field(key, value):
+            def move(x):
+                if torch.is_floating_point(x) and key in field_dtypes:
+                    return x.to(self.device, dtype=field_dtypes[key])
                 return x.to(self.device)
 
-        backbone_inputs = tree.map_structure(to_device_with_dtype, backbone_inputs)
-        action_inputs = tree.map_structure(to_device_with_dtype, action_inputs)
+            return tree.map_structure(move, value)
+
+        action_inputs = BatchFeature(
+            data={key: move_action_field(key, value) for key, value in action_inputs.items()}
+        )
+
+        if not self._dtype_diagnostics_logged and os.environ.get(
+            "GR00T_DTYPE_DEBUG", ""
+        ).lower() in {"1", "true", "yes"}:
+            logger.info(
+                "GR00T input dtype: model=%s qwen_pixels=%s state=%s action=%s "
+                "points=%s tactile=%s cuda_amp=%s cuda_amp_dtype=%s",
+                self.dtype,
+                getattr(backbone_inputs.get("pixel_values"), "dtype", None),
+                getattr(action_inputs.get("state"), "dtype", None),
+                getattr(action_inputs.get("action"), "dtype", None),
+                getattr(action_inputs.get("points"), "dtype", None),
+                getattr(action_inputs.get("tactile"), "dtype", None),
+                torch.is_autocast_enabled("cuda"),
+                torch.get_autocast_dtype("cuda"),
+            )
+            self._dtype_diagnostics_logged = True
 
         return backbone_inputs, action_inputs
 
-    def forward(self, inputs: dict) -> BatchFeature:
+    def forward(self, inputs: dict) -> dict:
         """
         Forward pass through the complete model.
 
@@ -877,12 +1029,12 @@ class Gr00tN1d7(PreTrainedModel):
                 - Action inputs (state, action, embodiment_id, etc.)
 
         Returns:
-            BatchFeature containing loss and other outputs
+            Dict containing loss and other outputs
         """
         # Prepare inputs for backbone and action head
         backbone_inputs, action_inputs = self.prepare_input(inputs)
-        backbone_outputs = self.backbone(backbone_inputs)
-        action_outputs = self.action_head(backbone_outputs, action_inputs)
+        backbone_outputs = self.backbone(dict(backbone_inputs))
+        action_outputs = self.action_head(dict(backbone_outputs), dict(action_inputs))
 
         return action_outputs
 
@@ -894,8 +1046,10 @@ class Gr00tN1d7(PreTrainedModel):
         backbone_inputs, action_inputs = self.prepare_input(inputs)
 
         # Forward through backbone
-        backbone_outputs = self.backbone(backbone_inputs)
-        action_outputs = self.action_head.get_action(backbone_outputs, action_inputs, options)
+        backbone_outputs = self.backbone(dict(backbone_inputs))
+        action_outputs = self.action_head.get_action(
+            BatchFeature(data=backbone_outputs), action_inputs, options
+        )
 
         return action_outputs
 

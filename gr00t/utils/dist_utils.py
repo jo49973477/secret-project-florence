@@ -113,3 +113,44 @@ def run_on_rank0(fn, *args, label: str | None = None, **kwargs):
         if is_rank0:
             result = fn(*args, **kwargs)
     return result
+
+
+def run_serialized_across_ranks(fn, *args, label: str | None = None, **kwargs):
+    """Run the same memory-heavy callable one rank at a time.
+
+    Each rank retains its own return value. Python exceptions are propagated to
+    every rank before moving to the next rank, avoiding a peer waiting forever
+    after a catchable loader failure.
+    """
+    if not is_dist_avail_and_initialized():
+        return fn(*args, **kwargs)
+
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+    device = _collective_device()
+    result = None
+    for active_rank in range(world_size):
+        status = torch.zeros(1, dtype=torch.int, device=device)
+        local_error: BaseException | None = None
+        error_summary: list[str | None] = [None]
+        if rank == active_rank:
+            try:
+                result = fn(*args, **kwargs)
+            except BaseException as exc:
+                status += 1
+                local_error = exc
+                error_summary[0] = f"{type(exc).__name__}: {exc}"
+
+        torch.distributed.all_reduce(status, op=torch.distributed.ReduceOp.MAX)
+        if status.item() != 0:
+            torch.distributed.broadcast_object_list(error_summary, src=active_rank)
+        torch.distributed.barrier()
+        if status.item() != 0:
+            if local_error is not None:
+                raise local_error
+            label_prefix = f"{label}: " if label else ""
+            raise RuntimeError(
+                f"{label_prefix}rank {active_rank} failed during serialized execution with "
+                f"{error_summary[0] or '<no error info broadcast>'}"
+            ) from None
+    return result

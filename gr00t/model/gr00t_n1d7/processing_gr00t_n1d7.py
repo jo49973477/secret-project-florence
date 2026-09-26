@@ -170,7 +170,7 @@ class Gr00tN1d7DataCollator:
         self.model_type = model_type
         self.model_name = model_name
 
-    def __call__(self, features: list[Dict[str, Any]]) -> BatchFeature:
+    def __call__(self, features: list[Dict[str, Any]]) -> dict[str, dict[str, torch.Tensor]]:
         batch = {}
         keys = list(set().union(*(elem.keys() for elem in features)))
 
@@ -205,7 +205,9 @@ class Gr00tN1d7DataCollator:
             else:
                 # state, state_mask, action and action_mask - stack to form batch dimension
                 batch[key] = torch.from_numpy(np.stack(values))
-        return BatchFeature(data={"inputs": batch})
+        # ZeRO-3 discovers backward tensors only in tensors and builtin
+        # containers. BatchFeature (UserDict) at the model boundary hides them.
+        return {"inputs": batch}
 
     def __str__(self):
         return f"Gr00tN1d7DataCollator(model_name={self.model_name}, model_type={self.model_type})"

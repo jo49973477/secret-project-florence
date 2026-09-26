@@ -44,6 +44,46 @@ from gr00t.utils.dist_utils import run_on_rank0, run_or_wait_on_rank0
 from gr00t.utils.initial_actions import INITIAL_ACTIONS_FILENAME, save_initial_actions
 
 
+def _log_zero3_backward_state(model: torch.nn.Module) -> None:
+    """Log bounded parameter metadata after a failed opt-in ZeRO-3 backward."""
+    prefixes = (
+        "point_encoder.backbone",
+        "point_encoder.projection",
+        "tactile_encoder.backbone",
+        "tactile_encoder.projection",
+        "point_cross_attention",
+        "tactile_cross_attention",
+        "point_gates",
+        "tactile_gates",
+    )
+    seen: set[str] = set()
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    for name, parameter in model.named_parameters():
+        category = next((prefix for prefix in prefixes if prefix in name), None)
+        if category is None:
+            continue
+        # Include the deep Concerto sparse kernels, especially the 512-channel
+        # CPE weights matching the reported backward dimension.
+        sparse_kernel = ".cpe.0.weight" in name
+        if category in seen and not sparse_kernel:
+            continue
+        if not sparse_kernel:
+            seen.add(category)
+        logging.warning(
+            "ZeRO-3 backward state rank=%s parameter=%s shape=%s numel=%s "
+            "ds_shape=%s ds_numel=%s ds_status=%s requires_grad=%s grad_shape=%s",
+            rank,
+            name,
+            tuple(parameter.shape),
+            parameter.numel(),
+            getattr(parameter, "ds_shape", None),
+            getattr(parameter, "ds_numel", None),
+            getattr(parameter, "ds_status", None),
+            parameter.requires_grad,
+            tuple(parameter.grad.shape) if parameter.grad is not None else None,
+        )
+
+
 def setup_logging(debug: bool = False):
     """Configure logging."""
     logging.basicConfig(
@@ -407,14 +447,20 @@ def run(config: Config):
         trainer.add_callback(notification_callback)
 
     if config.training.save_best_eval_metric_name != "":
-        trainer.add_callback(
-            BestMetricCheckpointCallback(
-                metric_name=config.training.save_best_eval_metric_name,
-                greater_is_better=config.training.save_best_eval_metric_greater_is_better,
-                exp_cfg_dir=save_cfg_dir,
-                trainer=trainer,
+        if deepspeed_config is not None and config.training.deepspeed_stage == 3:
+            logging.warning(
+                "Best-metric model snapshots are disabled under ZeRO-3; use the explicit "
+                "checkpoint export tool to consolidate a selected resumable checkpoint."
             )
-        )
+        else:
+            trainer.add_callback(
+                BestMetricCheckpointCallback(
+                    metric_name=config.training.save_best_eval_metric_name,
+                    greater_is_better=config.training.save_best_eval_metric_greater_is_better,
+                    exp_cfg_dir=save_cfg_dir,
+                    trainer=trainer,
+                )
+            )
 
     if hasattr(train_dataset, "get_initial_actions"):
         run_on_rank0(save_initial_actions_artifact, train_dataset, save_cfg_dir)
@@ -422,6 +468,10 @@ def run(config: Config):
     # Train and finalize. Catch ordinary Python exceptions only: notifications are
     # best-effort, then the original failure is re-raised with its traceback.
     logging.info("🚀 Starting training...")
+    zero3_debug = os.environ.get("GR00T_ZERO3_DEBUG", "").lower() in {"1", "true", "yes"}
+    if zero3_debug:
+        logging.warning("ZeRO-3 debug enabled: autograd anomaly detection is active")
+        torch.autograd.set_detect_anomaly(True)
     try:
         if config.training.enable_profiling:
             from functools import partial
@@ -456,9 +506,24 @@ def run(config: Config):
         else:
             trainer.train(resume_from_checkpoint=config.training.resume_from_checkpoint)
 
-        # The success notification is intentionally after this final save.
-        trainer.save_model()
-        logging.info(f"Model saved to {output_dir}")
+        # A public Trainer.save_model() consolidates ZeRO-3 parameters. Preserve
+        # native resumability at the end without doing that full-model gather.
+        if deepspeed_config is not None and config.training.deepspeed_stage == 3:
+            final_checkpoint = output_dir / f"checkpoint-{trainer.state.global_step}"
+            if trainer.state.global_step > 0 and not final_checkpoint.exists():
+                logging.info(
+                    "Saving final native ZeRO-3 training checkpoint at step %d",
+                    trainer.state.global_step,
+                )
+                trainer._save_checkpoint(trainer.model, trial=None)
+            logging.info(
+                "Final ZeRO-3 training state is resumable at %s; use "
+                "scripts/export_zero3_checkpoint.py for an inference model.",
+                final_checkpoint,
+            )
+        else:
+            trainer.save_model()
+            logging.info(f"Model saved to {output_dir}")
 
         if config.training.assert_loss_less_than is not None:
             final_loss = trainer.loss
@@ -475,6 +540,13 @@ def run(config: Config):
         for notification_callback in notification_callbacks:
             notification_callback.notify_finish(args=trainer.args, state=trainer.state)
     except Exception as exc:
+        if zero3_debug:
+            try:
+                _log_zero3_backward_state(trainer.model_wrapped or model)
+            except Exception as diagnostic_error:
+                logging.warning(
+                    "ZeRO-3 state diagnostic failed (%s)", type(diagnostic_error).__name__
+                )
         for notification_callback in notification_callbacks:
             notification_callback.notify_failure(exc, args=trainer.args, state=trainer.state)
         raise

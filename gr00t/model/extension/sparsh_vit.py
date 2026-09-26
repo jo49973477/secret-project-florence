@@ -81,6 +81,25 @@ class PatchEmbed(nn.Module):
         return self.proj(x).flatten(2).transpose(1, 2)
 
 
+class SparshLayerNorm(nn.LayerNorm):
+    """Accumulate normalization in FP32 without changing checkpoint parameters.
+
+    ZeRO/BF16 may store affine weights in BF16 while convolution/attention
+    autocast and positional embeddings produce a different activation dtype.
+    Cast the operation's inputs, not the registered Parameters, then return to
+    the incoming activation dtype.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.layer_norm(
+            x.float(),
+            self.normalized_shape,
+            self.weight.float() if self.weight is not None else None,
+            self.bias.float() if self.bias is not None else None,
+            self.eps,
+        ).to(dtype=x.dtype)
+
+
 class Attention(nn.Module):
     def __init__(self, dim: int = 768, num_heads: int = 12) -> None:
         super().__init__()
@@ -96,7 +115,8 @@ class Attention(nn.Module):
         qkv = self.qkv(x).reshape(batch, tokens, 3, self.num_heads, channels // self.num_heads)
         qkv = qkv.permute(2, 0, 3, 1, 4)
         query, key, value = qkv[0] * self.scale, qkv[1], qkv[2]
-        attention = (query @ key.transpose(-2, -1)).softmax(dim=-1)
+        attention = (query @ key.transpose(-2, -1)).float().softmax(dim=-1)
+        attention = attention.to(dtype=value.dtype)
         attention = self.attn_drop(attention)
         x = (attention @ value).transpose(1, 2).reshape(batch, tokens, channels)
         return self.proj_drop(self.proj(x))
@@ -108,7 +128,7 @@ class LayerScale(nn.Module):
         self.gamma = nn.Parameter(init_values * torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x * self.gamma
+        return x * self.gamma.to(dtype=x.dtype)
 
 
 class Mlp(nn.Module):
@@ -127,11 +147,11 @@ class Mlp(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim: int = 768, num_heads: int = 12) -> None:
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim, eps=1e-6)
+        self.norm1 = SparshLayerNorm(dim, eps=1e-6)
         self.attn = Attention(dim=dim, num_heads=num_heads)
         self.ls1 = LayerScale(dim, init_values=1.0)
         self.drop_path1 = nn.Identity()
-        self.norm2 = nn.LayerNorm(dim, eps=1e-6)
+        self.norm2 = SparshLayerNorm(dim, eps=1e-6)
         self.mlp = Mlp(dim=dim, hidden_dim=dim * 4)
         self.ls2 = LayerScale(dim, init_values=1.0)
         self.drop_path2 = nn.Identity()
@@ -167,7 +187,7 @@ class SparshVisionTransformer(nn.Module):
             embed_dim=self.embed_dim,
         )
         self.blocks = nn.ModuleList([Block(dim=self.embed_dim, num_heads=12) for _ in range(12)])
-        self.norm = nn.LayerNorm(self.embed_dim, eps=1e-6)
+        self.norm = SparshLayerNorm(self.embed_dim, eps=1e-6)
         self.head = nn.Identity()
         self._init_weights()
 
@@ -193,9 +213,13 @@ class SparshVisionTransformer(nn.Module):
                 f"Sparsh backbone expects spatial size {self.img_size}, got {tuple(x.shape[-2:])}."
             )
         x = self.patch_embed(x)
-        # The official implementation materializes sinusoidal positions in fp32.
-        x = x + self.pos_embed(x.device).float().unsqueeze(0)
-        x = torch.cat((self.register_tokens.expand(x.shape[0], -1, -1), x), dim=1)
+        # Generate the sinusoidal encoding in FP32, then join the BF16 compute
+        # stream explicitly. A bare BF16 + FP32 add promotes the entire ViT to
+        # FP32 and fails at LayerNorm with ZeRO's BF16 affine parameters.
+        positions = self.pos_embed(x.device).float().to(dtype=x.dtype)
+        x = x + positions.unsqueeze(0)
+        register_tokens = self.register_tokens.to(dtype=x.dtype).expand(x.shape[0], -1, -1)
+        x = torch.cat((register_tokens, x), dim=1)
         for block in self.blocks:
             x = block(x)
         x_norm = self.norm(x)
@@ -209,4 +233,4 @@ class SparshVisionTransformer(nn.Module):
         return self.forward_features(x)["x_norm_patchtokens"]
 
 
-__all__ = ["SparshVisionTransformer"]
+__all__ = ["SparshLayerNorm", "SparshVisionTransformer"]

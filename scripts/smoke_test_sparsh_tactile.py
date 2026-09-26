@@ -37,9 +37,19 @@ def main() -> None:
         dtype=torch.uint8,
         device=device,
     )
-    tokens = encoder(tactile)
-    loss = tokens.float().square().mean()
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        tokens = encoder(tactile)
+        loss = tokens.float().square().mean()
     loss.backward()
+    if not torch.isfinite(tokens).all() or not torch.isfinite(loss):
+        raise RuntimeError("Sparsh BF16 smoke test produced non-finite tokens or loss.")
+    for name, parameter in (
+        ("patch embedding", encoder.backbone.patch_embed.proj.weight),
+        ("first attention QKV", encoder.backbone.blocks[0].attn.qkv.weight),
+        ("projection", encoder.projection[1].weight),
+    ):
+        if parameter.grad is None or not torch.isfinite(parameter.grad).all():
+            raise RuntimeError(f"Sparsh BF16 smoke test did not produce a finite {name} gradient.")
     print(
         f"PASS input={tuple(tactile.shape)} tokens={tuple(tokens.shape)} "
         f"dtype={tokens.dtype} loss={loss.item():.6g}"

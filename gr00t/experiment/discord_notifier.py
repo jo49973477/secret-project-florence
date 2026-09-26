@@ -12,6 +12,7 @@ import logging
 import os
 import sys
 from typing import Any
+import urllib.error
 import urllib.request
 
 
@@ -20,6 +21,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_TIMEOUT_SECONDS = 5.0
 _MAX_CONTENT_LENGTH = 2000
 _TRUNCATION_MARKER = "\n… message truncated …\n"
+_USER_AGENT = "secret-project-florence/1.0"
 
 
 def validate_discord_configuration(
@@ -83,7 +85,10 @@ class DiscordNotifier:
             request = urllib.request.Request(
                 self._webhook_url,
                 data=payload,
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": _USER_AGENT,
+                },
                 method="POST",
             )
             with self._opener(request, timeout=self._timeout) as response:
@@ -91,6 +96,12 @@ class DiscordNotifier:
                 if not 200 <= status < 300:
                     raise RuntimeError("Discord API returned a non-success status")
             return True
+        except urllib.error.HTTPError as exc:
+            logger.warning(
+                "Discord notification failed (HTTP %s); training will continue.",
+                exc.code,
+            )
+            return False
         except Exception as exc:
             # urllib exception strings may contain the credential-bearing request URL.
             logger.warning(

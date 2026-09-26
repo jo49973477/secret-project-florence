@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 
 from gr00t.data.types import ModalityConfig, VLAStepData
+from gr00t.model.extension.sparsh_vit import SparshLayerNorm, SparshVisionTransformer
 import gr00t.model.extension.tactile_encoder as tactile_module
 from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7Processor
 import numpy as np
@@ -165,7 +166,92 @@ def test_saved_state_reconstructs_without_original_checkpoint(tiny_sparsh, tmp_p
     )
 
     restored.load_state_dict(saved_state, strict=True)
+    restored.validate_pretrained_backbone("embedded GR00T checkpoint")
 
+    assert restored.pretrained_loaded is True
     for expected, actual in zip(source.parameters(), restored.parameters()):
         torch.testing.assert_close(expected, actual)
     torch.testing.assert_close(source.background, restored.background)
+
+
+def test_sparsh_layer_norm_handles_bf16_activations_and_weights() -> None:
+    norm = SparshLayerNorm(8).to(dtype=torch.bfloat16)
+    activation = torch.randn(2, 3, 8, dtype=torch.bfloat16, requires_grad=True)
+    output = norm(activation)
+    output.float().square().mean().backward()
+
+    assert output.dtype == torch.bfloat16
+    assert torch.isfinite(output).all()
+    assert activation.grad is not None and torch.isfinite(activation.grad).all()
+    assert norm.weight.grad is not None and torch.isfinite(norm.weight.grad).all()
+    assert set(norm.state_dict()) == {"weight", "bias"}
+
+
+def test_sparsh_bf16_vit_forward_backward_keeps_parameters_and_preprocessing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Exercise the real Sparsh block/position/register/LayerNorm logic at a
+    # tiny resolution, without downloading the 345 MB official checkpoint.
+    monkeypatch.setattr(SparshVisionTransformer, "img_size", (16, 16))
+    monkeypatch.setattr(SparshVisionTransformer, "embed_dim", 24)
+    monkeypatch.setattr(tactile_module.SparshDinoTactileEncoder, "official_image_size", (16, 16))
+    monkeypatch.setattr(tactile_module.SparshDinoTactileEncoder, "backbone_dim", 24)
+    encoder = tactile_module.SparshDinoTactileEncoder(output_dim=8, load_pretrained=False).to(
+        dtype=torch.bfloat16
+    )
+    parameter_ids = {name: id(parameter) for name, parameter in encoder.named_parameters()}
+    norm_inputs = []
+    handle = encoder.backbone.blocks[0].norm1.register_forward_pre_hook(
+        lambda _module, inputs: norm_inputs.append(inputs[0].dtype)
+    )
+    raw_tactile = torch.rand(1, 2, 3, 16, 16, dtype=torch.float32)
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        tokens = encoder(raw_tactile)
+        loss = tokens.float().square().mean()
+    loss.backward()
+    handle.remove()
+
+    assert encoder.preprocess(raw_tactile).dtype == torch.float32
+    assert norm_inputs == [torch.bfloat16]
+    assert tokens.shape == (1, 1, 8)
+    assert tokens.dtype == torch.bfloat16
+    assert torch.isfinite(tokens).all()
+    assert {name: id(parameter) for name, parameter in encoder.named_parameters()} == parameter_ids
+    for parameter in (
+        encoder.backbone.patch_embed.proj.weight,
+        encoder.backbone.blocks[0].attn.qkv.weight,
+        encoder.projection[1].weight,
+    ):
+        assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_sparsh_cuda_bf16_forward_backward_without_layer_norm_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(SparshVisionTransformer, "img_size", (16, 16))
+    monkeypatch.setattr(SparshVisionTransformer, "embed_dim", 24)
+    monkeypatch.setattr(tactile_module.SparshDinoTactileEncoder, "official_image_size", (16, 16))
+    monkeypatch.setattr(tactile_module.SparshDinoTactileEncoder, "backbone_dim", 24)
+    encoder = tactile_module.SparshDinoTactileEncoder(output_dim=8, load_pretrained=False).to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    ids_before = {name: id(parameter) for name, parameter in encoder.named_parameters()}
+    raw_tactile = torch.rand(1, 2, 3, 16, 16, device="cuda", dtype=torch.float32)
+
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        tokens = encoder(raw_tactile)
+        loss = tokens.float().square().mean()
+    loss.backward()
+
+    assert tokens.dtype == torch.bfloat16
+    assert torch.isfinite(tokens).all()
+    assert ids_before == {name: id(parameter) for name, parameter in encoder.named_parameters()}
+    for parameter in (
+        encoder.backbone.patch_embed.proj.weight,
+        encoder.backbone.blocks[0].attn.qkv.weight,
+        encoder.projection[1].weight,
+    ):
+        assert parameter.grad is not None and torch.isfinite(parameter.grad).all()

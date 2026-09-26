@@ -58,6 +58,15 @@ def _rec_to_dtype(x: Any, dtype: torch.dtype) -> Any:
         return x
 
 
+def _prepare_policy_model_inputs(collated_inputs: Any, model: Any) -> Any:
+    """Leave N1.7 raw sensor dtypes intact; retain legacy policy casting."""
+    if getattr(getattr(model, "config", None), "model_type", None) == "Gr00tN1d7":
+        # Gr00tN1d7.prepare_input assigns dtype by semantic field. Casting
+        # here would irreversibly quantize XYZ and tactile pixels to BF16.
+        return collated_inputs
+    return _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
+
+
 def _sim_language_batch_to_sequence(value: Any) -> Any:
     """Normalize sim language batches while preserving validation semantics."""
     if isinstance(value, np.ndarray):
@@ -517,7 +526,7 @@ class Gr00tPolicy(BasePolicy):
 
         # Step 3: Collate processed inputs into a single batch for model
         collated_inputs = self.collate_fn(processed_inputs)
-        collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
+        collated_inputs = _prepare_policy_model_inputs(collated_inputs, self.model)
 
         # Step 4: Run model inference to predict actions
         with torch.inference_mode():

@@ -285,12 +285,14 @@ class TestProcessorCall:
         assert 0.0 <= result["tactile"].min() <= result["tactile"].max() <= 1.0
 
         collator = object.__new__(processor.data_collator_class)
-        batch = collator(
+        collated = collator(
             [
                 {"points": result["points"].numpy(), "tactile": result["tactile"].numpy()},
                 {"points": result["points"].numpy(), "tactile": result["tactile"].numpy()},
             ]
-        )["inputs"]
+        )
+        assert type(collated) is dict
+        batch = collated["inputs"]
         assert batch["points"].shape == (2, 32, 3)
         assert batch["tactile"].shape == (2, 2, 3, 24, 32)
 

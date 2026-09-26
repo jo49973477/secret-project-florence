@@ -187,6 +187,19 @@ def test_run_or_wait_on_rank0_no_dist_propagates_local_error():
             raise RuntimeError("local-only")
 
 
+def test_run_serialized_across_ranks_no_dist_runs_once_and_returns_value():
+    from gr00t.utils.dist_utils import run_serialized_across_ranks
+
+    calls = []
+
+    def operation():
+        calls.append("called")
+        return "result"
+
+    assert run_serialized_across_ranks(operation) == "result"
+    assert calls == ["called"]
+
+
 def test_run_on_rank0_no_dist_calls_fn_and_returns_result():
     """``run_on_rank0`` degenerates to a plain call returning the fn result."""
     from gr00t.utils.dist_utils import run_on_rank0
