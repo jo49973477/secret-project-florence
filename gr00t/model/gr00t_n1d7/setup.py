@@ -443,7 +443,10 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 use_relative_action=self.model_config.use_relative_action,
                 # State augmentation overrides
                 exclude_state=self.model_config.exclude_state,
-                state_dropout_prob=self.model_config.state_dropout_prob,
+                # The action head is the sole stochastic state-dropout site.
+                # Keeping processor-side dropout disabled avoids squaring the
+                # configured survival probability for each training sample.
+                state_dropout_prob=0.0,
                 use_mean_std=self.model_config.use_mean_std,
                 **self.transformers_loading_kwargs,
             )
@@ -472,7 +475,9 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 use_relative_action=self.model_config.use_relative_action,
                 # State augmentation
                 exclude_state=self.model_config.exclude_state,
-                state_dropout_prob=self.model_config.state_dropout_prob,
+                # Preserve legacy model configs while applying the configured
+                # probability only once, in the action head.
+                state_dropout_prob=0.0,
                 use_mean_std=self.model_config.use_mean_std,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
             )

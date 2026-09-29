@@ -162,6 +162,19 @@ def test_notifier_exception_does_not_escape_callback(tmp_path):
     callback.on_train_begin(_args(tmp_path), _state(), None)
 
 
+@pytest.mark.parametrize("result", [False, None])
+def test_failed_failure_delivery_is_not_marked_sent(tmp_path, result):
+    notifier = Mock()
+    notifier.send.return_value = result
+    callback, _ = _callback(tmp_path, notifier=notifier)
+    callback.notify_failure(RuntimeError("boom"), args=_args(tmp_path), state=_state())
+    assert callback._failure_sent is False
+    notifier.send.return_value = True
+    callback.notify_failure(RuntimeError("boom"), args=_args(tmp_path), state=_state())
+    assert callback._failure_sent is True
+    assert notifier.send.call_count == 2
+
+
 def test_one_transport_failure_does_not_prevent_another(tmp_path):
     failing_notifier = Mock()
     failing_notifier.send.side_effect = RuntimeError("transport failed")

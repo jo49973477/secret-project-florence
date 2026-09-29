@@ -766,11 +766,10 @@ class Gr00tN1d7Processor(BaseProcessor):
         exclude_state = self.exclude_state or getattr(
             self.modality_configs[embodiment_tag.value]["state"], "exclude_state", False
         )
-        if exclude_state or (
-            self.state_dropout_prob > 0
-            and random.random() < self.state_dropout_prob
-            and self.training
-        ):
+        # State dropout is applied once, after the action-head state encoder.
+        # Keep state_dropout_prob in the processor config for old serialized
+        # processors, but never perform a second sample-level dropout here.
+        if exclude_state:
             normalized_states = torch.cat(
                 [torch.from_numpy(np.zeros_like(state_data[key])) for key in state_keys], dim=-1
             )

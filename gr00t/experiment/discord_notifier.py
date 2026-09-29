@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import sys
+import time
 from typing import Any
 import urllib.error
 import urllib.request
@@ -22,6 +23,8 @@ _DEFAULT_TIMEOUT_SECONDS = 5.0
 _MAX_CONTENT_LENGTH = 2000
 _TRUNCATION_MARKER = "\n… message truncated …\n"
 _USER_AGENT = "secret-project-florence/1.0"
+_MAX_ATTEMPTS = 3
+_MAX_BACKOFF_SECONDS = 1.0
 
 
 def validate_discord_configuration(
@@ -59,10 +62,12 @@ class DiscordNotifier:
         webhook_url: str,
         timeout: float = _DEFAULT_TIMEOUT_SECONDS,
         opener: Callable[..., Any] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._webhook_url = webhook_url
         self._timeout = timeout
         self._opener = urllib.request.urlopen if opener is None else opener
+        self._sleep = sleep
 
     @classmethod
     def from_environment(
@@ -71,44 +76,63 @@ class DiscordNotifier:
         timeout: float = _DEFAULT_TIMEOUT_SECONDS,
         environ: Mapping[str, str] | None = None,
         opener: Callable[..., Any] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> DiscordNotifier:
         webhook_url = validate_discord_configuration(enabled=True, environ=environ)
-        return cls(webhook_url=webhook_url, timeout=timeout, opener=opener)
+        return cls(webhook_url=webhook_url, timeout=timeout, opener=opener, sleep=sleep)
 
     def send(self, message: str) -> bool:
         """Send one plain-text message, returning false on every transport failure."""
-        try:
-            payload = json.dumps(
-                {"content": _truncate_content(message)}, ensure_ascii=False
-            ).encode("utf-8")
-            # Never log the request or URL: Discord webhook URLs contain credentials.
-            request = urllib.request.Request(
-                self._webhook_url,
-                data=payload,
-                headers={
-                    "Content-Type": "application/json",
-                    "User-Agent": _USER_AGENT,
-                },
-                method="POST",
-            )
-            with self._opener(request, timeout=self._timeout) as response:
-                status = getattr(response, "status", 204)
-                if not 200 <= status < 300:
-                    raise RuntimeError("Discord API returned a non-success status")
-            return True
-        except urllib.error.HTTPError as exc:
-            logger.warning(
-                "Discord notification failed (HTTP %s); training will continue.",
-                exc.code,
-            )
+        payload = json.dumps({"content": _truncate_content(message)}, ensure_ascii=False).encode(
+            "utf-8"
+        )
+        # Never log the request or URL: Discord webhook URLs contain credentials.
+        request = urllib.request.Request(
+            self._webhook_url,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": _USER_AGENT,
+            },
+            method="POST",
+        )
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            try:
+                with self._opener(request, timeout=self._timeout) as response:
+                    status = getattr(response, "status", 204)
+                if 200 <= status < 300:
+                    return True
+                retry_after = None
+                retryable = status in {429, 500, 502, 503, 504}
+            except urllib.error.HTTPError as exc:
+                status = exc.code
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                retryable = status in {429, 500, 502, 503, 504}
+            except Exception as exc:
+                status = None
+                retry_after = None
+                retryable = isinstance(exc, (urllib.error.URLError, TimeoutError, OSError))
+                error_type = type(exc).__name__
+
+            if retryable and attempt < _MAX_ATTEMPTS:
+                logger.warning("Discord notification retry %s/%s", attempt + 1, _MAX_ATTEMPTS)
+                try:
+                    delay = (
+                        float(retry_after)
+                        if retry_after is not None
+                        else 0.25 * (2 ** (attempt - 1))
+                    )
+                except (TypeError, ValueError):
+                    delay = 0.25 * (2 ** (attempt - 1))
+                self._sleep(min(_MAX_BACKOFF_SECONDS, max(0.0, delay)))
+                continue
+            if status is not None:
+                logger.warning("Discord notification failed: HTTP %s", status)
+            else:
+                logger.warning("Discord notification failed (%s)", error_type)
+            logger.warning("Discord notification delivery failed permanently")
             return False
-        except Exception as exc:
-            # urllib exception strings may contain the credential-bearing request URL.
-            logger.warning(
-                "Discord notification failed (%s); training will continue.",
-                type(exc).__name__,
-            )
-            return False
+        return False
 
 
 def _main(argv: list[str] | None = None) -> int:

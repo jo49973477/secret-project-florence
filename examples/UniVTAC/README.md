@@ -13,6 +13,8 @@ It can now optionally add one tactile RGB stream and a fixed-size point cloud. T
 
 The maintained UniVTAC alignment is unchanged: `joint[:-1, :8]` is state, `joint[1:, :8]` is action, and all observation streams use their first `T-1` samples. The stored action is still an absolute target. `ActionRepresentation.RELATIVE` in the config performs the relative transform inside GR00T.
 
+The shared RGB and multimodal configs use action horizon 16. For an episode of length `T`, the sharded single-step dataset can use `T-H+1` anchors for horizon `H` (before other data filters): horizon 16 yields `T-15`, while horizon 40 yields `T-39`, losing 24 otherwise-valid anchors per episode. `build_univtac_config(multimodal=..., action_horizon=40)` remains available for an explicit horizon-40 run.
+
 ## Expected input
 
 The official download is arranged as task directories containing HDF5 episodes. The converter also accepts freshly collected `data/<task>/<config>/hdf5/*.hdf5` trees because it searches recursively.
@@ -430,7 +432,24 @@ Use `--no-use-point-conditioning` or `--no-use-tactile-conditioning` for a singl
 
 ## Current Limitations
 
-The extension includes pretrained Sparsh-DINO-Base plus a scratch ResNet-18 ablation, Concerto/lightweight point-encoder choices, and gated action-token cross-attention. It does **not** fuse point and tactile representations before the action DiT. Point coordinates remain in the selected depth camera frame and receive no dataset-statistics normalization.
+The extension includes pretrained Sparsh-DINO-Base plus a scratch ResNet-18 ablation, Concerto/lightweight point-encoder choices, and gated action-token cross-attention. It does **not** fuse point and tactile representations before the action DiT. UniVTAC scene points are fused into a common frame before storage and Concerto applies per-scene centering. When a sparse scene is densified, valid points are repeated to fill fixed-size storage; Concerto currently treats those repeated rows as observations. The original valid count is recorded in conversion diagnostics, but the per-frame validity mask is not part of LeRobot samples, so existing point clouds cannot recover the exact mask safely. This is a potential sampling-weight risk; it does not justify dataset reconversion without evidence that affected frames are common or materially degrading.
+
+## Controlled training runs
+
+Run one experiment at a time, using the same dataset, base model, and overrides. Each run gets a timestamped fresh output directory and never resumes an existing run. The defaults are 2 GPUs, global batch 4, accumulation 8 (effective batch 32), 1,000 optimizer steps, 5% warmup, LR `1e-4`, and state dropout 0.
+
+```bash
+EXPERIMENT=A TRAIN_GPUS=0,1 NUM_GPUS=2 DATASET_PATH=/path/to/univtac \
+  bash scripts/launch_univtac_controlled_experiment.sh
+EXPERIMENT=B TRAIN_GPUS=0,1 NUM_GPUS=2 DATASET_PATH=/path/to/univtac \
+  bash scripts/launch_univtac_controlled_experiment.sh
+EXPERIMENT=C TRAIN_GPUS=0,1 NUM_GPUS=2 DATASET_PATH=/path/to/univtac_multimodal \
+  bash scripts/launch_univtac_controlled_experiment.sh
+```
+
+A is the RGB `AlternateVLDiT` baseline; B swaps in the multimodal DiT with both sensor branches disabled; C enables point and tactile conditioning. Compare A vs B for architecture parity, then B vs C for sensor contribution. These are short diagnostics, not evidence that a 10,000-step plateau is fixed.
+
+Multimodal diagnostics are included in the standard Trainer logs every 50 optimizer steps: masked target/prediction velocity scales, zero-prediction MSE, valid action ratio, enabled gate magnitudes, and available sensor/adapter gradient norms. Zero-initialized gates can have nonzero gate gradients while the encoder and cross-attention gradients remain zero at the start; those sensor gradients are expected to appear only after gates move. Frozen or disabled branches have no corresponding gradient/gate metric. These local scalar summaries are synchronized only at log intervals.
 
 ## Backward Compatibility
 

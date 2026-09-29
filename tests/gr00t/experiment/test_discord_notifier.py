@@ -74,7 +74,8 @@ def test_http_error_reports_safe_status_without_leaking_webhook(caplog):
     with caplog.at_level(logging.WARNING):
         assert notifier.send("message") is False
 
-    assert "Discord notification failed (HTTP 403); training will continue." in caplog.text
+    assert "Discord notification failed: HTTP 403" in caplog.text
+    assert "delivery failed permanently" in caplog.text
     assert WEBHOOK_URL not in caplog.text
     assert "super-secret-token" not in caplog.text
 
@@ -89,7 +90,39 @@ def test_network_failure_returns_false_without_leaking_webhook(caplog):
 
     assert WEBHOOK_URL not in caplog.text
     assert "super-secret-token" not in caplog.text
-    assert "Discord notification failed (URLError); training will continue." in caplog.text
+    assert "Discord notification failed (URLError)" in caplog.text
+
+
+@pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
+def test_transient_http_status_retries_with_bounded_attempts(status):
+    calls = []
+    delays = []
+
+    def opener(request, *, timeout):
+        calls.append(timeout)
+        if len(calls) < 3:
+            raise urllib.error.HTTPError(request.full_url, status, "temporary", {"Retry-After": "0"}, None)
+        return _Response(204)
+
+    notifier = DiscordNotifier(webhook_url=WEBHOOK_URL, opener=opener, sleep=delays.append)
+    assert notifier.send("message") is True
+    assert len(calls) == 3
+    assert delays == [0.0, 0.0]
+
+
+def test_permanent_http_status_is_not_retried(caplog):
+    calls = []
+
+    def opener(request, *, timeout):
+        calls.append(1)
+        raise urllib.error.HTTPError(request.full_url, 403, "Forbidden", {}, None)
+
+    notifier = DiscordNotifier(webhook_url=WEBHOOK_URL, opener=opener, sleep=lambda _: None)
+    with caplog.at_level(logging.WARNING):
+        assert notifier.send("message") is False
+    assert len(calls) == 1
+    assert "delivery failed permanently" in caplog.text
+    assert WEBHOOK_URL not in caplog.text
 
 
 def test_oversized_message_is_safely_truncated():

@@ -36,13 +36,16 @@ GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-2}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-16}"
 
 LR_VLM="${LR_VLM:-1e-4}"
-LR_ACTION_HEAD="${LR_ACTION_HEAD:-1e-3}"
+LR_ACTION_HEAD="${LR_ACTION_HEAD:-1e-4}"
+LR_CONCERTO="${LR_CONCERTO:-${LR_ACTION_HEAD}}"
+LR_SPARSH="${LR_SPARSH:-${LR_ACTION_HEAD}}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-5}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.05}"
 
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-0}"
 
 EPISODE_SAMPLING_RATE="${EPISODE_SAMPLING_RATE:-1.0}"
+DISCORD_ON="${DISCORD_ON:-0}"
 
 RUN_NAME="${RUN_NAME:-univtac_full_multimodal_$(date +%Y%m%d_%H%M%S)}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/${RUN_NAME}}"
@@ -89,20 +92,33 @@ fi
 mkdir -p "${OUTPUT_DIR}/logs"
 
 EFFECTIVE_BATCH=$((GLOBAL_BATCH_SIZE * GRAD_ACCUM_STEPS))
+if (( NUM_GPUS <= 0 || GLOBAL_BATCH_SIZE % NUM_GPUS != 0 )); then
+    echo "[ERROR] GLOBAL_BATCH_SIZE must be divisible by NUM_GPUS" >&2
+    exit 1
+fi
+MICRO_BATCH_PER_DEVICE=$((GLOBAL_BATCH_SIZE / NUM_GPUS))
+WARMUP_STEPS=$(awk -v steps="${MAX_STEPS}" -v ratio="${WARMUP_RATIO}" \
+    'BEGIN { printf "%d", int(steps * ratio + 0.999999) }')
 
 echo "============================================================"
 echo "UniVTAC FULL Multimodal Fine-tuning"
 echo "============================================================"
 echo "GPUs                : ${TRAIN_GPUS}"
+echo "Number of GPUs      : ${NUM_GPUS}"
 echo "Dataset             : ${DATASET_PATH}"
 echo "Config              : ${MODALITY_CONFIG}"
 echo "Output              : ${OUTPUT_DIR}"
 echo "Max steps           : ${MAX_STEPS}"
 echo "Global batch        : ${GLOBAL_BATCH_SIZE}"
+echo "Per-device microbatch: ${MICRO_BATCH_PER_DEVICE}"
 echo "Grad accumulation   : ${GRAD_ACCUM_STEPS}"
 echo "Effective batch     : ${EFFECTIVE_BATCH}"
+echo "Warmup ratio        : ${WARMUP_RATIO}"
+echo "Calculated warmup   : ${WARMUP_STEPS} steps"
 echo "VLM LR              : ${LR_VLM}"
 echo "Action Head LR      : ${LR_ACTION_HEAD}"
+echo "Concerto LR         : ${LR_CONCERTO}"
+echo "Sparsh LR           : ${LR_SPARSH}"
 echo "Episode sampling    : ${EPISODE_SAMPLING_RATE}"
 echo "DeepSpeed stage : ${DEEPSPEED_STAGE}"
 checkpoint_resume_print_status "${OUTPUT_DIR}"
@@ -145,6 +161,8 @@ TRAIN_ARGS=(
 
     --vlm-learning-rate "${LR_VLM}"
     --action-head-learning-rate "${LR_ACTION_HEAD}"
+    --point-encoder-learning-rate "${LR_CONCERTO}"
+    --tactile-encoder-learning-rate "${LR_SPARSH}"
     --weight-decay "${WEIGHT_DECAY}"
     --warmup-ratio "${WARMUP_RATIO}"
 
@@ -156,7 +174,7 @@ TRAIN_ARGS=(
     --use-point-conditioning
     --use-tactile-conditioning
 
-    --point-input-dim 3
+    --point-input-dim 6
 
     --no-tune-llm
     --no-tune-visual
@@ -172,9 +190,18 @@ TRAIN_ARGS=(
     "${CHECKPOINT_SAVE_ARGS[@]}"
     "${CHECKPOINT_RESUME_ARGS[@]}"
 )
+if [[ "${DISCORD_ON}" == "1" ]]; then
+    TRAIN_ARGS+=(--discord-on)
+    export GR00T_SUPERVISOR_NOTIFY=1
+fi
+export GR00T_EXPERIMENT_NAME="${RUN_NAME}"
+export GR00T_OUTPUT_DIR="${OUTPUT_DIR}"
+export GR00T_TRAIN_LOG="${OUTPUT_DIR}/logs/train.log"
 
 CUDA_VISIBLE_DEVICES="${TRAIN_GPUS}" \
-uv run torchrun \
+uv run python -m gr00t.experiment.torchrun_supervisor \
+    --marker "${OUTPUT_DIR}/.gr00t-failure-notification-delivered" \
+    -- uv run torchrun \
     --nproc-per-node="${NUM_GPUS}" \
     --master-port="${MASTER_PORT}" \
     gr00t/experiment/launch_finetune.py \

@@ -669,6 +669,11 @@ class ConcertoPointEncoder(nn.Module):
         """Return newly initialized GR00T projection parameters."""
         return self.projection.parameters()
 
+    def set_trainable(self, *, backbone: bool, projection: bool) -> None:
+        """Freeze pretrained Concerto independently from its GR00T projection."""
+        self.backbone.requires_grad_(backbone)
+        self.projection.requires_grad_(projection)
+
     def _prepare_batch(
         self, points: torch.Tensor, point_mask: torch.Tensor
     ) -> tuple[dict[str, torch.Tensor | float], list[int]]:

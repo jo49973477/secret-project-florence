@@ -11,15 +11,21 @@ from gr00t.data.types import (
     ModalityConfig,
 )
 
+ACTION_HORIZON = 16
 
-def build_univtac_config(*, multimodal: bool) -> dict[str, ModalityConfig]:
+
+def build_univtac_config(
+    *, multimodal: bool, action_horizon: int = ACTION_HORIZON
+) -> dict[str, ModalityConfig]:
     """Build the stable RGB baseline, optionally adding sensor modalities."""
+    if not 1 <= action_horizon <= 40:
+        raise ValueError(f"action_horizon must be between 1 and 40, got {action_horizon}")
     config = {
         "video": ModalityConfig(delta_indices=[0], modality_keys=["head", "wrist"]),
         "state": ModalityConfig(delta_indices=[0], modality_keys=["joint"]),
         "action": ModalityConfig(
-            # UniVTAC's ACT baseline uses 50, but N1.7 accepts at most 40.
-            delta_indices=list(range(40)),
+            # Longer horizons reduce valid windows at episode ends.
+            delta_indices=list(range(action_horizon)),
             modality_keys=["joint"],
             action_configs=[
                 ActionConfig(

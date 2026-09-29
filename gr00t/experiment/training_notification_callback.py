@@ -101,6 +101,7 @@ class TrainingNotificationCallback(TrainerCallback):
         notify_finish: bool = True,
         notify_error: bool = True,
         defer_finish_until_final_save: bool = False,
+        failure_delivery_marker: str | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.notifier = notifier
@@ -110,6 +111,7 @@ class TrainingNotificationCallback(TrainerCallback):
         self.notify_finish_enabled = notify_finish
         self.notify_error_enabled = notify_error
         self.defer_finish_until_final_save = defer_finish_until_final_save
+        self.failure_delivery_marker = failure_delivery_marker
         self._monotonic = monotonic
         self._created_at = monotonic()
         self._started_at: float | None = None
@@ -122,15 +124,16 @@ class TrainingNotificationCallback(TrainerCallback):
     def _is_world_process_zero(state: Any) -> bool:
         return bool(getattr(state, "is_world_process_zero", False))
 
-    def _send(self, message: str) -> None:
+    def _send(self, message: str) -> bool:
         try:
-            self.notifier.send(message)
+            return bool(self.notifier.send(message))
         except Exception as exc:
             # Third-party/custom transports must not be able to interrupt training.
             logger.warning(
                 "Training notification callback failed (%s); training will continue.",
                 type(exc).__name__,
             )
+            return False
 
     def _elapsed(self) -> str:
         start = self._started_at if self._started_at is not None else self._created_at
@@ -260,8 +263,6 @@ class TrainingNotificationCallback(TrainerCallback):
             or self._finish_sent
         ):
             return
-        self._failure_sent = True
-
         output_dir = str(getattr(args, "output_dir", self.context.output_dir))
         try:
             last_checkpoint = get_last_checkpoint(output_dir) or "none"
@@ -282,4 +283,15 @@ class TrainingNotificationCallback(TrainerCallback):
             "",
             f"Duration: {self._elapsed()}",
         ]
-        self._send("\n".join(lines))
+        if self._send("\n".join(lines)):
+            self._failure_sent = True
+            marker = self.failure_delivery_marker
+            if marker:
+                try:
+                    marker_path = Path(marker)
+                    marker_path.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = marker_path.with_name(f"{marker_path.name}.{time.time_ns()}.tmp")
+                    temporary.write_text("delivered\n", encoding="utf-8")
+                    os.replace(temporary, marker_path)
+                except OSError as exc:
+                    logger.warning("Could not record failure notification delivery (%s).", type(exc).__name__)

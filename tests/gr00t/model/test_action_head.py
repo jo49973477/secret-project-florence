@@ -24,6 +24,7 @@ import math
 from unittest.mock import patch
 
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
+from gr00t.model.extension.point_encoder import ConcertoPointEncoder
 from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7ActionHead
 import pytest
 import torch
@@ -148,6 +149,43 @@ def test_checkpoint_config_accepts_explicit_dropout_overrides(tmp_path):
     assert loaded.vl_self_attention_cfg["dropout"] == 0.0
     assert head.model.config.dropout == 0.0
     assert head.vl_self_attention.config.dropout == 0.0
+
+
+def test_zero_state_dropout_preserves_state_features_and_eval_disables_dropout():
+    config = _small_config(state_dropout_prob=0.0)
+    head = Gr00tN1d7ActionHead(config).train()
+    seen = []
+    handle = head.model.register_forward_pre_hook(
+        lambda _module, _args, kwargs: seen.append(kwargs["hidden_states"].detach().clone()),
+        with_kwargs=True,
+    )
+    inputs = _make_action_input(config, batch_size=1)
+    torch.manual_seed(4)
+    head(_make_backbone_output(config, batch_size=1), inputs)
+    first_state = seen[-1][:, :1].clone()
+    inputs["state"] = inputs["state"] + 1.0
+    torch.manual_seed(4)
+    head(_make_backbone_output(config, batch_size=1), inputs)
+    assert not torch.equal(first_state, seen[-1][:, :1])
+    handle.remove()
+
+    # A legacy p=1 config is deterministic in evaluation; the processor never
+    # performs a second stochastic state zeroing operation.
+    eval_head = Gr00tN1d7ActionHead(_small_config(state_dropout_prob=1.0)).eval()
+    eval_seen = []
+    hook = eval_head.model.register_forward_pre_hook(
+        lambda _module, _args, kwargs: eval_seen.append(kwargs["hidden_states"].detach().clone()),
+        with_kwargs=True,
+    )
+    eval_inputs = _make_action_input(eval_head.config, batch_size=1)
+    torch.manual_seed(10)
+    eval_head(_make_backbone_output(eval_head.config, batch_size=1), eval_inputs)
+    state_features = eval_seen[-1][:, :1].clone()
+    torch.manual_seed(99)
+    eval_head(_make_backbone_output(eval_head.config, batch_size=1), eval_inputs)
+    torch.testing.assert_close(eval_seen[-1][:, :1], state_features)
+    assert torch.count_nonzero(state_features) > 0
+    hook.remove()
 
 
 def test_sensor_bootstrap_is_deferred_until_explicit_post_load_stage() -> None:
@@ -302,6 +340,15 @@ class TestActionHeadForward:
         )
         assert torch.count_nonzero(first_output["action_loss"][~valid]) == 0
         assert torch.count_nonzero(second_output["action_loss"][~valid]) == 0
+        for name in (
+            "predicted_velocity_std",
+            "target_velocity_std",
+            "zero_prediction_mse",
+            "valid_action_ratio",
+        ):
+            torch.testing.assert_close(
+                first_output["diagnostics"][name], second_output["diagnostics"][name]
+            )
 
 
 class TestActionHeadGetAction:
@@ -644,3 +691,44 @@ class TestActionHeadTrainableParams:
         head.set_trainable_parameters(True, False, True)
         for p in head.model.parameters():
             assert not p.requires_grad
+
+    def test_concerto_backbone_and_projection_have_independent_freeze_controls():
+        encoder = ConcertoPointEncoder(
+            input_dim=6,
+            point_dim=8,
+            backbone=nn.Linear(9, 4),
+            backbone_output_dim=4,
+            pretrained_loaded=True,
+            load_pretrained=False,
+        )
+        config = _small_multimodal_config(
+            point_input_dim=6,
+            point_encoder_cfg="concerto_small",
+            use_point_conditioning=True,
+        )
+        with patch(
+            "gr00t.model.gr00t_n1d7.gr00t_n1d7.build_point_encoder", return_value=encoder
+        ):
+            head = Gr00tN1d7ActionHead(config)
+            head.set_trainable_parameters(
+                tune_projector=True,
+                tune_diffusion_model=False,
+                tune_vlln=True,
+                tune_point_encoder=False,
+                tune_multimodal_adapter=True,
+            )
+        assert all(not p.requires_grad for p in encoder.backbone.parameters())
+        assert all(p.requires_grad for p in encoder.projection.parameters())
+        assert all(
+            parameter.requires_grad == name.startswith(("point_", "tactile_"))
+            for name, parameter in head.model.named_parameters()
+        )
+
+        head.train()
+        head.set_frozen_modules_to_eval_mode()
+        assert not encoder.backbone.training
+        assert encoder.projection.training
+
+        features = torch.randn(2, 4, requires_grad=True)
+        encoder.projection(features).sum().backward()
+        assert any(parameter.grad is not None for parameter in encoder.projection.parameters())

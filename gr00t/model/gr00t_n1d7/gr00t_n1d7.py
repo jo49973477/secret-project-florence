@@ -27,7 +27,7 @@ import tree
 
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
 from gr00t.model.extension.multimodal_dit import MultiModalConditionedDiT
-from gr00t.model.extension.point_encoder import build_point_encoder
+from gr00t.model.extension.point_encoder import ConcertoPointEncoder, build_point_encoder
 from gr00t.model.extension.tactile_encoder import SparshDinoTactileEncoder, build_tactile_encoder
 from gr00t.model.modules.dit import AlternateVLDiT, DiT, SelfAttentionTransformer
 from gr00t.model.modules.embodiment_conditioned_mlp import (
@@ -329,7 +329,15 @@ class Gr00tN1d7ActionHead(nn.Module):
             # The base DiT can remain frozen while the new residual adapters train.
             self.model.set_multimodal_adapter_trainable(tune_multimodal_adapter)
         if self.point_encoder is not None:
-            self.point_encoder.requires_grad_(tune_point_encoder)
+            if isinstance(self.point_encoder, ConcertoPointEncoder):
+                self.point_encoder.set_trainable(
+                    backbone=tune_point_encoder,
+                    projection=tune_multimodal_adapter,
+                )
+            else:
+                # Preserve historical all-or-nothing freezing for PointNet++
+                # and other existing encoder implementations.
+                self.point_encoder.requires_grad_(tune_point_encoder)
         if self.tactile_encoder is not None:
             if isinstance(self.tactile_encoder, SparshDinoTactileEncoder):
                 self.tactile_encoder.set_trainable(
@@ -377,7 +385,12 @@ class Gr00tN1d7ActionHead(nn.Module):
                 and not self.tune_multimodal_adapter
             ):
                 self.model.set_multimodal_adapter_mode(False)
-            if self.point_encoder is not None and not self.tune_point_encoder:
+            if isinstance(self.point_encoder, ConcertoPointEncoder):
+                if not self.tune_point_encoder:
+                    self.point_encoder.backbone.eval()
+                if not self.tune_multimodal_adapter:
+                    self.point_encoder.projection.eval()
+            elif self.point_encoder is not None and not self.tune_point_encoder:
                 self.point_encoder.eval()
             if self.tactile_encoder is not None and not self.tune_tactile_encoder:
                 self.tactile_encoder.eval()
@@ -574,6 +587,30 @@ class Gr00tN1d7ActionHead(nn.Module):
         action_loss = action_loss * action_mask.float()
         loss = action_loss.sum() / (action_mask.float().sum() + 1e-6)
 
+        diagnostic_mask = action_mask.float()
+        valid_count = diagnostic_mask.sum().clamp_min(1.0)
+        pred_float = pred_actions.float()
+        target_float = velocity.float()
+        pred_mean = (pred_float * diagnostic_mask).sum() / valid_count
+        target_mean = (target_float * diagnostic_mask).sum() / valid_count
+        diagnostics = {
+            "predicted_velocity_std": (
+                (pred_float - pred_mean).square() * diagnostic_mask
+            ).sum().div(valid_count).sqrt(),
+            "target_velocity_std": (
+                (target_float - target_mean).square() * diagnostic_mask
+            ).sum().div(valid_count).sqrt(),
+            "zero_prediction_mse": (target_float.square() * diagnostic_mask).sum().div(valid_count),
+            "valid_action_ratio": action_mask.float().mean(),
+        }
+        if isinstance(self.model, MultiModalConditionedDiT):
+            if self.config.use_point_conditioning and point_tokens is not None:
+                diagnostics["point_gate_mean_abs"] = self.model.point_gates.detach().abs().mean()
+            if self.config.use_tactile_conditioning and tactile_tokens is not None:
+                diagnostics["tactile_gate_mean_abs"] = (
+                    self.model.tactile_gates.detach().abs().mean()
+                )
+
         if not self._dtype_diagnostics_logged and os.environ.get(
             "GR00T_DTYPE_DEBUG", ""
         ).lower() in {"1", "true", "yes"}:
@@ -600,6 +637,7 @@ class Gr00tN1d7ActionHead(nn.Module):
             "loss": loss,
             "action_loss": action_loss,
             "action_mask": action_mask,
+            "diagnostics": diagnostics,
             "backbone_features": vl_embeds,
             "state_features": state_features,
         }

@@ -35,7 +35,7 @@ class FinetuneConfig:
 
     dataset_path: str
     """Path to one dataset root, or an os.pathsep-separated list of dataset roots."""
-
+    
     embodiment_tag: str
     """Embodiment tag (name or value, case-insensitive). See EmbodimentTag for known tags."""
 
@@ -44,6 +44,10 @@ class FinetuneConfig:
     Path to a Python file defining the modality configuration for the given embodiment. 
     If None, use the pre-registered modality config in `gr00t/configs/data/embodiment_configs.py`. 
     """
+
+    seed: int = 42
+    """Seed used for model initialization, data sampling, and worker RNGs."""
+
 
     dit_type: str = "alternate_vl_dit"
     """Action-head DiT implementation; use multimodal_conditioned_dit for sensor inputs."""
@@ -132,7 +136,9 @@ class FinetuneConfig:
 
     state_dropout_prob: float = 0.2
     """
-    Dropout probability applied to state inputs for regularization during training.
+    Per-sample state-feature dropout applied once after the action-head state
+    encoder during training. Zero disables it. Older processor configs may
+    contain this field, but preprocessing no longer applies a second dropout.
     """
 
     # --- Data Augmentation ---

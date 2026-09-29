@@ -106,6 +106,7 @@ if __name__ == "__main__":
         }
     )
     config.load_config_path = None
+    config.data.seed = ft_config.seed
 
     # overwrite with finetune config supplied by the user
     config.model.tune_llm = ft_config.tune_llm

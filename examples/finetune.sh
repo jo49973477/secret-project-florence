@@ -238,7 +238,20 @@ if [ "$NUM_GPUS" = "1" ]; then
     # Restrict to a single GPU so HF Trainer doesn't wrap the model in DataParallel,
     # which crashes with a StopIteration error in the model's device property.
     export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
-    exec python "${LAUNCH_CMD[@]}"
+    TRAIN_COMMAND=(python "${LAUNCH_CMD[@]}")
+else
+    TRAIN_COMMAND=(torchrun --nproc_per_node="$NUM_GPUS" --master_port="$MASTER_PORT" "${LAUNCH_CMD[@]}")
 fi
 
-exec torchrun --nproc_per_node="$NUM_GPUS" --master_port="$MASTER_PORT" "${LAUNCH_CMD[@]}"
+SUPERVISOR_ARGS=()
+if [[ " ${LAUNCH_CMD[*]} " == *" --discord-on "* ]]; then
+    if [[ " ${LAUNCH_CMD[*]} " != *" --no-discord-notify-error "* ]]; then
+        export GR00T_SUPERVISOR_NOTIFY=1
+    fi
+fi
+export GR00T_EXPERIMENT_NAME="${EXPERIMENT_NAME:-$(basename -- "$OUTPUT_DIR")}"
+export GR00T_OUTPUT_DIR="$OUTPUT_DIR"
+export GR00T_TRAIN_LOG="${TRAIN_LOG:-}"
+exec python -m gr00t.experiment.torchrun_supervisor \
+    --marker "$OUTPUT_DIR/.gr00t-failure-notification-delivered" \
+    -- "${TRAIN_COMMAND[@]}"

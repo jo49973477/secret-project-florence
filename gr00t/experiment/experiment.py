@@ -26,6 +26,7 @@ import torch
 import torch.distributed as dist
 from transformers import TrainingArguments, set_seed
 import wandb
+import yaml
 
 from gr00t.configs.base_config import Config
 from gr00t.configs.training.training_config import check_resume_compatibility
@@ -235,6 +236,60 @@ def save_initial_actions_artifact(train_dataset, save_cfg_dir: Path):
     logging.info(f"Saved {len(initial_actions)} initial actions to {initial_actions_path}")
 
 
+def _validate_resume_action_config(config: Config, output_dir: Path) -> None:
+    """Reject a resume when its saved action semantics differ from this run."""
+    resume = config.training.resume_from_checkpoint
+    if not resume:
+        return
+    checkpoint = Path(resume) if isinstance(resume, str) else output_dir
+    candidates = (
+        checkpoint / "experiment_cfg" / "config.yaml",
+        checkpoint.parent / "experiment_cfg" / "config.yaml",
+        output_dir / "experiment_cfg" / "config.yaml",
+    )
+    saved_config_path = next((path for path in candidates if path.is_file()), None)
+    if saved_config_path is None:
+        raise ValueError(
+            "Cannot verify action configuration for requested checkpoint resume. "
+            "Start a fresh output directory or resume from a checkpoint that contains "
+            "experiment_cfg/config.yaml."
+        )
+    with saved_config_path.open() as config_file:
+        saved_config = yaml.safe_load(config_file)
+    embodiment = config.data.datasets[0].embodiment_tag
+    saved_action = (
+        saved_config.get("data", {}).get("modality_configs", {}).get(embodiment, {}).get("action")
+    )
+    requested_action = config.data.modality_configs[embodiment]["action"]
+    if saved_action is None:
+        raise ValueError(
+            f"Cannot verify action configuration in {saved_config_path}; refusing resume."
+        )
+    requested = {
+        "delta_indices": list(requested_action.delta_indices),
+        "modality_keys": list(requested_action.modality_keys),
+        "action_configs": [
+            {
+                "rep": action.rep.value,
+                "type": action.type.value,
+                "format": action.format.value,
+                "state_key": action.state_key,
+            }
+            for action in (requested_action.action_configs or [])
+        ],
+    }
+    saved = {
+        "delta_indices": saved_action.get("delta_indices"),
+        "modality_keys": saved_action.get("modality_keys"),
+        "action_configs": saved_action.get("action_configs") or [],
+    }
+    if saved != requested:
+        raise ValueError(
+            "Refusing checkpoint resume with incompatible action semantics: "
+            f"saved={saved}, requested={requested}. Use a fresh output directory."
+        )
+
+
 def _notification_dataset_path(config: Config) -> str | None:
     paths = [
         str(path)
@@ -285,6 +340,7 @@ def run(config: Config):
 
     save_cfg_dir = output_dir / "experiment_cfg"
     processor_dir = output_dir / "processor"
+    _validate_resume_action_config(config, output_dir)
 
     # Rank-0-only write; wrapped so a rank-0 failure surfaces on every rank
     # instead of stranding peers at the next NCCL collective.
@@ -441,6 +497,7 @@ def run(config: Config):
                 notify_error=config.training.discord_notify_error,
                 # HF fires on_train_end before the explicit final save below.
                 defer_finish_until_final_save=True,
+                failure_delivery_marker=os.environ.get("GR00T_FAILURE_NOTIFICATION_MARKER"),
             )
         )
     for notification_callback in notification_callbacks:

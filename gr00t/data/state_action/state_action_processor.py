@@ -152,7 +152,7 @@ class StateActionProcessor:
             return {
                 "min": min_vals,
                 "max": max_vals,
-                "dim": np.array(min_vals.shape[0]),
+                "dim": np.array(min_vals.shape[-1]),
                 "mean": np.asarray(stats["mean"]).copy(),
                 "std": np.asarray(stats["std"]).copy(),
             }

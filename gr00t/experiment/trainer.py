@@ -172,6 +172,10 @@ class Gr00tTrainer(Trainer):
         self.point_encoder_learning_rate = kwargs.pop("point_encoder_learning_rate", None)
         self.tactile_encoder_learning_rate = kwargs.pop("tactile_encoder_learning_rate", None)
         super().__init__(*args, **kwargs)
+        self._forward_diagnostics: dict[str, torch.Tensor] = {}
+        self._forward_diagnostics_count = 0
+        self._forward_diagnostics_step = None
+        self._gradient_diagnostics: dict[str, torch.Tensor] = {}
 
     def _save_checkpoint(self, *args: Any, **kwargs: Any) -> None:
         """Capture memory across the complete native Trainer checkpoint operation."""
@@ -496,6 +500,27 @@ class Gr00tTrainer(Trainer):
         logging.info("bitsandbytes optimizer keeps %s embedding parameters in fp32", f"{skipped:,}")
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
+        if self.state.global_step and self.state.global_step % 50 == 0:
+            diagnostic_logs = {}
+            for name, value in self._forward_diagnostics.items():
+                reduced = value.detach().float().clone() / max(self._forward_diagnostics_count, 1)
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    torch.distributed.all_reduce(reduced, op=torch.distributed.ReduceOp.SUM)
+                    reduced /= torch.distributed.get_world_size()
+                diagnostic_logs[name] = float(reduced.cpu())
+            for name, squared_norm in self._gradient_diagnostics.items():
+                reduced = squared_norm.detach().clone()
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    torch.distributed.all_reduce(reduced, op=torch.distributed.ReduceOp.SUM)
+                    plugin = getattr(
+                        getattr(self.accelerator, "state", None), "deepspeed_plugin", None
+                    )
+                    if plugin is None or getattr(plugin, "zero_stage", 0) != 3:
+                        # DDP and ZeRO-2 expose replicated gradients; ZeRO-3
+                        # exposes rank-local shards whose squared norms sum.
+                        reduced /= torch.distributed.get_world_size()
+                diagnostic_logs[name] = float(reduced.sqrt().cpu())
+            logs = dict(logs) | diagnostic_logs
         # Hide epoch from logged metrics as it's misleading for Iterable datasets.
         epoch = self.state.epoch
         self.state.epoch = None
@@ -636,6 +661,21 @@ class Gr00tTrainer(Trainer):
             return_outputs=True,
             num_items_in_batch=num_items_in_batch,
         )
+        output_dict = outputs if isinstance(outputs, dict) else getattr(outputs, "__dict__", {})
+        diagnostics = output_dict.get("diagnostics", {})
+        if self._forward_diagnostics_step != self.state.global_step:
+            self._forward_diagnostics = {}
+            self._forward_diagnostics_count = 0
+            self._forward_diagnostics_step = self.state.global_step
+        for name, value in diagnostics.items():
+            if torch.is_tensor(value):
+                detached = value.detach()
+                self._forward_diagnostics[name] = (
+                    detached
+                    if name not in self._forward_diagnostics
+                    else self._forward_diagnostics[name] + detached
+                )
+        self._forward_diagnostics_count += 1
         # import ipdb; ipdb.set_trace()
         # # save the model's embedding for the first step
         # input_embeddings = model.get_input_embeddings().weight.data.cpu()
@@ -688,3 +728,30 @@ class Gr00tTrainer(Trainer):
                 )
 
         return (loss, outputs) if return_outputs else loss
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        loss = super().training_step(model, inputs, num_items_in_batch)
+        # Capture scalar norms after backward while gradients still exist. Keep
+        # them on device; host synchronization happens only when log() is called.
+        groups = {
+            "point_encoder_grad_norm": ("point_encoder.backbone.",),
+            "tactile_encoder_grad_norm": ("tactile_encoder.backbone.",),
+            "multimodal_adapter_grad_norm": (
+                "point_encoder.projection.", "point_cross_attention.", "point_action_norms.",
+                "point_modality_norms.", "point_gates", "tactile_encoder.projection.",
+                "tactile_cross_attention.", "tactile_action_norms.",
+                "tactile_modality_norms.", "tactile_gates",
+            ),
+        }
+        sums = {name: None for name in groups}
+        for parameter_name, parameter in model.named_parameters():
+            if parameter.grad is None:
+                continue
+            for metric, fragments in groups.items():
+                if any(fragment in parameter_name for fragment in fragments):
+                    square_sum = parameter.grad.detach().float().square().sum()
+                    sums[metric] = square_sum if sums[metric] is None else sums[metric] + square_sum
+        self._gradient_diagnostics = {
+            name: value for name, value in sums.items() if value is not None
+        }
+        return loss
