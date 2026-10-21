@@ -15,6 +15,8 @@
 
 """Focused tests for point- and tactile-conditioned DiT behavior."""
 
+from functools import partial
+
 from gr00t.model.extension.multimodal_dit import MultiModalConditionedDiT
 from gr00t.model.extension.point_encoder import (
     PointNet2Encoder,
@@ -24,6 +26,7 @@ from gr00t.model.extension.point_encoder import (
 from gr00t.model.extension.tactile_encoder import TactileEncoder
 from gr00t.model.modules.dit import AlternateVLDiT
 import torch
+from torch.utils.checkpoint import checkpoint
 
 
 def _dit_config() -> dict:
@@ -101,12 +104,18 @@ def test_bf16_sensor_token_boundary_and_fp32_gates_do_not_promote_dit() -> None:
         model.point_gates.data = model.point_gates.data.float()
         model.tactile_gates.data = model.tactile_gates.data.float()
     seen = {"point": [], "tactile": []}
-    point_hook = model.point_modality_norms[0].register_forward_pre_hook(
-        lambda _module, inputs: seen["point"].append(inputs[0].dtype)
-    )
-    tactile_hook = model.tactile_modality_norms[0].register_forward_pre_hook(
-        lambda _module, inputs: seen["tactile"].append(inputs[0].dtype)
-    )
+    point_hooks = [
+        norm.register_forward_pre_hook(
+            lambda _module, inputs: seen["point"].append(inputs[0].dtype)
+        )
+        for norm in model.point_modality_norms
+    ]
+    tactile_hooks = [
+        norm.register_forward_pre_hook(
+            lambda _module, inputs: seen["tactile"].append(inputs[0].dtype)
+        )
+        for norm in model.tactile_modality_norms
+    ]
     point_tokens = torch.randn(1, 5, 8, dtype=torch.float32, requires_grad=True)
     tactile_tokens = torch.randn(1, 2, 8, dtype=torch.float32, requires_grad=True)
     with torch.autocast("cpu", dtype=torch.bfloat16):
@@ -120,8 +129,8 @@ def test_bf16_sensor_token_boundary_and_fp32_gates_do_not_promote_dit() -> None:
             **_vlm_masks(batch_size=1, sequence_length=4),
         )
         output.float().square().mean().backward()
-    point_hook.remove()
-    tactile_hook.remove()
+    for hook in point_hooks + tactile_hooks:
+        hook.remove()
 
     assert seen == {"point": [torch.bfloat16] * 2, "tactile": [torch.bfloat16] * 2}
     assert output.dtype == torch.bfloat16
@@ -207,6 +216,36 @@ def test_fully_masked_modality_rows_produce_finite_outputs_and_gradients() -> No
     assert model.tactile_gates.grad is not None
     assert torch.isfinite(model.point_gates.grad).all()
     assert torch.isfinite(model.tactile_gates.grad).all()
+
+
+def test_non_reentrant_gradient_checkpointing_preserves_sensor_gradients() -> None:
+    """Checkpoint only the dense conditioned DiT; sensor outputs remain graph inputs."""
+    torch.manual_seed(23)
+    model = _multimodal_dit().train()
+    model.gradient_checkpointing = True
+    model._gradient_checkpointing_func = partial(checkpoint, use_reentrant=False)
+    with torch.no_grad():
+        model.point_gates.fill_(0.25)
+        model.tactile_gates.fill_(0.25)
+
+    hidden_states = torch.randn(1, 4, 8, requires_grad=True)
+    point_tokens = torch.randn(1, 5, 8, requires_grad=True)
+    tactile_tokens = torch.randn(1, 3, 8, requires_grad=True)
+    output = model(
+        hidden_states=hidden_states,
+        encoder_hidden_states=torch.randn(1, 4, 6),
+        timestep=torch.tensor([3]),
+        point_tokens=point_tokens,
+        tactile_tokens=tactile_tokens,
+        **_vlm_masks(batch_size=1, sequence_length=4),
+    )
+    output.square().mean().backward()
+
+    for tensor in (hidden_states, point_tokens, tactile_tokens):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()
+    assert model.point_cross_attention.attention.in_proj_weight.grad is not None
+    assert model.tactile_cross_attention.attention.in_proj_weight.grad is not None
 
 
 def test_shared_attention_parameter_count_and_per_layer_norms() -> None:

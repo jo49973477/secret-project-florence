@@ -35,7 +35,7 @@ class FinetuneConfig:
 
     dataset_path: str
     """Path to one dataset root, or an os.pathsep-separated list of dataset roots."""
-    
+
     embodiment_tag: str
     """Embodiment tag (name or value, case-insensitive). See EmbodimentTag for known tags."""
 
@@ -48,10 +48,22 @@ class FinetuneConfig:
     seed: int = 42
     """Seed used for model initialization, data sampling, and worker RNGs."""
 
-
     dit_type: str = "alternate_vl_dit"
     """Action-head DiT implementation; use multimodal_conditioned_dit for sensor inputs."""
 
+    sidecar_num_stages: int = 4
+    sidecar_stage_indices: list[int] | None = None
+    sidecar_hidden_dim: int = 256
+    sidecar_num_heads: int = 4
+    sidecar_num_point_tokens: int = 32
+    tactile_fusion_mode: str = "surprise"
+    contact_num_tokens: int = 4
+    contact_hidden_dim: int = 256
+    contact_prediction_loss_weight: float = 0.1
+    freeze_pretrained_dit: bool = True
+    freeze_contact_teacher: bool = True
+    contact_injection_enabled: bool = True
+    contact_predictor_warmup: bool = False
     use_point_conditioning: bool = True
     """Enable point-cloud conditioning when using multimodal_conditioned_dit."""
 
@@ -265,6 +277,18 @@ class FinetuneConfig:
     ZeRO-3 also shards parameters.
     """
 
+    zero3_offload_optimizer: bool = False
+    """Offload ZeRO-3 optimizer states and AdamW computation to CPU."""
+
+    zero3_offload_param: bool = False
+    """Offload ZeRO-3 parameter partitions to CPU independently of optimizer offload."""
+
+    zero3_sub_group_size: int | None = None
+    """Optional ZeRO-3 processing tile size. None preserves DeepSpeed's existing default."""
+
+    gradient_checkpointing: bool = False
+    """Enable supported activation checkpointing paths; disabled by default."""
+
     use_wandb: bool = False
     """
     If True, log metrics and artifacts to Weights & Biases (wandb).
@@ -345,6 +369,12 @@ class FinetuneConfig:
     The processor (tokenizer/config) is still loaded from base_model_path.
     Useful for CI/testing to skip the slow checkpoint shard loading."""
 
+    enable_training_dashboard: bool | None = None
+    dashboard_refresh_seconds: float = 1.0
+    enable_multimodal_diagnostics: bool = False
+    multimodal_diagnostics_interval: int = 50
+    multimodal_diagnostics_level: str = "basic"
+
     @property
     def resolved_vlm_learning_rate(self) -> float:
         return self.learning_rate if self.vlm_learning_rate is None else self.vlm_learning_rate
@@ -382,8 +412,25 @@ class FinetuneConfig:
             chat_id=self.telegram_chat_id,
         )
         validate_discord_configuration(enabled=self.discord_on)
+        if self.dashboard_refresh_seconds <= 0:
+            raise ValueError("dashboard_refresh_seconds must be positive")
+        if self.multimodal_diagnostics_interval < 1:
+            raise ValueError("multimodal_diagnostics_interval must be positive")
+        if self.multimodal_diagnostics_level not in {"off", "basic", "per_layer"}:
+            raise ValueError("multimodal_diagnostics_level must be off, basic, or per_layer")
         if self.deepspeed_stage not in (2, 3):
             raise ValueError(f"deepspeed_stage must be 2 or 3, got {self.deepspeed_stage}")
+        if self.zero3_sub_group_size is not None and self.zero3_sub_group_size <= 0:
+            raise ValueError(
+                "zero3_sub_group_size must be positive when provided, got "
+                f"{self.zero3_sub_group_size}"
+            )
+        if self.deepspeed_stage != 3 and (
+            self.zero3_offload_optimizer
+            or self.zero3_offload_param
+            or self.zero3_sub_group_size is not None
+        ):
+            raise ValueError("ZeRO-3 memory options require deepspeed_stage=3")
         if self.learning_rate <= 0:
             raise ValueError(f"learning_rate must be positive, got {self.learning_rate}")
         if self.resolved_vlm_learning_rate <= 0:

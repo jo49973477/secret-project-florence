@@ -174,3 +174,5 @@ offline_open_loop_eval_plots/
 /data
 
 tmp/
+demo_data/
+examples/

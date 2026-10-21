@@ -90,4 +90,5 @@ uv run torchrun --nproc-per-node="${NUM_GPUS}" \
     --point-input-dim 6 \
     --seed "${SEED}" \
     "${SENSOR_ARGS[@]}" \
+    "$@" \
     2>&1 | tee "${OUTPUT_DIR}/logs/train.log"

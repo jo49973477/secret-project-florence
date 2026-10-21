@@ -1,0 +1,38 @@
+# @package _global_
+defaults:
+- /model: gr00t_base
+- /data: univtac_rgb
+- /training: overfit_5eps
+- /hardware: dual_3090_zero3
+- _self_
+- override /hydra/job_logging: disabled
+name: univtac_overfit5
+run_id: ${now:%Y%m%d_%H%M%S}
+output_dir: outputs/${name}/${run_id}
+dry_run: false
+resume:
+  enabled: false
+  checkpoint_path: null
+  auto_find_latest: false
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null
+model:
+  state_dropout_prob: 0.0
+  action_head_dropout_override: 0.0
+  vl_self_attention_dropout_override: 0.0
+data:
+  expected_episode_ids: [0, 1, 2, 3, 4]
+  datasets:
+  - dataset_paths:
+    - ${oc.env:FLORENCE_OVERFIT_DATASET,data/univtac_overfit5}
+    embodiment_tag: new_embodiment
+    mix_ratio: 1.0
+  preprocessing:
+    color_jitter_params: null
+    random_rotation_angle: 0
+    crop_fraction: 1.0
+    use_percentiles: false

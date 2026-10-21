@@ -367,6 +367,10 @@ class MultiModalConditionedDiT(AlternateVLDiT):
         # the pretrained GR00T behavior, then learn the conditioning strength.
         gate = self.point_gates[block_index].to(dtype=point_update.dtype)
         gated_point_update = gate * point_update
+        observer = getattr(self, "_diagnostic_observer", None)
+        if observer is not None:
+            observer("point", block_index, action_hidden_states, gated_point_update)
+
         action_hidden_states = action_hidden_states + gated_point_update.to(
             dtype=action_hidden_states.dtype
         )
@@ -394,10 +398,57 @@ class MultiModalConditionedDiT(AlternateVLDiT):
         # the action stream at the current layer.
         gate = self.tactile_gates[block_index].to(dtype=tactile_update.dtype)
         gated_tactile_update = gate * tactile_update
+        observer = getattr(self, "_diagnostic_observer", None)
+        if observer is not None:
+            observer("tactile", block_index, action_hidden_states, gated_tactile_update)
+
         action_hidden_states = action_hidden_states + gated_tactile_update.to(
             dtype=action_hidden_states.dtype
         )
         return action_hidden_states
+
+    def _run_conditioned_layer(
+        self,
+        block_index: int,
+        hidden_states: torch.Tensor,
+        vlm_hidden_states: torch.Tensor,
+        timestep_embedding: torch.Tensor,
+        image_attention_mask: torch.Tensor,
+        non_image_attention_mask: torch.Tensor,
+        hidden_attention_mask: torch.Tensor | None,
+        point_tokens: torch.Tensor | None,
+        tactile_tokens: torch.Tensor | None,
+        point_attention_mask: torch.Tensor | None,
+        tactile_attention_mask: torch.Tensor | None,
+        num_state_tokens: int,
+    ) -> torch.Tensor:
+        """Run one complete original-plus-sensor layer for safe recomputation."""
+        hidden_states = self._run_original_gr00t_block(
+            block_index,
+            hidden_states,
+            vlm_hidden_states,
+            timestep_embedding,
+            image_attention_mask,
+            non_image_attention_mask,
+            hidden_attention_mask,
+        )
+        hidden_states = _mask_hidden_states(hidden_states, hidden_attention_mask)
+        state_hidden_states = hidden_states[:, :num_state_tokens]
+        action_hidden_states = hidden_states[:, num_state_tokens:]
+        action_hidden_states = self._apply_point_conditioning(
+            block_index,
+            action_hidden_states,
+            point_tokens,
+            point_attention_mask,
+        )
+        action_hidden_states = self._apply_tactile_conditioning(
+            block_index,
+            action_hidden_states,
+            tactile_tokens,
+            tactile_attention_mask,
+        )
+        hidden_states = torch.cat((state_hidden_states, action_hidden_states), dim=1)
+        return _mask_hidden_states(hidden_states, hidden_attention_mask)
 
     def forward(
         self,
@@ -500,9 +551,7 @@ class MultiModalConditionedDiT(AlternateVLDiT):
         all_hidden_states = [hidden_states]
 
         for block_index in range(len(self.transformer_blocks)):
-            # 1. Original GR00T block computation, including the established
-            #    self-attention/VLM-cross-attention schedule.
-            hidden_states = self._run_original_gr00t_block(
+            layer_args = (
                 block_index,
                 hidden_states,
                 vlm_hidden_states,
@@ -510,35 +559,18 @@ class MultiModalConditionedDiT(AlternateVLDiT):
                 image_attention_mask,
                 non_image_attention_mask,
                 hidden_attention_mask,
-            )
-            hidden_states = _mask_hidden_states(hidden_states, hidden_attention_mask)
-
-            # 2. State is the prefix and action is the suffix. Sensor branches
-            #    intentionally query with action tokens only.
-            # state_hidden_states:  [B, N_state, D_dit]
-            # action_hidden_states: [B, N_action, D_dit]
-            state_hidden_states = hidden_states[:, :num_state_tokens]
-            action_hidden_states = hidden_states[:, num_state_tokens:]
-
-            # 3. Action <- point-cloud cross-attention.
-            action_hidden_states = self._apply_point_conditioning(
-                block_index,
-                action_hidden_states,
                 point_tokens,
-                point_attention_mask,
-            )
-
-            # 4. Action <- tactile-image cross-attention.
-            action_hidden_states = self._apply_tactile_conditioning(
-                block_index,
-                action_hidden_states,
                 tactile_tokens,
+                point_attention_mask,
                 tactile_attention_mask,
+                num_state_tokens,
             )
-
-            # 5. Rebuild [state; action] for the next original GR00T block.
-            hidden_states = torch.cat((state_hidden_states, action_hidden_states), dim=1)
-            hidden_states = _mask_hidden_states(hidden_states, hidden_attention_mask)
+            if self.training and self.gradient_checkpointing:
+                hidden_states = self._gradient_checkpointing_func(
+                    self._run_conditioned_layer, *layer_args
+                )
+            else:
+                hidden_states = self._run_conditioned_layer(*layer_args)
             all_hidden_states.append(hidden_states)
 
         # Preserve the original DiT adaptive output normalization and projection.

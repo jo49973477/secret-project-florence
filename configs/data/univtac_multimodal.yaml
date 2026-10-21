@@ -1,0 +1,17 @@
+defaults:
+- univtac_rgb
+- _self_
+modalities:
+  action:
+    horizon: 40
+  pointcloud:
+    delta_indices:
+    - 0
+    modality_keys:
+    - scene
+  tactile:
+    delta_indices:
+    - -1
+    - 0
+    modality_keys:
+    - rgb

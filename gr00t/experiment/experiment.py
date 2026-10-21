@@ -34,7 +34,8 @@ from gr00t.experiment.discord_notifier import DiscordNotifier
 from gr00t.experiment.telegram_notifier import TelegramNotifier
 
 # Use custom trainer that profiles data loading & forward times
-from gr00t.experiment.trainer import Gr00tTrainer, ProfCallback
+from gr00t.experiment.trainer import FirstStepMemoryCallback, Gr00tTrainer, ProfCallback
+from gr00t.experiment.training_memory import log_memory_snapshot, log_trainable_parameter_summary
 from gr00t.experiment.training_notification_callback import (
     TrainingNotificationCallback,
     TrainingNotificationContext,
@@ -361,6 +362,12 @@ def run(config: Config):
                     "git_commit_hash": os.environ.get("GROOT_COMMIT_HASH", "unknown"),
                 }
 
+                hydra_path = os.environ.get("GR00T_HYDRA_CONFIG")
+                if hydra_path:
+                    config_dict["hydra_resolved"] = OmegaConf.to_container(
+                        OmegaConf.load(hydra_path), resolve=True
+                    )
+
                 wandb.init(
                     project=config.training.wandb_project,
                     name=experiment_name,
@@ -372,6 +379,8 @@ def run(config: Config):
     pipeline = MODEL_REGISTRY.get(type(config.model))(config, save_cfg_dir)
     pipeline.setup()
     model = pipeline.return_model()
+    log_memory_snapshot("after_model_loading")
+    log_trainable_parameter_summary(model)
     train_dataset, eval_dataset = pipeline.return_dataset()
     data_collator = pipeline.return_collator()
     processor = pipeline.return_processor()
@@ -382,6 +391,9 @@ def run(config: Config):
     # deepspeed config
     if config.training.num_gpus > 1 and not config.training.use_ddp:
         deepspeed_config = config.get_deepspeed_config()
+        logging.info(
+            "Runtime DeepSpeed configuration: %s", json.dumps(deepspeed_config, sort_keys=True)
+        )
     else:
         deepspeed_config = None
 
@@ -426,6 +438,12 @@ def run(config: Config):
         bf16=config.training.bf16,
         tf32=config.training.tf32,
         gradient_checkpointing=config.training.gradient_checkpointing,
+        gradient_checkpointing_kwargs=(
+            {"use_reentrant": False} if config.training.gradient_checkpointing else None
+        ),
+        # With ZeRO CPU optimizer offload, Accelerate maps torch AdamW (including
+        # fused AdamW) to DeepSpeedCPUAdam while retaining these parameter groups
+        # and AdamW mode. The initialized engine is checked and logged below.
         optim=config.training.optim,
         dataloader_num_workers=config.training.dataloader_num_workers,
         report_to="wandb" if config.training.use_wandb else "none",
@@ -452,6 +470,22 @@ def run(config: Config):
         action_head_learning_rate=resolved_action_head_lr,
         point_encoder_learning_rate=resolved_point_encoder_lr,
         tactile_encoder_learning_rate=resolved_tactile_encoder_lr,
+        enable_training_dashboard=config.training.enable_training_dashboard,
+        dashboard_refresh_seconds=config.training.dashboard_refresh_seconds,
+        enable_multimodal_diagnostics=config.training.enable_multimodal_diagnostics,
+        multimodal_diagnostics_interval=config.training.multimodal_diagnostics_interval,
+        multimodal_diagnostics_level=config.training.multimodal_diagnostics_level,
+    )
+    from gr00t.experiment.optimizer_artifacts import EffectiveOptimizerCallback
+
+    trainer.add_callback(EffectiveOptimizerCallback(trainer))
+    trainer.add_callback(
+        FirstStepMemoryCallback(
+            deepspeed_enabled=deepspeed_config is not None,
+            zero3_offload_optimizer=config.training.zero3_offload_optimizer,
+            zero3_offload_param=config.training.zero3_offload_param,
+            zero3_sub_group_size=config.training.zero3_sub_group_size,
+        )
     )
 
     trainer.add_callback(

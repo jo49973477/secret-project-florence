@@ -1,0 +1,36 @@
+base_model_path: nvidia/GR00T-N1.7-3B
+checkpoint_expectations:
+  action_horizon: 40
+dit_type: alternate_vl_dit
+use_point_conditioning: false
+use_tactile_conditioning: false
+point_input_dim: 6
+tactile_input_channels: 3
+tactile_encoder_cfg: sparsh_dino_base
+tactile_pretrained_model: facebook/sparsh-dino-base
+tactile_checkpoint_filename: dino_vitbase.safetensors
+tactile_background_path: null
+point_encoder_cfg: concerto_small
+point_encoder_checkpoint_path: null
+point_encoder_repo_id: Pointcept/Concerto
+point_encoder_download_root: null
+point_encoder_grid_size: 0.02
+point_encoder_enable_flash: null
+tune_llm: false
+tune_visual: false
+tune_projector: true
+tune_diffusion_model: true
+tune_vlln: true
+tune_point_encoder: true
+tune_tactile_encoder: true
+tune_multimodal_adapter: true
+use_lora: false
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.0
+lora_bias: none
+state_dropout_prob: 0.2
+action_head_dropout_override: null
+vl_self_attention_dropout_override: null
+load_bf16: false
+backbone_trainable_params_fp32: true

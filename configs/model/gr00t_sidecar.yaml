@@ -1,0 +1,24 @@
+defaults:
+- gr00t_multimodal
+- _self_
+dit_type: sidecar_conditioned_dit
+sidecar_num_stages: 4
+sidecar_stage_indices: null
+sidecar_hidden_dim: 256
+sidecar_num_heads: 4
+sidecar_num_point_tokens: 32
+tactile_fusion_mode: surprise
+contact_num_tokens: 4
+contact_hidden_dim: 256
+contact_prediction_loss_weight: 0.1
+freeze_pretrained_dit: true
+freeze_contact_teacher: true
+contact_injection_enabled: true
+contact_predictor_warmup: false
+tune_llm: false
+tune_visual: false
+tune_projector: false
+tune_vlln: false
+tune_diffusion_model: false
+tune_point_encoder: false
+tune_tactile_encoder: false

@@ -692,7 +692,7 @@ class TestActionHeadTrainableParams:
         for p in head.model.parameters():
             assert not p.requires_grad
 
-    def test_concerto_backbone_and_projection_have_independent_freeze_controls():
+    def test_concerto_backbone_and_projection_have_independent_freeze_controls(self):
         encoder = ConcertoPointEncoder(
             input_dim=6,
             point_dim=8,
@@ -706,9 +706,7 @@ class TestActionHeadTrainableParams:
             point_encoder_cfg="concerto_small",
             use_point_conditioning=True,
         )
-        with patch(
-            "gr00t.model.gr00t_n1d7.gr00t_n1d7.build_point_encoder", return_value=encoder
-        ):
+        with patch("gr00t.model.gr00t_n1d7.gr00t_n1d7.build_point_encoder", return_value=encoder):
             head = Gr00tN1d7ActionHead(config)
             head.set_trainable_parameters(
                 tune_projector=True,

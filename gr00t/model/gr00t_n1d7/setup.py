@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import json
 import logging
 import os
@@ -33,9 +32,9 @@ from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import (
 )
 from gr00t.model.gr00t_n1d7.sensor_loading import (
     MULTIMODAL_ADAPTER_PREFIXES,
+    SIDECAR_ADAPTER_PREFIXES,
     checkpoint_sensor_layout,
     has_legacy_layerwise_attention_keys,
-    unexpected_missing_keys,
 )
 from gr00t.model.registry import register_model
 from gr00t.utils.dist_utils import (
@@ -222,7 +221,31 @@ class Gr00tN1d7Pipeline(ModelPipeline):
             checkpoint_multimodal, checkpoint_has_point, checkpoint_has_tactile = (
                 checkpoint_sensor_layout(checkpoint_config)
             )
-            requested_multimodal = self.config.model.dit_type == "multimodal_conditioned_dit"
+            requested_multimodal = self.config.model.dit_type in {
+                "multimodal_conditioned_dit",
+                "sidecar_conditioned_dit",
+            }
+            checkpoint_dit_type = getattr(checkpoint_config, "dit_type", "alternate_vl_dit")
+            requested_dit_type = self.config.model.dit_type
+            if checkpoint_multimodal and checkpoint_dit_type != requested_dit_type:
+                raise ValueError(
+                    "Incompatible adapter architecture: "
+                    + checkpoint_dit_type
+                    + " -> "
+                    + requested_dit_type
+                )
+            if checkpoint_dit_type == "sidecar_conditioned_dit":
+                for field in (
+                    "sidecar_num_stages",
+                    "sidecar_stage_indices",
+                    "sidecar_hidden_dim",
+                    "sidecar_num_heads",
+                    "sidecar_num_point_tokens",
+                    "contact_hidden_dim",
+                    "contact_num_tokens",
+                ):
+                    if getattr(checkpoint_config, field) != getattr(self.config.model, field):
+                        raise ValueError(f"Incompatible Sidecar checkpoint architecture: {field}")
             requested_point = requested_multimodal and self.config.model.use_point_conditioning
             requested_tactile = requested_multimodal and self.config.model.use_tactile_conditioning
             point_model_config = getattr(checkpoint_config, "point_encoder_model_config", None)
@@ -275,6 +298,19 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                     load_bf16=self.config.model.load_bf16,
                     transformers_loading_kwargs=self.transformers_loading_kwargs,
                     dit_type=self.config.model.dit_type,
+                    sidecar_num_stages=self.config.model.sidecar_num_stages,
+                    sidecar_stage_indices=self.config.model.sidecar_stage_indices,
+                    sidecar_hidden_dim=self.config.model.sidecar_hidden_dim,
+                    sidecar_num_heads=self.config.model.sidecar_num_heads,
+                    sidecar_num_point_tokens=self.config.model.sidecar_num_point_tokens,
+                    tactile_fusion_mode=self.config.model.tactile_fusion_mode,
+                    contact_num_tokens=self.config.model.contact_num_tokens,
+                    contact_hidden_dim=self.config.model.contact_hidden_dim,
+                    contact_prediction_loss_weight=self.config.model.contact_prediction_loss_weight,
+                    freeze_pretrained_dit=self.config.model.freeze_pretrained_dit,
+                    freeze_contact_teacher=self.config.model.freeze_contact_teacher,
+                    contact_injection_enabled=self.config.model.contact_injection_enabled,
+                    contact_predictor_warmup=self.config.model.contact_predictor_warmup,
                     use_point_conditioning=self.config.model.use_point_conditioning,
                     use_tactile_conditioning=self.config.model.use_tactile_conditioning,
                     point_input_dim=self.config.model.point_input_dim,
@@ -328,12 +364,26 @@ class Gr00tN1d7Pipeline(ModelPipeline):
             mismatched_keys = loading_info.get("mismatched_keys", [])
             newly_enabled_prefixes: tuple[str, ...] = ()
             if requested_multimodal and not checkpoint_multimodal:
-                newly_enabled_prefixes += MULTIMODAL_ADAPTER_PREFIXES
+                newly_enabled_prefixes += (
+                    SIDECAR_ADAPTER_PREFIXES
+                    if requested_dit_type == "sidecar_conditioned_dit"
+                    else MULTIMODAL_ADAPTER_PREFIXES
+                )
             if point_deferred:
                 newly_enabled_prefixes += ("action_head.point_encoder.",)
             if tactile_deferred:
                 newly_enabled_prefixes += ("action_head.tactile_encoder.",)
-            other_missing = unexpected_missing_keys(missing_keys, newly_enabled_prefixes)
+            from gr00t.model.gr00t_n1d7.dit_integrity import validate_loading_info
+
+            validation = validate_loading_info(loading_info, newly_enabled_prefixes)
+            model.pretrained_loading_report = {
+                **validation,
+                "checkpoint": str(self.config.training.start_from_checkpoint),
+                "skip_weight_loading": False,
+                "dit_type": model.config.dit_type,
+                "diffusion_model_cfg": model.config.diffusion_model_cfg,
+            }
+            other_missing = validation["errors"].get("missing_keys", [])
             initialized_sensor_keys = [
                 key
                 for key in missing_keys
@@ -381,6 +431,29 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 else:
                     bootstrap_sensor_backbones()
 
+            model.pretrained_loading_report["sensors"] = {
+                "point": {
+                    "status": "PASS" if checkpoint_has_point or point_deferred else "SKIP",
+                    "source": "embedded checkpoint"
+                    if checkpoint_has_point
+                    else "external bootstrap"
+                    if point_deferred
+                    else "disabled",
+                    "checkpoint": self.config.model.point_encoder_checkpoint_path,
+                    "repo_id": self.config.model.point_encoder_repo_id,
+                },
+                "tactile": {
+                    "status": "PASS" if checkpoint_has_tactile or tactile_deferred else "SKIP",
+                    "source": "embedded checkpoint"
+                    if checkpoint_has_tactile
+                    else "external bootstrap"
+                    if tactile_deferred
+                    else "disabled",
+                    "model": self.config.model.tactile_pretrained_model,
+                    "checkpoint_filename": self.config.model.tactile_checkpoint_filename,
+                },
+            }
+
             if self.config.model.use_lora and not model.config.use_lora:
                 model.enable_lora(
                     r=self.config.model.lora_r,
@@ -396,6 +469,14 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 self.config.model,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
             )
+
+        if not hasattr(model, "pretrained_loading_report"):
+            model.pretrained_loading_report = {
+                "status": "SKIP",
+                "skip_weight_loading": skip_weight_loading,
+                "checkpoint": str(self.config.training.start_from_checkpoint),
+                "reason": "Constructed without pretrained weight loading",
+            }
 
         logging.debug(f"Model Config: {model.config}")
         with run_or_wait_on_rank0(label="final_model_config.json write") as is_rank0:

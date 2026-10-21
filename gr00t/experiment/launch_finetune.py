@@ -74,7 +74,7 @@ if __name__ == "__main__":
         list(tactile_modality.delta_indices) if tactile_modality is not None else [-1, 0]
     )
     if (
-        ft_config.dit_type == "multimodal_conditioned_dit"
+        ft_config.dit_type in {"multimodal_conditioned_dit", "sidecar_conditioned_dit"}
         and ft_config.use_tactile_conditioning
         and ft_config.tactile_encoder_cfg == "sparsh_dino_base"
         and (
@@ -138,6 +138,19 @@ if __name__ == "__main__":
     config.model.tune_vlln = ft_config.tune_vlln
     config.model.tune_point_encoder = ft_config.tune_point_encoder
     config.model.tune_tactile_encoder = ft_config.tune_tactile_encoder
+    config.model.sidecar_num_stages = ft_config.sidecar_num_stages
+    config.model.sidecar_stage_indices = ft_config.sidecar_stage_indices
+    config.model.sidecar_hidden_dim = ft_config.sidecar_hidden_dim
+    config.model.sidecar_num_heads = ft_config.sidecar_num_heads
+    config.model.sidecar_num_point_tokens = ft_config.sidecar_num_point_tokens
+    config.model.tactile_fusion_mode = ft_config.tactile_fusion_mode
+    config.model.contact_num_tokens = ft_config.contact_num_tokens
+    config.model.contact_hidden_dim = ft_config.contact_hidden_dim
+    config.model.contact_prediction_loss_weight = ft_config.contact_prediction_loss_weight
+    config.model.freeze_pretrained_dit = ft_config.freeze_pretrained_dit
+    config.model.freeze_contact_teacher = ft_config.freeze_contact_teacher
+    config.model.contact_injection_enabled = ft_config.contact_injection_enabled
+    config.model.contact_predictor_warmup = ft_config.contact_predictor_warmup
     config.model.tune_multimodal_adapter = ft_config.tune_multimodal_adapter
     config.model.state_dropout_prob = ft_config.state_dropout_prob
     config.model.random_rotation_angle = ft_config.random_rotation_angle
@@ -183,6 +196,10 @@ if __name__ == "__main__":
     config.training.save_total_limit = ft_config.save_total_limit
     config.training.num_gpus = ft_config.num_gpus
     config.training.deepspeed_stage = ft_config.deepspeed_stage
+    config.training.zero3_offload_optimizer = ft_config.zero3_offload_optimizer
+    config.training.zero3_offload_param = ft_config.zero3_offload_param
+    config.training.zero3_sub_group_size = ft_config.zero3_sub_group_size
+    config.training.gradient_checkpointing = ft_config.gradient_checkpointing
     config.training.use_wandb = ft_config.use_wandb
     config.training.telegram_on = ft_config.telegram_on
     config.training.telegram_chat_id = ft_config.telegram_chat_id
@@ -209,6 +226,11 @@ if __name__ == "__main__":
     config.training.save_only_model = ft_config.save_only_model
     config.training.resume_from_checkpoint = ft_config.resume_from_checkpoint
     config.training.skip_weight_loading = ft_config.skip_weight_loading
+    config.training.enable_training_dashboard = ft_config.enable_training_dashboard
+    config.training.dashboard_refresh_seconds = ft_config.dashboard_refresh_seconds
+    config.training.enable_multimodal_diagnostics = ft_config.enable_multimodal_diagnostics
+    config.training.multimodal_diagnostics_interval = ft_config.multimodal_diagnostics_interval
+    config.training.multimodal_diagnostics_level = ft_config.multimodal_diagnostics_level
 
     print(f"DeepSpeed stage : {config.training.deepspeed_stage}")
     run(config)

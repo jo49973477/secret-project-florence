@@ -15,8 +15,17 @@ MULTIMODAL_ADAPTER_PREFIXES = (
 )
 
 
+SIDECAR_ADAPTER_PREFIXES = tuple(
+    "action_head.model." + name + "."
+    for name in ("sidecar_pool", "sidecar_stages", "contact_adapter", "contact_injections")
+)
+
+
 def checkpoint_sensor_layout(checkpoint_config) -> tuple[bool, bool, bool]:
-    is_multimodal = getattr(checkpoint_config, "dit_type", None) == "multimodal_conditioned_dit"
+    is_multimodal = getattr(checkpoint_config, "dit_type", None) in {
+        "multimodal_conditioned_dit",
+        "sidecar_conditioned_dit",
+    }
     return (
         is_multimodal,
         is_multimodal and getattr(checkpoint_config, "use_point_conditioning", False),

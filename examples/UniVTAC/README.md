@@ -9,7 +9,12 @@ The UniVTAC converter produces a GR00T-flavored LeRobot v2 dataset with the exis
 - the next-timestep eight-dimensional absolute joint target
 - task language
 
-It can now optionally add one tactile RGB stream and a fixed-size point cloud. These values are transported through `LeRobotEpisodeLoader`, `extract_step_data()`, explicit `VLAStepData.tactile` / `VLAStepData.pointclouds` fields, the N1.7 processor/collator, and the optional `MultiModalConditionedDiT` action-head path.
+It can optionally add tactile RGB and one semantic scene field,
+`observation.pointcloud.scene`. The scene is an XYZRGB point set built from calibrated head and
+wrist RGB-D, transformed into `robot_base`, concatenated over the point axis, cropped/voxelized,
+and reproducibly capped. These values are transported through `LeRobotEpisodeLoader`,
+`extract_step_data()`, explicit `VLAStepData.tactile` / `VLAStepData.pointclouds` fields, the N1.7
+processor/collator, and the optional `MultiModalConditionedDiT` action-head path.
 
 The maintained UniVTAC alignment is unchanged: `joint[:-1, :8]` is state, `joint[1:, :8]` is action, and all observation streams use their first `T-1` samples. The stored action is still an absolute target. `ActionRepresentation.RELATIVE` in the config performs the relative transform inside GR00T.
 
@@ -27,14 +32,34 @@ observation/head/rgb      [T] JPEG byte streams
 observation/wrist/rgb     [T] JPEG byte streams
 ```
 
-Multimodal conversion additionally resolves one unmarked tactile RGB stream and one depth stream:
+Tactile conversion resolves one unmarked tactile RGB stream:
 
 ```text
 tactile/<sensor>/rgb          [T] JPEG byte streams
-tactile/<sensor>/depth        [T, 240, 320] float32
 ```
 
-The semantic output is always `tactile.rgb`; the raw HDF5 path is only source provenance. If an input file contains multiple `tactile/*/rgb` datasets, select one with `--tactile-rgb-key`. When that option is omitted but `--pointcloud-depth-key` is present, the converter selects the sibling `rgb` dataset. `rgb_marker` is not silently substituted for raw `rgb`.
+The semantic output is always `tactile.rgb`; the raw HDF5 path is only source provenance. If an input file contains multiple `tactile/*/rgb` datasets, select one with `--tactile-rgb-key`. `rgb_marker` is not silently substituted for raw `rgb`.
+
+Scene conversion additionally requires synchronized head and wrist depth plus verified calibration:
+
+```text
+observation/head/depth                 [T,H,W] or [T,H,W,1]
+observation/wrist/depth                [T,H,W] or [T,H,W,1]
+observation/head/T_base_camera         [4,4] or [T,4,4]       # one supported source
+observation/wrist/T_base_camera        [T,4,4]                # one supported source
+embodiment/ee                          [T,7] xyz+qw,qx,qy,qz  # wrist alternative
+```
+
+Each camera also needs its actual pinhole intrinsics and depth-to-metre scale. They may be embedded
+in HDF5 metadata or supplied in a verified JSON sidecar. A wrist sidecar must provide calibrated
+`T_ee_camera` and use recorded `embodiment/ee`; a single static wrist transform is rejected.
+
+Important: the published UniVTAC `clean.yml`, `demo.yml`, and `contact.yml` record camera RGB only,
+and the published HDF5 writer does not save head/wrist intrinsics or camera transforms. Those
+existing RGB-only episodes therefore cannot be safely converted into a common-frame scene cloud.
+Re-collect with `camera: ['rgb', 'depth']` and record calibration/transforms, or provide a verified
+sidecar derived from the exact simulator/task configuration that created the recordings. The
+converter never substitutes task-default poses or guessed calibration.
 
 Install conversion dependencies with:
 
@@ -58,28 +83,69 @@ uv run python examples/UniVTAC/convert_univtac_to_lerobot.py \
   --verbose
 ```
 
-### Tactile and point cloud
+### Calibrated head+wrist scene cloud
 
-The inspected downloaded episode did not embed camera intrinsics or a depth-unit attribute. Therefore the source RGB/depth paths, pinhole calibration, and millimetre-to-metre scale are explicit in this example. The legacy `left_gsmini` text below is the real raw HDF5 group name; it does not create a `left` semantic modality:
+A sidecar is needed only for values not embedded in the HDF5. Matrix values below are deliberately
+symbolic: replace every entry with calibration extracted from the exact recording configuration.
+Do not copy a matrix from another task or camera setup.
+
+```json
+{
+  "coordinate_frame": "robot_base",
+  "cameras": {
+    "head": {
+      "rgb_key": "observation/head/rgb",
+      "depth_key": "observation/head/depth",
+      "intrinsics": [["FX_HEAD", 0, "CX_HEAD"], [0, "FY_HEAD", "CY_HEAD"], [0, 0, 1]],
+      "depth_scale": "HEAD_UNITS_TO_METRES",
+      "T_base_camera": "VERIFIED_4_BY_4_HEAD_MATRIX"
+    },
+    "wrist": {
+      "rgb_key": "observation/wrist/rgb",
+      "depth_key": "observation/wrist/depth",
+      "intrinsics": [["FX_WRIST", 0, "CX_WRIST"], [0, "FY_WRIST", "CY_WRIST"], [0, 0, 1]],
+      "depth_scale": "WRIST_UNITS_TO_METRES",
+      "T_ee_camera": "VERIFIED_4_BY_4_WRIST_MOUNT_MATRIX",
+      "ee_pose_key": "embodiment/ee"
+    }
+  }
+}
+```
+
+The camera convention is OpenCV/ROS optical (`+x` right, `+y` down, `+z` forward). Each supplied
+matrix must map that optical frame into its named parent. `embodiment/ee` is the UniVTAC
+base-frame pose `[x,y,z,qw,qx,qy,qz]`, so each wrist frame uses
+`T_base_wrist_camera(t) = T_base_ee(t) @ T_ee_camera`. If HDF5 already stores per-frame
+`observation/{camera}/T_base_camera`, that verified dataset takes precedence.
+
+Convert one episode first:
 
 ```bash
 uv run python examples/UniVTAC/convert_univtac_to_lerobot.py \
   --input /path/to/UniVTAC \
-  --output /path/to/univtac_gr00t_multimodal \
+  --output /path/to/univtac_scene_multimodal_smoke \
   --fps 10 \
+  --max-episodes 1 \
   --include-tactile \
   --tactile-rgb-key tactile/left_gsmini/rgb \
-  --include-pointcloud \
-  --pointcloud-depth-key tactile/left_gsmini/depth \
-  --pointcloud-intrinsics 340.45112782 324.97607656 160 120 \
-  --pointcloud-depth-scale 0.001 \
-  --pointcloud-num-points 1024 \
+  --include-scene-pointcloud \
+  --scene-calibration-json /path/to/verified_univtac_scene_calibration.json \
+  --scene-voxel-size 0.01 \
+  --scene-num-points 8192 \
+  --scene-seed 0 \
   --verbose
 ```
 
-Those calibration values come from the current UniVTAC GS Mini configuration: resolution `(320, 240)`, camera-to-surface distance `0.0283 m`, and real size `(0.0266, 0.0209) m`. Confirm them against the configuration that produced custom data. When an HDF5 depth dataset/group/file contains `intrinsics`, `camera_intrinsics`, `intrinsic_matrix`, `depth_scale`, `unit`, or equivalent supported metadata, the converter uses it and the corresponding override can be omitted. It never guesses missing calibration.
+Remove `--max-episodes 1` for the full conversion. Use `--scene-workspace-min X Y Z` together with
+`--scene-workspace-max X Y Z` only after measuring task bounds in `robot_base`; no arbitrary crop
+is enabled by default. The converter filters invalid/non-positive depth, transforms both cameras,
+merges with `np.concatenate(..., axis=0)`, optionally crops, averages XYZRGB per voxel, then randomly
+caps points. Random sampling is reproducible. No robot/self mask is applied because the inspected
+UniVTAC data path exposes no verified robot-geometry filter.
 
-`--pointcloud-depth-key` selects one camera stream, so the example point cloud is in that selected tactile camera's OpenCV frame (`+x` right, `+y` down, `+z` along depth). It is not transformed into robot/world coordinates. Choose another depth stream and its matching intrinsics when a different frame is desired.
+The old `--include-pointcloud` flag remains available only for backward-compatible tactile-depth
+XYZ datasets. It is not the default scene design and cannot be combined with
+`--include-scene-pointcloud`.
 
 The output path must not exist. `--overwrite` replaces it only after a staging conversion validates. `--skip-invalid` skips malformed episodes; the default fails instead of silently dropping data.
 
@@ -96,7 +162,7 @@ univtac_gr00t_multimodal/
 │       └── observation.tactile.rgb/episode_000000.mp4
 ├── pointclouds/
 │   └── chunk-000/
-│       └── observation.pointcloud.xyz/episode_000000.npz
+│       └── observation.pointcloud.scene/episode_000000.npz
 └── meta/
     ├── info.json
     ├── modality.json
@@ -106,7 +172,12 @@ univtac_gr00t_multimodal/
 
 Tactile RGB is physically H.264 video but remains semantically `tactile.rgb`. H.264 is lossy; decoded arrays are `uint8 [T,H,W,3]`, but pixel values need not exactly equal the source JPEG decode.
 
-Each point-cloud NPZ contains `xyz` as `float32 [T,1024,3]`. Conversion filters non-finite and non-positive scaled depth. Valid pixels are traversed in row-major order and deterministically sampled at uniform positions. When fewer than 1024 valid pixels exist, valid points repeat deterministically; a frame with no valid point fails conversion.
+Each scene NPZ contains `scene` as `float32 [T,N,6]`: robot-base XYZ followed by the matching
+camera RGB stored in `[0,255]`. Concerto applies its official `NormalizeColor` division by 255 inside
+the encoder. Dataset metadata records camera sources, calibration provenance, coordinate frame,
+workspace/voxel settings, sampling seed, and per-camera/preprocessing point counts. RGB-D frames
+with no valid points, missing calibration, incompatible resolutions, or a static wrist extrinsic
+fail conversion rather than producing a geometrically invalid merge.
 
 ## Modality Configuration
 
@@ -158,9 +229,15 @@ Expected sample values include:
 images.head           [1, 270, 480, 3] uint8
 images.wrist          [1, 270, 480, 3] uint8
 tactile.rgb           [2, 240, 320, 3] uint8
-pointclouds.xyz       [1, 1024, 3] float32
+pointclouds.scene     [1, 8192, 6] float32
 states.joint          [1, 8] float32
 actions.joint         [40, 8] float32
+
+scene coordinate frame: robot_base
+scene source cameras: head,wrist
+scene XYZ min/max: ...
+scene RGB min/max: ...
+head/wrist points before merge: ...
 ```
 
 To check an existing baseline dataset in the same run, add:
@@ -364,25 +441,67 @@ Use either `--tactile-pretrained-model facebook/sparsh-dino-base` or the resulti
 ### Architecture
 
 ```text
-Head RGB ───────────────┐
-Wrist RGB ───────────────┼→ Qwen3-VL ─────────────┐
-Language ───────────────┘                         │
-                                                  ↓
-                                            GR00T Action DiT
-                                           ↑               ↑
-                                          /                 \
-                           point cross-attn                   tactile cross-attn
-                                ↑                                  ↑
-                         Concerto pretrained                 Sparsh-DINO pretrained
-                                ↑                                  ↑
-                      Head+Wrist scene PC                Tactile(t-1), Tactile(t)
+Head RGB ──────────────────────→ Qwen3-VL ─────┐
+Wrist RGB ─────────────────────→ Qwen3-VL ─────┤
+Language ──────────────────────→ Qwen3-VL ─────┤
+                                               ↓
+                                         GR00T Action DiT
+                                               ↑
+                                               │ point cross-attention
+                                               │
+Head RGB-D  ─→ XYZRGB ─┐                       │
+                       ├→ common frame → merge → pretrained Concerto/PTv3
+Wrist RGB-D ─→ XYZRGB ─┘
 ```
 
-The Concerto and Sparsh branches stay independent until their separate gated cross-attention residuals update action tokens. Tactile images are not sent through Qwen3-VL.
+The same head/wrist RGB images participate in two separate representations: Qwen3-VL receives
+them as the 2D semantic VLM path, while their pixels become the RGB features of the 3D XYZRGB
+scene path. Head and wrist points are transformed first and concatenated over the point dimension;
+they are never concatenated as features. Concerto produces geometry tokens, projects them to the
+DiT inner dimension, and the existing gated point cross-attention updates action tokens. It does
+not replace the GR00T DiT. The optional Sparsh tactile branch remains separate and does not enter
+Qwen3-VL or Concerto.
+
+### Concerto installation and checkpoint smoke test
+
+Concerto is optional so RGB-only and lightweight PointNet++ workflows keep working. Install the
+official [Pointcept/Concerto](https://github.com/Pointcept/Concerto) package-mode dependencies using
+versions matching the active GR00T PyTorch/CUDA environment. The official instructions derive the
+`spconv-cu${CUDA_VERSION}` package and torch-scatter wheel from the locally reported versions; do
+not blindly copy an example CUDA suffix.
+
+```bash
+uv run python -c 'import torch; print(torch.__version__, torch.version.cuda)'
+nvcc --version
+
+git clone https://github.com/Pointcept/Concerto.git /path/to/Concerto
+uv pip install huggingface_hub timm
+# Install matching spconv, torch-scatter, and optional FlashAttention per Concerto README.
+uv pip install --no-deps /path/to/Concerto
+```
+
+The wrapper uses the official `concerto.load(..., ckpt_only=True)` path with repository
+`Pointcept/Concerto`. Supported GR00T names are exactly `concerto_small` and `concerto_base`; a
+local official `.pth` can be supplied with `--point-encoder-checkpoint-path`. Loading is strict and
+fails on missing/unexpected keys or a missing checkpoint. It never falls back to random weights.
+
+Run a one-batch real-checkpoint CUDA test before fine-tuning:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+uv run python scripts/smoke_test_concerto_point_encoder.py \
+  --model concerto_small \
+  --device cuda:0 \
+  --batch-size 1 \
+  --num-points 8192 \
+  --dit-dim 1536
+```
 
 ### Multimodal fine-tuning
 
-This command parses through `examples/finetune.sh`, uses LR `1e-5` only for the pretrained Sparsh backbone, and uses the action-head LR (`1e-4`) for the new projection, cross-attention, and gates:
+This command parses through `examples/finetune.sh`. It uses LR `1e-5` only for the pretrained
+Concerto backbone and LR `1e-4` for the new Concerto projection, point cross-attention, residual
+gate, and the rest of the trainable action head:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,7 \
@@ -394,30 +513,36 @@ MAX_STEPS=2000 \
 USE_WANDB=0 \
 uv run bash examples/finetune.sh \
   --base-model-path nvidia/GR00T-N1.7-3B \
-  --dataset-path /path/to/univtac_multimodal \
+  --dataset-path /path/to/univtac_scene_multimodal \
   --embodiment-tag NEW_EMBODIMENT \
   --modality-config-path examples/UniVTAC/univtac_multimodal_config.py \
-  --output-dir outputs/univtac_sparsh \
+  --output-dir outputs/univtac_concerto \
   -- \
   --dit-type multimodal_conditioned_dit \
+  --no-use-tactile-conditioning \
+  --point-encoder-cfg concerto_small \
   --point-input-dim 6 \
-  --tactile-encoder-cfg sparsh_dino_base \
-  --tactile-pretrained-model facebook/sparsh-dino-base \
-  --tactile-background-path /path/to/gsmini_no_contact.png \
-  --tactile-encoder-learning-rate 1e-5 \
+  --point-encoder-learning-rate 1e-5 \
   --action-head-learning-rate 1e-4 \
   --allow-padding \
-  --tune-tactile-encoder \
+  --tune-point-encoder \
   --tune-multimodal-adapter
 ```
 
-`--allow-padding` uses GR00T's established in-episode clamping for all delta-indexed modalities;
-therefore the first tactile pair is `[frame 0, frame 0]`, matching rollout reset behavior. The
-background argument reproduces the official GelSight Mini/DIGIT subtraction. Omit it only
-when the stored stream is already background-adjusted or when intentionally using the official
-raw GelSight-2017 preprocessing path.
+`concerto_small` is the default production point encoder; `--point-encoder-cfg concerto_base`
+selects the larger official model. Use `--point-encoder-checkpoint-path /path/to/concerto_small.pth`
+for an already downloaded official checkpoint. Startup logs include the checkpoint source, loaded
+parameter count, missing/unexpected keys, and trainability.
 
-Use `--no-tune-tactile-encoder` to freeze only the Sparsh backbone; the newly initialized tactile projection and cross-attention remain trainable when `--tune-multimodal-adapter` is enabled. Use `--tactile-encoder-cfg resnet18` for the scratch baseline.
+`--allow-padding` uses GR00T's established in-episode clamping for delta-indexed modalities;
+therefore the first tactile pair is `[frame 0, frame 0]`, matching rollout reset behavior. To use
+the existing tactile branch too, add the Sparsh checkpoint/background flags from the preceding
+section. Use `--no-use-tactile-conditioning` for a point-only action branch; the current multimodal
+dataset config still includes tactile data for compatible joint ablations.
+
+Use `--no-tune-point-encoder` to freeze only the Concerto backbone; the new projection and point
+cross-attention remain trainable with `--tune-multimodal-adapter`. `pointnet2` and
+`point_transformer` remain available for legacy XYZ-only datasets with `--point-input-dim 3`.
 
 One-batch real-checkpoint CUDA smoke test:
 
@@ -428,7 +553,9 @@ CUDA_VISIBLE_DEVICES=0 uv run python scripts/smoke_test_sparsh_tactile.py \
   --dit-dim 1536
 ```
 
-Use `--no-use-point-conditioning` or `--no-use-tactile-conditioning` for a single-sensor ablation. The calibrated UniVTAC `scene` conversion is XYZRGB and uses the default `--point-input-dim 6`; legacy XYZ-only point fields must use a lightweight point encoder with `--point-input-dim 3`.
+Use `--no-use-point-conditioning` or `--no-use-tactile-conditioning` for single-sensor ablations.
+The calibrated UniVTAC `scene` conversion is XYZRGB and requires `--point-input-dim 6`; selecting
+Concerto with an XYZ-only input fails with an explicit incompatibility error.
 
 ## Current Limitations
 

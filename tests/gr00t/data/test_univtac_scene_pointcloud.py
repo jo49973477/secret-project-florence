@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib
 from types import SimpleNamespace
 
 from examples.UniVTAC.scene_pointcloud import (
@@ -125,6 +126,11 @@ class _FakeConcertoBackbone(nn.Module):
         return SimpleNamespace(feat=self.linear(data["feat"]), offset=data["offset"])
 
 
+class _CheckpointConcertoBackbone(_FakeConcertoBackbone):
+    def __init__(self, **_config) -> None:
+        super().__init__()
+
+
 def test_concerto_wrapper_shape_mask_projection_and_rgb_normalization() -> None:
     backbone = _FakeConcertoBackbone()
     encoder = ConcertoPointEncoder(
@@ -160,3 +166,52 @@ def test_concerto_refuses_unverified_random_backbone() -> None:
             backbone_output_dim=12,
             pretrained_loaded=False,
         )
+
+
+def test_concerto_official_loader_restores_non_default_checkpoint_weights(monkeypatch) -> None:
+    checkpoint_model = _CheckpointConcertoBackbone()
+    nn.init.constant_(checkpoint_model.linear.weight, 0.75)
+    nn.init.constant_(checkpoint_model.linear.bias, -0.125)
+    checkpoint = {
+        "config": {
+            "in_channels": 9,
+            "enc_mode": False,
+            "dec_channels": (12,),
+        },
+        "state_dict": checkpoint_model.state_dict(),
+    }
+    calls = []
+
+    fake_concerto = SimpleNamespace(
+        load=lambda *args, **kwargs: calls.append((args, kwargs)) or checkpoint,
+        model=SimpleNamespace(PointTransformerV3=_CheckpointConcertoBackbone),
+    )
+    real_import_module = importlib.import_module
+
+    def fake_import_module(name):
+        if name == "concerto":
+            return fake_concerto
+        return real_import_module(name)
+
+    monkeypatch.setattr(
+        "gr00t.model.extension.point_encoder.importlib.import_module", fake_import_module
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    encoder = ConcertoPointEncoder(
+        input_dim=6,
+        point_dim=16,
+        model_name="concerto_small",
+        repo_id="Pointcept/Concerto",
+    )
+
+    assert calls[0][0] == ("concerto_small",)
+    assert calls[0][1]["repo_id"] == "Pointcept/Concerto"
+    assert calls[0][1]["ckpt_only"] is True
+    assert torch.allclose(
+        encoder.backbone.linear.weight, torch.full_like(encoder.backbone.linear.weight, 0.75)
+    )
+    assert torch.allclose(
+        encoder.backbone.linear.bias, torch.full_like(encoder.backbone.linear.bias, -0.125)
+    )
+    assert encoder.pretrained_loaded is True

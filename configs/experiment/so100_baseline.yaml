@@ -1,0 +1,25 @@
+# @package _global_
+defaults:
+- /model: gr00t_base
+- /data: so100
+- /training: finetune
+- /hardware: dual_3090_zero3
+- _self_
+- override /hydra/job_logging: disabled
+name: so100_baseline
+run_id: ${now:%Y%m%d_%H%M%S}
+output_dir: outputs/${name}/${run_id}
+dry_run: false
+resume:
+  enabled: false
+  checkpoint_path: null
+  auto_find_latest: false
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null
+training:
+  max_steps: 2000
+  gradient_accumulation_steps: 16

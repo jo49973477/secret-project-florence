@@ -11,6 +11,7 @@ from gr00t.data.types import (
     ModalityConfig,
 )
 
+
 ACTION_HORIZON = 16
 
 

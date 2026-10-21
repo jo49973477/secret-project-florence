@@ -35,7 +35,7 @@ TASK_DISPLAY_NAMES = {
     "grasp_classify": "Grasp & Classify",
 }
 
-ERROR_TERMINATIONS = frozenset({"exception", "invalid_action"})
+ERROR_TERMINATIONS = frozenset({"exception", "invalid_action", "worker_failure"})
 VALID_TERMINATIONS = frozenset({"success", "step_limit", "early_stop"}) | ERROR_TERMINATIONS
 
 

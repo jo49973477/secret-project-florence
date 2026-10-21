@@ -1,0 +1,6 @@
+defaults:
+- gr00t_base
+- _self_
+dit_type: multimodal_conditioned_dit
+use_point_conditioning: true
+use_tactile_conditioning: true

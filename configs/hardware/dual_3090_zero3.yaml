@@ -1,0 +1,13 @@
+cuda_visible_devices: ${oc.env:CUDA_VISIBLE_DEVICES,"0,1"}
+num_gpus: 2
+master_port: 29500
+deepspeed_stage: 3
+use_ddp: false
+tf32: true
+fp16: false
+bf16: true
+gradient_checkpointing: false
+dataloader_num_workers: 0
+zero3_offload_optimizer: false
+zero3_offload_param: false
+zero3_sub_group_size: null

@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import logging
 import os
 from typing import Any, Tuple
@@ -28,6 +27,7 @@ import tree
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
 from gr00t.model.extension.multimodal_dit import MultiModalConditionedDiT
 from gr00t.model.extension.point_encoder import ConcertoPointEncoder, build_point_encoder
+from gr00t.model.extension.sidecar_dit import SidecarConditionedDiT
 from gr00t.model.extension.tactile_encoder import SparshDinoTactileEncoder, build_tactile_encoder
 from gr00t.model.modules.dit import AlternateVLDiT, DiT, SelfAttentionTransformer
 from gr00t.model.modules.embodiment_conditioned_mlp import (
@@ -111,6 +111,23 @@ class Gr00tN1d7ActionHead(nn.Module):
                 attend_text_every_n_blocks=config.attend_text_every_n_blocks,
             )
             logger.info("Using AlternateVLDiT for diffusion model")
+        elif config.dit_type == "sidecar_conditioned_dit":
+            self.model = SidecarConditionedDiT(
+                **config.diffusion_model_cfg,
+                cross_attention_dim=config.backbone_embedding_dim,
+                attend_text_every_n_blocks=config.attend_text_every_n_blocks,
+                sidecar_num_stages=config.sidecar_num_stages,
+                sidecar_stage_indices=config.sidecar_stage_indices,
+                sidecar_hidden_dim=config.sidecar_hidden_dim,
+                sidecar_num_heads=config.sidecar_num_heads,
+                sidecar_num_point_tokens=config.sidecar_num_point_tokens,
+                tactile_fusion_mode=config.tactile_fusion_mode,
+                contact_num_tokens=config.contact_num_tokens,
+                contact_hidden_dim=config.contact_hidden_dim,
+                freeze_pretrained_dit=config.freeze_pretrained_dit,
+                freeze_contact_teacher=config.freeze_contact_teacher,
+                contact_injection_enabled=config.contact_injection_enabled,
+            )
         elif config.dit_type == "multimodal_conditioned_dit":
             self.model = MultiModalConditionedDiT(
                 **config.diffusion_model_cfg,
@@ -150,8 +167,9 @@ class Gr00tN1d7ActionHead(nn.Module):
         )
         self.point_encoder = None
         self.tactile_encoder = None
-        if config.dit_type == "multimodal_conditioned_dit":
+        if config.dit_type in {"multimodal_conditioned_dit", "sidecar_conditioned_dit"}:
             if config.use_point_conditioning and not config.point_encoder_deferred_bootstrap:
+                normalized_point_encoder_cfg = config.point_encoder_cfg.lower().replace("-", "_")
                 self.point_encoder = build_point_encoder(
                     config.point_encoder_cfg,
                     input_dim=config.point_input_dim,
@@ -166,10 +184,18 @@ class Gr00tN1d7ActionHead(nn.Module):
                             "load_pretrained": config.point_encoder_pretrained_load_on_init,
                             "architecture_config": config.point_encoder_model_config,
                         }
-                        if config.point_encoder_cfg in {"concerto_small", "concerto_base"}
+                        if normalized_point_encoder_cfg in {"concerto_small", "concerto_base"}
                         else {}
                     ),
                 )
+                if (
+                    isinstance(self.point_encoder, ConcertoPointEncoder)
+                    and self.point_encoder.architecture_config is not None
+                ):
+                    # The complete backbone is stored in the GR00T checkpoint. Persist its exact
+                    # architecture so reload does not need the original Hub/local .pth file.
+                    config.point_encoder_model_config = dict(self.point_encoder.architecture_config)
+                    config.point_encoder_pretrained_load_on_init = False
             if config.use_tactile_conditioning and not config.tactile_encoder_deferred_bootstrap:
                 self.tactile_encoder = build_tactile_encoder(
                     config.tactile_encoder_cfg,
@@ -323,9 +349,11 @@ class Gr00tN1d7ActionHead(nn.Module):
             self.action_decoder.requires_grad_(False)
             if self.config.add_pos_embed:
                 self.position_embedding.requires_grad_(False)
-        if not tune_diffusion_model:
+        if not tune_diffusion_model or (
+            isinstance(self.model, SidecarConditionedDiT) and self.config.freeze_pretrained_dit
+        ):
             self.model.requires_grad_(False)
-        if isinstance(self.model, MultiModalConditionedDiT):
+        if isinstance(self.model, (MultiModalConditionedDiT, SidecarConditionedDiT)):
             # The base DiT can remain frozen while the new residual adapters train.
             self.model.set_multimodal_adapter_trainable(tune_multimodal_adapter)
         if self.point_encoder is not None:
@@ -352,6 +380,42 @@ class Gr00tN1d7ActionHead(nn.Module):
         logger.debug(f"Tune action head projector: {self.tune_projector}")
         logger.debug(f"Tune action head diffusion model: {self.tune_diffusion_model}")
         logger.debug(f"Tune action head vlln: {self.tune_vlln}")
+        if isinstance(self.model, SidecarConditionedDiT) and self.config.freeze_contact_teacher:
+            if self.tactile_encoder is not None:
+                self.tactile_encoder.requires_grad_(False)
+        if isinstance(self.model, SidecarConditionedDiT) and self.config.contact_predictor_warmup:
+            if (
+                not self.config.use_tactile_conditioning
+                or self.config.tactile_fusion_mode == "none"
+            ):
+                raise ValueError("Contact warmup requires tactile observations")
+            self.requires_grad_(False)
+            for module in (
+                self.model.contact_adapter.scene_pool,
+                self.model.contact_adapter.state_projection,
+                self.model.contact_adapter.predictor,
+            ):
+                module.requires_grad_(True)
+            self.model.contact_injection_enabled = False
+        if isinstance(self.model, SidecarConditionedDiT):
+            for name, module in (
+                ("sidecar", self.model.sidecar_stages),
+                ("point_pool", self.model.sidecar_pool),
+                ("contact", self.model.contact_adapter),
+                ("contact_injection", self.model.contact_injections),
+            ):
+                total = sum(getattr(p, "ds_numel", p.numel()) for p in module.parameters())
+                trainable = sum(
+                    getattr(p, "ds_numel", p.numel())
+                    for p in module.parameters()
+                    if p.requires_grad
+                )
+                logger.info(
+                    "%s parameters: total=%s trainable=%s (action-head optimizer ownership)",
+                    name,
+                    total,
+                    trainable,
+                )
         logger.debug(f"Tune point encoder: {self.tune_point_encoder}")
         logger.debug(f"Tune tactile encoder: {self.tune_tactile_encoder}")
         logger.debug(f"Tune multimodal adapter: {self.tune_multimodal_adapter}")
@@ -378,10 +442,10 @@ class Gr00tN1d7ActionHead(nn.Module):
                     self.position_embedding.eval()
             if not self.tune_diffusion_model:
                 self.model.eval()
-                if isinstance(self.model, MultiModalConditionedDiT):
+                if isinstance(self.model, (MultiModalConditionedDiT, SidecarConditionedDiT)):
                     self.model.set_multimodal_adapter_mode(self.tune_multimodal_adapter)
             elif (
-                isinstance(self.model, MultiModalConditionedDiT)
+                isinstance(self.model, (MultiModalConditionedDiT, SidecarConditionedDiT))
                 and not self.tune_multimodal_adapter
             ):
                 self.model.set_multimodal_adapter_mode(False)
@@ -392,7 +456,13 @@ class Gr00tN1d7ActionHead(nn.Module):
                     self.point_encoder.projection.eval()
             elif self.point_encoder is not None and not self.tune_point_encoder:
                 self.point_encoder.eval()
-            if self.tactile_encoder is not None and not self.tune_tactile_encoder:
+            if self.tactile_encoder is not None and (
+                not self.tune_tactile_encoder
+                or (
+                    isinstance(self.model, SidecarConditionedDiT)
+                    and self.config.freeze_contact_teacher
+                )
+            ):
                 self.tactile_encoder.eval()
             if not self.tune_vlln:
                 self.vlln.eval()
@@ -434,7 +504,10 @@ class Gr00tN1d7ActionHead(nn.Module):
             )
 
         tactile_tokens = None
-        if self.tactile_encoder is not None:
+        if self.tactile_encoder is not None and not (
+            isinstance(self.model, SidecarConditionedDiT)
+            and self.config.tactile_fusion_mode == "none"
+        ):
             if "tactile" not in action_input:
                 raise KeyError(
                     "Tactile conditioning is enabled but action_input.tactile is missing"
@@ -488,6 +561,7 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         # Embed state.
         state_features = self.state_encoder(action_input.state, embodiment_id)
+        contact_state_features = state_features
 
         # Dropout state features (training only): zero out dropped states.
         if self.training and self.state_dropout_prob > 0:
@@ -549,7 +623,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 backbone_attention_mask=backbone_attention_mask,
                 hidden_attention_mask=hidden_attention_mask,
             )
-        elif self.config.dit_type == "multimodal_conditioned_dit":
+        elif self.config.dit_type in {"multimodal_conditioned_dit", "sidecar_conditioned_dit"}:
             point_tokens, point_attention_mask, tactile_tokens = self._encode_multimodal_inputs(
                 action_input
             )
@@ -562,6 +636,11 @@ class Gr00tN1d7ActionHead(nn.Module):
                 point_tokens=point_tokens,
                 point_attention_mask=point_attention_mask,
                 tactile_tokens=tactile_tokens,
+                **(
+                    {"robot_state": contact_state_features}
+                    if isinstance(self.model, SidecarConditionedDiT)
+                    else {}
+                ),
                 image_mask=backbone_output.image_mask,
                 backbone_attention_mask=backbone_output.backbone_attention_mask,
                 hidden_attention_mask=hidden_attention_mask,
@@ -586,6 +665,17 @@ class Gr00tN1d7ActionHead(nn.Module):
         action_loss = F.mse_loss(pred_actions.float(), velocity.float(), reduction="none")
         action_loss = action_loss * action_mask.float()
         loss = action_loss.sum() / (action_mask.float().sum() + 1e-6)
+        if isinstance(self.model, SidecarConditionedDiT):
+            if self.config.contact_predictor_warmup:
+                loss = (
+                    self.config.contact_prediction_loss_weight * self.model.contact_prediction_loss
+                )
+            else:
+                loss = (
+                    loss
+                    + self.config.contact_prediction_loss_weight
+                    * self.model.contact_prediction_loss
+                )
 
         diagnostic_mask = action_mask.float()
         valid_count = diagnostic_mask.sum().clamp_min(1.0)
@@ -594,23 +684,17 @@ class Gr00tN1d7ActionHead(nn.Module):
         pred_mean = (pred_float * diagnostic_mask).sum() / valid_count
         target_mean = (target_float * diagnostic_mask).sum() / valid_count
         diagnostics = {
-            "predicted_velocity_std": (
-                (pred_float - pred_mean).square() * diagnostic_mask
-            ).sum().div(valid_count).sqrt(),
-            "target_velocity_std": (
-                (target_float - target_mean).square() * diagnostic_mask
-            ).sum().div(valid_count).sqrt(),
+            "predicted_velocity_std": ((pred_float - pred_mean).square() * diagnostic_mask)
+            .sum()
+            .div(valid_count)
+            .sqrt(),
+            "target_velocity_std": ((target_float - target_mean).square() * diagnostic_mask)
+            .sum()
+            .div(valid_count)
+            .sqrt(),
             "zero_prediction_mse": (target_float.square() * diagnostic_mask).sum().div(valid_count),
             "valid_action_ratio": action_mask.float().mean(),
         }
-        if isinstance(self.model, MultiModalConditionedDiT):
-            if self.config.use_point_conditioning and point_tokens is not None:
-                diagnostics["point_gate_mean_abs"] = self.model.point_gates.detach().abs().mean()
-            if self.config.use_tactile_conditioning and tactile_tokens is not None:
-                diagnostics["tactile_gate_mean_abs"] = (
-                    self.model.tactile_gates.detach().abs().mean()
-                )
-
         if not self._dtype_diagnostics_logged and os.environ.get(
             "GR00T_DTYPE_DEBUG", ""
         ).lower() in {"1", "true", "yes"}:
@@ -621,10 +705,10 @@ class Gr00tN1d7ActionHead(nn.Module):
                 state_features.dtype,
                 actions.dtype,
                 getattr(point_tokens, "dtype", None)
-                if self.config.dit_type == "multimodal_conditioned_dit"
+                if self.config.dit_type in {"multimodal_conditioned_dit", "sidecar_conditioned_dit"}
                 else None,
                 getattr(tactile_tokens, "dtype", None)
-                if self.config.dit_type == "multimodal_conditioned_dit"
+                if self.config.dit_type in {"multimodal_conditioned_dit", "sidecar_conditioned_dit"}
                 else None,
                 sa_embs.dtype,
                 pred_actions.dtype,
@@ -767,7 +851,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         point_tokens = None
         point_attention_mask = None
         tactile_tokens = None
-        if self.config.dit_type == "multimodal_conditioned_dit":
+        if self.config.dit_type in {"multimodal_conditioned_dit", "sidecar_conditioned_dit"}:
             point_tokens, point_attention_mask, tactile_tokens = self._encode_multimodal_inputs(
                 action_input
             )
@@ -807,7 +891,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                     backbone_attention_mask=backbone_output.backbone_attention_mask,
                     hidden_attention_mask=hidden_attention_mask,
                 )
-            elif self.config.dit_type == "multimodal_conditioned_dit":
+            elif self.config.dit_type in {"multimodal_conditioned_dit", "sidecar_conditioned_dit"}:
                 model_output = self.model(
                     hidden_states=sa_embs,
                     encoder_hidden_states=vl_embeds,
@@ -815,6 +899,11 @@ class Gr00tN1d7ActionHead(nn.Module):
                     point_tokens=point_tokens,
                     point_attention_mask=point_attention_mask,
                     tactile_tokens=tactile_tokens,
+                    **(
+                        {"robot_state": state_features}
+                        if isinstance(self.model, SidecarConditionedDiT)
+                        else {}
+                    ),
                     image_mask=backbone_output.image_mask,
                     backbone_attention_mask=backbone_output.backbone_attention_mask,
                     hidden_attention_mask=hidden_attention_mask,

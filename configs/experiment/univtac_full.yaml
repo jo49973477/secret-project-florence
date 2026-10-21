@@ -1,0 +1,22 @@
+# @package _global_
+defaults:
+- /model: gr00t_multimodal
+- /data: univtac_multimodal
+- /training: finetune
+- /hardware: dual_3090_zero3
+- _self_
+- override /hydra/job_logging: disabled
+name: univtac_full
+run_id: ${now:%Y%m%d_%H%M%S}
+output_dir: outputs/${name}/${run_id}
+dry_run: false
+resume:
+  enabled: false
+  checkpoint_path: null
+  auto_find_latest: false
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null

@@ -4,11 +4,15 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict, dataclass
 import json
+import os
 from pathlib import Path
 import shlex
+import signal
 import subprocess
 import sys
+import time
 from typing import Any
 
 from univtac_rollout.core import EpisodeResult, resolve_tasks, write_results
@@ -16,6 +20,13 @@ from univtac_rollout.policy import Gr00tUniVTACPolicy
 
 
 MODE_EPISODES = {"smoke": 5, "quick": 20, "full": 100}
+
+
+@dataclass(frozen=True)
+class ProcessOutcome:
+    return_code: int
+    signal_name: str | None
+    elapsed_seconds: float
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -39,6 +50,11 @@ def _parser() -> argparse.ArgumentParser:
         default=sys.executable,
         help="Isaac Python command, e.g. '/path/to/IsaacLab/isaaclab.sh -p'.",
     )
+    parser.add_argument(
+        "--expected-python",
+        type=Path,
+        help="Exact Python executable the driver and worker must use.",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--headless", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
@@ -60,6 +76,17 @@ def _validate(args: argparse.Namespace) -> tuple[list[str], int]:
         raise ValueError("--seed-start must be nonnegative.")
     if args.request_timeout_seconds <= 0:
         raise ValueError("--request-timeout-seconds must be positive.")
+    if args.expected_python is not None:
+        expected = args.expected_python.expanduser().absolute()
+        actual = Path(sys.executable).absolute()
+        if not expected.is_file():
+            raise FileNotFoundError(f"--expected-python does not exist: {expected}")
+        if actual != expected:
+            raise RuntimeError(
+                "Wrong Python environment selected for the rollout driver: "
+                f"expected {expected}, running {actual}. Deactivate the unrelated Conda/venv "
+                "or invoke Isaac Lab with those environment variables unset."
+            )
     root = args.univtac_root.resolve()
     required = [root / "envs" / "_base_task.py", root / "task_config", root / "instructions"]
     missing = [str(path) for path in required if not path.exists()]
@@ -71,23 +98,32 @@ def _validate(args: argparse.Namespace) -> tuple[list[str], int]:
     return tasks, episodes
 
 
-def _load_worker_result(path: Path) -> tuple[list[EpisodeResult], dict[str, Any]]:
+def _load_worker_result(
+    path: Path,
+) -> tuple[list[EpisodeResult], dict[str, Any], bool, str, str]:
     with path.open(encoding="utf-8") as file:
         payload = json.load(file)
     return (
         [EpisodeResult(**row) for row in payload["episodes"]],
         payload.get("runtime_metadata", {}),
+        payload.get("completed") is True,
+        str(payload.get("phase", "unknown")),
+        str(payload.get("fatal_error", "")),
     )
 
 
-def _stream_process(command: list[str], *, cwd: Path, log_path: Path) -> int:
+def _stream_process(command: list[str], *, cwd: Path, log_path: Path) -> ProcessOutcome:
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    started = time.perf_counter()
     with log_path.open("w", encoding="utf-8") as log:
         log.write("Command: " + shlex.join(command) + "\n\n")
         log.flush()
+        environment = os.environ.copy()
+        environment["PYTHONUNBUFFERED"] = "1"
         process = subprocess.Popen(
             command,
             cwd=cwd,
+            env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -97,7 +133,48 @@ def _stream_process(command: list[str], *, cwd: Path, log_path: Path) -> int:
         for line in process.stdout:
             print(line, end="")
             log.write(line)
-        return process.wait()
+            log.flush()
+        return_code = process.wait()
+        elapsed = time.perf_counter() - started
+        signal_name = None
+        if return_code < 0:
+            try:
+                signal_name = signal.Signals(-return_code).name
+            except ValueError:
+                signal_name = f"signal {-return_code}"
+        footer = (
+            "\n[orchestrator] worker process finished: "
+            f"pid={process.pid} return_code={return_code} "
+            f"signal={signal_name or 'none'} elapsed_seconds={elapsed:.3f}\n"
+        )
+        print(footer, end="", flush=True)
+        log.write(footer)
+        log.flush()
+        return ProcessOutcome(return_code, signal_name, elapsed)
+
+
+def _worker_failure_result(
+    args: argparse.Namespace,
+    *,
+    task: str,
+    episode_index: int,
+    error: str,
+) -> EpisodeResult:
+    return EpisodeResult(
+        task=task,
+        seed=args.seed_start + episode_index,
+        episode_index=episode_index,
+        success=None,
+        num_steps=0,
+        sim_steps=0,
+        execution_horizon=args.execution_horizon,
+        checkpoint=args.checkpoint,
+        instruction="",
+        elapsed_seconds=0.0,
+        termination_reason="worker_failure",
+        video_path="",
+        error=error,
+    )
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -116,7 +193,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     result_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Checking GR00T server {args.server_host}:{args.server_port} and checkpoint contract...")
+    print(
+        f"Checking GR00T server {args.server_host}:{args.server_port} and checkpoint contract...",
+        flush=True,
+    )
     with Gr00tUniVTACPolicy(
         args.server_host,
         args.server_port,
@@ -168,6 +248,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ]
         if args.headless:
             command.append("--headless")
+        if args.expected_python is not None:
+            command.extend(("--expected-python", str(args.expected_python.expanduser().absolute())))
         command.append(
             "--debug-first-rollout"
             if args.debug_first_rollout and task_index == 0
@@ -176,34 +258,118 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if args.step_limit is not None:
             command.extend(("--step-limit", str(args.step_limit)))
 
-        print(f"\nStarting UniVTAC task {task} ({task_index + 1}/{len(tasks)})")
-        return_code = _stream_process(
+        print(
+            f"\nStarting UniVTAC task {task} ({task_index + 1}/{len(tasks)})",
+            flush=True,
+        )
+        outcome = _stream_process(
             command,
             cwd=args.univtac_root.resolve(),
             log_path=output_dir / "logs" / f"{task}.log",
         )
+        task_episodes: list[EpisodeResult] = []
+        task_metadata: dict[str, Any] = {}
+        completed = False
+        phase = "no_worker_result"
+        fatal_error = ""
+        result_error = ""
         if result_json.is_file():
-            task_episodes, task_metadata = _load_worker_result(result_json)
-            all_episodes.extend(task_episodes)
-            runtime_metadata[task] = task_metadata
-            write_results(
-                output_dir,
-                all_episodes,
-                tasks,
-                checkpoint=args.checkpoint,
-                execution_horizon=args.execution_horizon,
-                episodes_per_task=episodes_per_task,
-                metadata={
-                    "mode": args.mode,
-                    "seed_start": args.seed_start,
-                    "server": f"{args.server_host}:{args.server_port}",
-                    "runtime_by_task": runtime_metadata,
-                },
+            try:
+                task_episodes, task_metadata, completed, phase, fatal_error = (
+                    _load_worker_result(result_json)
+                )
+            except Exception as exc:
+                result_error = f"Could not read worker result {result_json}: {exc}"
+        else:
+            result_error = f"Worker did not create its result file: {result_json}"
+
+        process_metadata = asdict(outcome)
+        runtime_metadata[task] = {
+            **task_metadata,
+            "worker_phase": phase,
+            "worker_completed": completed,
+            "worker_fatal_error": fatal_error,
+            "process": process_metadata,
+        }
+        expected_indices = set(range(episodes_per_task))
+        observed_indices = {row.episode_index for row in task_episodes if row.task == task}
+        invalid_rows = [
+            row
+            for row in task_episodes
+            if row.task != task
+            or row.episode_index not in expected_indices
+            or row.seed != args.seed_start + row.episode_index
+            or row.execution_horizon != args.execution_horizon
+        ]
+        duplicate_indices = len(observed_indices) != len(task_episodes)
+        missing_videos = []
+        for row in task_episodes:
+            if row.success is None:
+                continue
+            video_path = Path(row.video_path)
+            if not video_path.is_absolute():
+                video_path = output_dir / video_path
+            if not row.video_path or not video_path.is_file() or video_path.stat().st_size <= 0:
+                missing_videos.append(row.episode_index)
+        issues = []
+        if outcome.return_code != 0:
+            issues.append(
+                f"worker return_code={outcome.return_code}"
+                + (f" ({outcome.signal_name})" if outcome.signal_name else "")
             )
-        if return_code != 0:
+        if not completed:
+            issues.append(f"worker did not complete (last phase: {phase})")
+        if fatal_error:
+            issues.append(f"worker fatal error:\n{fatal_error}")
+        if result_error:
+            issues.append(result_error)
+        if invalid_rows or duplicate_indices:
+            issues.append(
+                "worker result has duplicate, unexpected-task, out-of-range, wrong-seed, "
+                "or wrong-horizon episodes"
+            )
+        if missing_videos:
+            issues.append(
+                "completed success/failure episodes have missing or empty MP4 files at indices "
+                f"{missing_videos}"
+            )
+        missing_indices = sorted(expected_indices - observed_indices)
+        if missing_indices:
+            issues.append(f"worker omitted episode indices {missing_indices}")
+
+        failure_detail = "\n".join(issues) or "worker did not produce a valid episode result"
+        all_episodes.extend(task_episodes)
+        all_episodes.extend(
+            _worker_failure_result(
+                args,
+                task=task,
+                episode_index=episode_index,
+                error=failure_detail,
+            )
+            for episode_index in missing_indices
+        )
+
+        run_incomplete = bool(issues)
+        write_results(
+            output_dir,
+            all_episodes,
+            tasks,
+            checkpoint=args.checkpoint,
+            execution_horizon=args.execution_horizon,
+            episodes_per_task=episodes_per_task,
+            metadata={
+                "mode": args.mode,
+                "seed_start": args.seed_start,
+                "server": f"{args.server_host}:{args.server_port}",
+                "evaluation_status": "incomplete" if run_incomplete else "running",
+                "runtime_by_task": runtime_metadata,
+            },
+        )
+        if run_incomplete:
             raise RuntimeError(
-                f"UniVTAC worker for {task} exited with code {return_code}. "
-                f"See {output_dir / 'logs' / f'{task}.log'}"
+                f"UniVTAC worker for {task} did not complete a valid rollout: "
+                f"{failure_detail}. See {output_dir / 'logs' / f'{task}.log'} and "
+                f"{output_dir / 'summary.json'}"
             )
 
     aggregate = write_results(
@@ -217,6 +383,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "mode": args.mode,
             "seed_start": args.seed_start,
             "server": f"{args.server_host}:{args.server_port}",
+            "evaluation_status": "completed_with_errors"
+            if any(row.success is None for row in all_episodes)
+            else "completed",
             "runtime_by_task": runtime_metadata,
         },
     )

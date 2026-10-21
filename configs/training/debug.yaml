@@ -1,0 +1,8 @@
+defaults:
+- finetune
+- _self_
+max_steps: 2
+global_batch_size: 1
+gradient_accumulation_steps: 1
+save_steps: 1
+use_wandb: false

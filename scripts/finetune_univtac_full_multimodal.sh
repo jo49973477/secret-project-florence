@@ -13,6 +13,7 @@ source "${REPO_ROOT}/scripts/lib/checkpoint_resume.sh"
 TRAIN_GPUS="${TRAIN_GPUS:-6,7}"
 NUM_GPUS="${NUM_GPUS:-2}"
 DEEPSPEED_STAGE="${DEEPSPEED_STAGE:-3}"
+ZERO3_OFFLOAD_OPTIMIZER="${ZERO3_OFFLOAD_OPTIMIZER:-0}"
 MASTER_PORT="${MASTER_PORT:-29627}"
 
 # ============================================================
@@ -121,6 +122,7 @@ echo "Concerto LR         : ${LR_CONCERTO}"
 echo "Sparsh LR           : ${LR_SPARSH}"
 echo "Episode sampling    : ${EPISODE_SAMPLING_RATE}"
 echo "DeepSpeed stage : ${DEEPSPEED_STAGE}"
+echo "ZeRO-3 CPU optimizer offload: ${ZERO3_OFFLOAD_OPTIMIZER}"
 checkpoint_resume_print_status "${OUTPUT_DIR}"
 echo
 echo "Modalities:"
@@ -190,6 +192,12 @@ TRAIN_ARGS=(
     "${CHECKPOINT_SAVE_ARGS[@]}"
     "${CHECKPOINT_RESUME_ARGS[@]}"
 )
+if [[ "${ZERO3_OFFLOAD_OPTIMIZER}" == "1" ]]; then
+    TRAIN_ARGS+=(--zero3-offload-optimizer)
+elif [[ "${ZERO3_OFFLOAD_OPTIMIZER}" != "0" ]]; then
+    echo "[ERROR] ZERO3_OFFLOAD_OPTIMIZER must be 0 or 1" >&2
+    exit 1
+fi
 if [[ "${DISCORD_ON}" == "1" ]]; then
     TRAIN_ARGS+=(--discord-on)
     export GR00T_SUPERVISOR_NOTIFY=1
@@ -206,4 +214,5 @@ uv run python -m gr00t.experiment.torchrun_supervisor \
     --master-port="${MASTER_PORT}" \
     gr00t/experiment/launch_finetune.py \
     "${TRAIN_ARGS[@]}" \
+    "$@" \
     2>&1 | tee "${OUTPUT_DIR}/logs/train.log"
