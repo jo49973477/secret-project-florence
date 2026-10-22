@@ -127,6 +127,22 @@ def log_parameter_summary(model: Gr00tN1d7) -> None:
             required_action_modules.append("action_head.position_embedding.")
         if model.config.use_vlln:
             required_action_modules.append("action_head.vlln.")
+        if model.config.contact_input_mode != "none":
+            required_action_modules = []
+            if model.config.tune_projector:
+                required_action_modules += [
+                    "action_head.state_encoder.",
+                    "action_head.action_encoder.",
+                    "action_head.action_decoder.",
+                ]
+                if model.config.add_pos_embed:
+                    required_action_modules.append("action_head.position_embedding.")
+            if model.config.tune_diffusion_model and not model.config.freeze_pretrained_dit:
+                required_action_modules.append("action_head.model.")
+            if model.config.tune_vlln and model.config.use_vlln:
+                required_action_modules.append("action_head.vlln.")
+            if model.config.train_contact_input_adapter:
+                required_action_modules.append("action_head.contact_input_adapter.")
         missing_action_modules = [
             prefix
             for prefix in required_action_modules
@@ -224,7 +240,20 @@ class Gr00tN1d7Pipeline(ModelPipeline):
             )
             requested_multimodal = self.config.model.dit_type == "multimodal_conditioned_dit"
             requested_point = requested_multimodal and self.config.model.use_point_conditioning
-            requested_tactile = requested_multimodal and self.config.model.use_tactile_conditioning
+            requested_contact = self.config.model.contact_input_mode != "none"
+            requested_tactile = (
+                requested_multimodal or requested_contact
+            ) and self.config.model.use_tactile_conditioning
+            checkpoint_contact = getattr(checkpoint_config, "contact_input_mode", "none") != "none"
+            if checkpoint_contact and requested_contact:
+                for field in (
+                    "contact_input_mode",
+                    "contact_hidden_dim",
+                    "contact_num_tokens",
+                    "contact_moe_use_surprise",
+                ):
+                    if getattr(checkpoint_config, field) != getattr(self.config.model, field):
+                        raise ValueError(f"Contact checkpoint architecture mismatch: {field}")
             point_model_config = getattr(checkpoint_config, "point_encoder_model_config", None)
             legacy_point_resume = checkpoint_has_point and point_model_config is None
             if legacy_point_resume:
@@ -242,7 +271,9 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 else self.config.model.point_encoder_pretrained_load_on_init
             )
             tactile_load_on_init = (
-                False if requested_multimodal else self.config.model.tactile_pretrained_load_on_init
+                False
+                if (requested_multimodal or requested_contact)
+                else self.config.model.tactile_pretrained_load_on_init
             )
             dropout_overrides = {
                 key: value
@@ -301,6 +332,23 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                     tune_tactile_encoder=self.config.model.tune_tactile_encoder,
                     tune_multimodal_adapter=self.config.model.tune_multimodal_adapter,
                     output_loading_info=True,
+                    **{
+                        name: getattr(self.config.model, name)
+                        for name in (
+                            "contact_input_mode",
+                            "contact_hidden_dim",
+                            "contact_num_tokens",
+                            "contact_moe_use_surprise",
+                            "contact_predictor_checkpoint",
+                            "freeze_pretrained_dit",
+                            "train_contact_input_adapter",
+                            "train_contact_router",
+                            "contact_input_diagnostics",
+                        )
+                    },
+                    contact_predictor_embedded=getattr(
+                        checkpoint_config, "contact_predictor_embedded", False
+                    ),
                     **dropout_overrides,
                     **self.transformers_loading_kwargs,
                 )
@@ -327,6 +375,8 @@ class Gr00tN1d7Pipeline(ModelPipeline):
             unexpected_keys = loading_info.get("unexpected_keys", [])
             mismatched_keys = loading_info.get("mismatched_keys", [])
             newly_enabled_prefixes: tuple[str, ...] = ()
+            if requested_contact and not checkpoint_contact:
+                newly_enabled_prefixes += ("action_head.contact_input_adapter.",)
             if requested_multimodal and not checkpoint_multimodal:
                 newly_enabled_prefixes += MULTIMODAL_ADAPTER_PREFIXES
             if point_deferred:
@@ -396,6 +446,20 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 self.config.model,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
             )
+
+        adapter = model.action_head.contact_input_adapter
+        if adapter is not None and adapter.use_surprise:
+            if not model.config.contact_predictor_embedded:
+                path = self.config.model.contact_predictor_checkpoint
+                if not path:
+                    raise ValueError(
+                        "Surprise requires contact_predictor_checkpoint with provenance"
+                    )
+                adapter.load_predictor(path, model.action_head.tactile_encoder)
+                model.config.contact_predictor_embedded = True
+            model.action_head.tactile_encoder.requires_grad_(False)
+            adapter.projector.requires_grad_(False)
+            adapter.predictor.requires_grad_(False)
 
         logging.debug(f"Model Config: {model.config}")
         with run_or_wait_on_rank0(label="final_model_config.json write") as is_rank0:

@@ -20,7 +20,8 @@ def checkpoint_sensor_layout(checkpoint_config) -> tuple[bool, bool, bool]:
     return (
         is_multimodal,
         is_multimodal and getattr(checkpoint_config, "use_point_conditioning", False),
-        is_multimodal and getattr(checkpoint_config, "use_tactile_conditioning", False),
+        (is_multimodal or getattr(checkpoint_config, "contact_input_mode", "none") != "none")
+        and getattr(checkpoint_config, "use_tactile_conditioning", False),
     )
 
 

@@ -135,6 +135,17 @@ class Gr00tN1d7Config(PretrainedConfig):
         }
     )
 
+    contact_input_mode: str = "none"
+    contact_hidden_dim: int = 256
+    contact_num_tokens: int = 4
+    contact_moe_use_surprise: bool = False
+    contact_predictor_checkpoint: str | None = None
+    contact_predictor_embedded: bool = False
+    freeze_pretrained_dit: bool = False
+    train_contact_input_adapter: bool = True
+    train_contact_router: bool = True
+    contact_input_diagnostics: bool = False
+
     # Flow matching parameters
     num_inference_timesteps: int = 4
     noise_beta_alpha: float = 1.5

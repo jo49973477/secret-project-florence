@@ -262,6 +262,11 @@ def _run(args: argparse.Namespace) -> None:
             timeout_ms=round(args.request_timeout_seconds * 1000),
         )
         try:
+            if "tactile" in policy.modality_configs:
+                streams = list(env_cfg.obs_data_type.get("tactile", []))
+                if "rgb" not in streams:
+                    streams.append("rgb")
+                env_cfg.obs_data_type["tactile"] = streams
             task = task_module.Task(env_cfg, mode="eval")
             limits = _qpos_limits(task)
             if limits is None:
@@ -329,6 +334,8 @@ def _run(args: argparse.Namespace) -> None:
                             executed, eval_success = task.take_action(
                                 action_tensor, action_type="qpos"
                             )
+                            if "tactile" in policy.modality_configs:
+                                policy.observe(task._get_observations())
                             if eval_success or task.eval_success:
                                 success = True
                                 termination_reason = "success"

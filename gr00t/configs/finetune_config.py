@@ -35,7 +35,7 @@ class FinetuneConfig:
 
     dataset_path: str
     """Path to one dataset root, or an os.pathsep-separated list of dataset roots."""
-    
+
     embodiment_tag: str
     """Embodiment tag (name or value, case-insensitive). See EmbodimentTag for known tags."""
 
@@ -48,12 +48,21 @@ class FinetuneConfig:
     seed: int = 42
     """Seed used for model initialization, data sampling, and worker RNGs."""
 
-
     dit_type: str = "alternate_vl_dit"
     """Action-head DiT implementation; use multimodal_conditioned_dit for sensor inputs."""
 
     use_point_conditioning: bool = True
     """Enable point-cloud conditioning when using multimodal_conditioned_dit."""
+
+    contact_input_mode: str = "none"
+    contact_hidden_dim: int = 256
+    contact_num_tokens: int = 4
+    contact_moe_use_surprise: bool = False
+    contact_predictor_checkpoint: str | None = None
+    freeze_pretrained_dit: bool = False
+    train_contact_input_adapter: bool = True
+    train_contact_router: bool = True
+    contact_input_diagnostics: bool = False
 
     use_tactile_conditioning: bool = True
     """Enable tactile conditioning when using multimodal_conditioned_dit."""

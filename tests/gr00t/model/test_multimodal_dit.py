@@ -101,12 +101,18 @@ def test_bf16_sensor_token_boundary_and_fp32_gates_do_not_promote_dit() -> None:
         model.point_gates.data = model.point_gates.data.float()
         model.tactile_gates.data = model.tactile_gates.data.float()
     seen = {"point": [], "tactile": []}
-    point_hook = model.point_modality_norms[0].register_forward_pre_hook(
-        lambda _module, inputs: seen["point"].append(inputs[0].dtype)
-    )
-    tactile_hook = model.tactile_modality_norms[0].register_forward_pre_hook(
-        lambda _module, inputs: seen["tactile"].append(inputs[0].dtype)
-    )
+    point_hooks = [
+        norm.register_forward_pre_hook(
+            lambda _module, inputs: seen["point"].append(inputs[0].dtype)
+        )
+        for norm in model.point_modality_norms
+    ]
+    tactile_hooks = [
+        norm.register_forward_pre_hook(
+            lambda _module, inputs: seen["tactile"].append(inputs[0].dtype)
+        )
+        for norm in model.tactile_modality_norms
+    ]
     point_tokens = torch.randn(1, 5, 8, dtype=torch.float32, requires_grad=True)
     tactile_tokens = torch.randn(1, 2, 8, dtype=torch.float32, requires_grad=True)
     with torch.autocast("cpu", dtype=torch.bfloat16):
@@ -120,8 +126,8 @@ def test_bf16_sensor_token_boundary_and_fp32_gates_do_not_promote_dit() -> None:
             **_vlm_masks(batch_size=1, sequence_length=4),
         )
         output.float().square().mean().backward()
-    point_hook.remove()
-    tactile_hook.remove()
+    for hook in point_hooks + tactile_hooks:
+        hook.remove()
 
     assert seen == {"point": [torch.bfloat16] * 2, "tactile": [torch.bfloat16] * 2}
     assert output.dtype == torch.bfloat16

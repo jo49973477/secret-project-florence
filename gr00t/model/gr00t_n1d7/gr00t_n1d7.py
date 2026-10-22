@@ -26,6 +26,7 @@ from transformers.feature_extraction_utils import BatchFeature
 import tree
 
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
+from gr00t.model.extension.contact_input_moe import ContactInputAdapter, ContactTokenProjector
 from gr00t.model.extension.multimodal_dit import MultiModalConditionedDiT
 from gr00t.model.extension.point_encoder import ConcertoPointEncoder, build_point_encoder
 from gr00t.model.extension.tactile_encoder import SparshDinoTactileEncoder, build_tactile_encoder
@@ -148,10 +149,32 @@ class Gr00tN1d7ActionHead(nn.Module):
             hidden_dim=self.hidden_size,
             output_dim=self.action_dim,
         )
+        self.contact_input_adapter = None
+        if config.contact_input_mode != "none":
+            if config.dit_type != "alternate_vl_dit" or not config.use_tactile_conditioning:
+                raise ValueError("Contact input requires alternate_vl_dit and tactile conditioning")
+            with torch.random.fork_rng(devices=[]):
+                self.contact_input_adapter = ContactInputAdapter(
+                    self.input_embedding_dim,
+                    config.max_state_dim * config.state_history_length,
+                    mode=config.contact_input_mode,
+                    contact_dim=config.contact_hidden_dim,
+                    num_tokens=config.contact_num_tokens,
+                    use_surprise=config.contact_moe_use_surprise,
+                    diagnostics=config.contact_input_diagnostics,
+                )
+            self.contact_input_adapter.predictor_ready = config.contact_predictor_embedded
         self.point_encoder = None
         self.tactile_encoder = None
-        if config.dit_type == "multimodal_conditioned_dit":
-            if config.use_point_conditioning and not config.point_encoder_deferred_bootstrap:
+        if (
+            config.dit_type == "multimodal_conditioned_dit"
+            or self.contact_input_adapter is not None
+        ):
+            if (
+                config.dit_type == "multimodal_conditioned_dit"
+                and config.use_point_conditioning
+                and not config.point_encoder_deferred_bootstrap
+            ):
                 self.point_encoder = build_point_encoder(
                     config.point_encoder_cfg,
                     input_dim=config.point_input_dim,
@@ -171,7 +194,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                     ),
                 )
             if config.use_tactile_conditioning and not config.tactile_encoder_deferred_bootstrap:
-                self.tactile_encoder = build_tactile_encoder(
+                self.tactile_encoder = self._build_tactile_encoder(
                     config.tactile_encoder_cfg,
                     input_channels=config.tactile_input_channels,
                     output_dim=self.model.inner_dim,
@@ -253,7 +276,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         if config.tactile_encoder_deferred_bootstrap:
             if self.tactile_encoder is not None:
                 raise RuntimeError("Deferred Sparsh bootstrap found an existing tactile encoder.")
-            self.tactile_encoder = build_tactile_encoder(
+            self.tactile_encoder = self._build_tactile_encoder(
                 config.tactile_encoder_cfg,
                 input_channels=config.tactile_input_channels,
                 output_dim=self.model.inner_dim,
@@ -346,6 +369,21 @@ class Gr00tN1d7ActionHead(nn.Module):
                 )
             else:
                 self.tactile_encoder.requires_grad_(tune_tactile_encoder)
+        if self.contact_input_adapter is not None:
+            adapter = self.contact_input_adapter
+            adapter.requires_grad_(self.config.train_contact_input_adapter)
+            for module in (adapter.router, adapter.scalar_gate):
+                if module is not None:
+                    module.requires_grad_(
+                        self.config.train_contact_input_adapter and self.config.train_contact_router
+                    )
+            if adapter.predictor is not None:
+                adapter.predictor.requires_grad_(False)
+                adapter.projector.requires_grad_(False)
+                if self.tactile_encoder is not None:
+                    self.tactile_encoder.requires_grad_(False)
+        if self.config.freeze_pretrained_dit:
+            self.model.requires_grad_(False)
         if not tune_vlln:
             self.vlln.requires_grad_(False)
             self.vl_self_attention.requires_grad_(False)
@@ -419,10 +457,23 @@ class Gr00tN1d7ActionHead(nn.Module):
         backbone_output["backbone_features"] = backbone_features
         return backbone_output
 
+    def _build_tactile_encoder(self, *args, **kwargs):
+        if self.contact_input_adapter is None:
+            return build_tactile_encoder(*args, **kwargs)
+        # Keep the newly initialized sensor projection identical across modes,
+        # independent of how many missing router tensors HF initialized earlier.
+        with torch.random.fork_rng(devices=[]):
+            torch.random.default_generator.manual_seed(42)
+            return build_tactile_encoder(*args, **kwargs)
+
     def _encode_multimodal_inputs(
         self, action_input: BatchFeature
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         """Encode static sensor observations once per action-head invocation."""
+        if self.contact_input_adapter is not None and self.contact_input_adapter.use_surprise:
+            self.tactile_encoder.eval()
+            self.contact_input_adapter.projector.eval()
+            self.contact_input_adapter.predictor.eval()
         point_tokens = None
         point_attention_mask = None
         if self.point_encoder is not None:
@@ -521,6 +572,14 @@ class Gr00tN1d7ActionHead(nn.Module):
             pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
             pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
             action_features = action_features + pos_embs
+        if self.contact_input_adapter is not None:
+            _, _, tactile_tokens = self._encode_multimodal_inputs(action_input)
+            contact = self.contact_input_adapter.prepare_contact(
+                tactile_tokens, action_input.state, action_input.get("tactile_token_mask")
+            )
+            action_features = self.contact_input_adapter(
+                action_features, contact, action_input.state, action_token_mask
+            )
         action_features = action_features * action_token_mask.unsqueeze(-1).to(
             dtype=action_features.dtype
         )
@@ -594,12 +653,14 @@ class Gr00tN1d7ActionHead(nn.Module):
         pred_mean = (pred_float * diagnostic_mask).sum() / valid_count
         target_mean = (target_float * diagnostic_mask).sum() / valid_count
         diagnostics = {
-            "predicted_velocity_std": (
-                (pred_float - pred_mean).square() * diagnostic_mask
-            ).sum().div(valid_count).sqrt(),
-            "target_velocity_std": (
-                (target_float - target_mean).square() * diagnostic_mask
-            ).sum().div(valid_count).sqrt(),
+            "predicted_velocity_std": ((pred_float - pred_mean).square() * diagnostic_mask)
+            .sum()
+            .div(valid_count)
+            .sqrt(),
+            "target_velocity_std": ((target_float - target_mean).square() * diagnostic_mask)
+            .sum()
+            .div(valid_count)
+            .sqrt(),
             "zero_prediction_mse": (target_float.square() * diagnostic_mask).sum().div(valid_count),
             "valid_action_ratio": action_mask.float().mean(),
         }
@@ -633,6 +694,8 @@ class Gr00tN1d7ActionHead(nn.Module):
             )
             self._dtype_diagnostics_logged = True
 
+        if self.contact_input_adapter is not None and self.config.contact_input_diagnostics:
+            diagnostics.update(self.contact_input_adapter.last_diagnostics)
         return {
             "loss": loss,
             "action_loss": action_loss,
@@ -772,6 +835,13 @@ class Gr00tN1d7ActionHead(nn.Module):
                 action_input
             )
 
+        contact = None
+        if self.contact_input_adapter is not None:
+            _, _, tactile_tokens = self._encode_multimodal_inputs(action_input)
+            contact = self.contact_input_adapter.prepare_contact(
+                tactile_tokens, action_input.state, action_input.get("tactile_token_mask")
+            )
+
         # Run denoising steps.
         for t in range(self.num_inference_timesteps):
             t_cont = t / float(self.num_inference_timesteps)  # e.g. goes 0, 1/N, 2/N, ...
@@ -789,6 +859,10 @@ class Gr00tN1d7ActionHead(nn.Module):
                 pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
                 pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
                 action_features = action_features + pos_embs
+            if self.contact_input_adapter is not None:
+                action_features = self.contact_input_adapter(
+                    action_features, contact, action_input.state, action_token_mask
+                )
             if action_token_mask is not None:
                 action_features = action_features * action_token_mask.unsqueeze(-1).to(
                     dtype=action_features.dtype
@@ -962,6 +1036,14 @@ class Gr00tN1d7(PreTrainedModel):
             transformers_loading_kwargs=transformers_loading_kwargs,
         )
         log_model_load_memory("Gr00tN1d7 construction complete")
+
+    def _init_weights(self, module):
+        # HF meta/no_init loading must explicitly initialize new bare Parameters.
+        super()._init_weights(module)
+        if isinstance(module, ContactInputAdapter):
+            module.injection_scale.data.zero_()
+        elif isinstance(module, ContactTokenProjector):
+            module.queries.data.normal_(std=0.02)
 
     def enable_lora(
         self,

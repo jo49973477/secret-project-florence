@@ -29,6 +29,7 @@ pipeline is bottlenecked by data loading or by the model's computation.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -521,6 +522,17 @@ class Gr00tTrainer(Trainer):
                         reduced /= torch.distributed.get_world_size()
                 diagnostic_logs[name] = float(reduced.sqrt().cpu())
             logs = dict(logs) | diagnostic_logs
+            if self.is_world_process_zero() and any(
+                k.startswith("contact_") for k in diagnostic_logs
+            ):
+                from pathlib import Path
+
+                with (Path(self.args.output_dir) / "contact_input_diagnostics.jsonl").open(
+                    "a"
+                ) as stream:
+                    stream.write(
+                        json.dumps({"step": self.state.global_step, **diagnostic_logs}) + "\n"
+                    )
         # Hide epoch from logged metrics as it's misleading for Iterable datasets.
         epoch = self.state.epoch
         self.state.epoch = None
@@ -737,19 +749,54 @@ class Gr00tTrainer(Trainer):
             "point_encoder_grad_norm": ("point_encoder.backbone.",),
             "tactile_encoder_grad_norm": ("tactile_encoder.backbone.",),
             "multimodal_adapter_grad_norm": (
-                "point_encoder.projection.", "point_cross_attention.", "point_action_norms.",
-                "point_modality_norms.", "point_gates", "tactile_encoder.projection.",
-                "tactile_cross_attention.", "tactile_action_norms.",
-                "tactile_modality_norms.", "tactile_gates",
+                "point_encoder.projection.",
+                "point_cross_attention.",
+                "point_action_norms.",
+                "point_modality_norms.",
+                "point_gates",
+                "tactile_encoder.projection.",
+                "tactile_cross_attention.",
+                "tactile_action_norms.",
+                "tactile_modality_norms.",
+                "tactile_gates",
             ),
         }
+        if not hasattr(self, "_contact_diagnostics_enabled"):
+            self._contact_diagnostics_enabled = any(
+                getattr(module, "diagnostics_enabled", False)
+                for module in model.modules()
+                if module.__class__.__name__ == "ContactInputAdapter"
+            )
+        contact_enabled = self._contact_diagnostics_enabled
+        if contact_enabled:
+            groups.update(
+                {
+                    "contact_direct_expert_grad_norm": ("contact_input_adapter.direct_expert.",),
+                    "contact_surprise_expert_grad_norm": (
+                        "contact_input_adapter.surprise_expert.",
+                    ),
+                    "contact_router_grad_norm": (
+                        "contact_input_adapter.router.",
+                        "contact_input_adapter.scalar_gate.",
+                    ),
+                    "contact_encoder_grad_norm": ("tactile_encoder.",),
+                    "contact_input_injection_scale_grad": (
+                        "contact_input_adapter.injection_scale",
+                    ),
+                }
+            )
         sums = {name: None for name in groups}
         for parameter_name, parameter in model.named_parameters():
-            if parameter.grad is None:
+            gradient = parameter.grad
+            if contact_enabled and hasattr(parameter, "ds_id") and parameter.requires_grad:
+                from deepspeed.utils import safe_get_local_grad
+
+                gradient = safe_get_local_grad(parameter)
+            if gradient is None:
                 continue
             for metric, fragments in groups.items():
                 if any(fragment in parameter_name for fragment in fragments):
-                    square_sum = parameter.grad.detach().float().square().sum()
+                    square_sum = gradient.detach().float().square().sum()
                     sums[metric] = square_sum if sums[metric] is None else sums[metric] + square_sum
         self._gradient_diagnostics = {
             name: value for name, value in sums.items() if value is not None

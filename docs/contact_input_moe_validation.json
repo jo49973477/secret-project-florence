@@ -1,0 +1,113 @@
+{
+  "branch": "experiment/contact-input-moe-20261021",
+  "base_commit": "be334bc79f1245d8fc1b4d308f587027c732a0a8",
+  "worktree": "/ssdg/spl_yeongyoo/secret-project-florence-contact-moe",
+  "original_worktree_clean": true,
+  "sidecar_commit_unchanged": "db7eb4620c05156c58621f589284deffb58d1c88",
+  "files_added": [
+    "docs/contact_input_moe.md",
+    "docs/contact_input_moe_validation.json",
+    "examples/UniVTAC/univtac_contact_config.py",
+    "gr00t/model/extension/contact_input_moe.py",
+    "scripts/evaluate_contact_input.py",
+    "scripts/prepare_contact_overfit5.py",
+    "scripts/smoke_test_contact_input.py",
+    "scripts/train_univtac_contact_input.sh",
+    "tests/examples/test_contact_input_evaluation.py",
+    "tests/examples/test_univtac_contact_rollout.py",
+    "tests/gr00t/model/test_contact_input_moe.py"
+  ],
+  "files_modified": [
+    "examples/UniVTAC/run_closed_loop_worker.py",
+    "examples/UniVTAC/univtac_rollout/policy.py",
+    "gr00t/configs/finetune_config.py",
+    "gr00t/configs/model/gr00t_n1d7.py",
+    "gr00t/experiment/launch_finetune.py",
+    "gr00t/experiment/trainer.py",
+    "gr00t/model/gr00t_n1d7/gr00t_n1d7.py",
+    "gr00t/model/gr00t_n1d7/sensor_loading.py",
+    "gr00t/model/gr00t_n1d7/setup.py",
+    "tests/gr00t/model/test_action_head.py",
+    "tests/gr00t/model/test_multimodal_dit.py"
+  ],
+  "pretrained_sources_unchanged": [
+    "gr00t/model/modules/dit.py",
+    "gr00t/model/extension/multimodal_dit.py"
+  ],
+  "tests": {
+    "passed": 132,
+    "failed": 0,
+    "scope": "130 combined relevant regressions plus 1 offline-evaluator test and 1 embedded-Surprise checkpoint test",
+    "combined_suite_files": [
+      "tests/gr00t/model/test_contact_input_moe.py",
+      "tests/gr00t/model/test_action_head.py",
+      "tests/gr00t/model/test_multimodal_dit.py",
+      "tests/gr00t/model/test_dit_padding_mask.py",
+      "tests/gr00t/experiment/test_optimizer_parameter_groups.py",
+      "tests/examples/test_univtac_closed_loop.py",
+      "tests/examples/test_univtac_contact_rollout.py",
+      "tests/gr00t/model/test_sensor_loading.py",
+      "tests/gr00t/model/test_sparsh_tactile_encoder.py",
+      "tests/gr00t/model/test_input_dtype_contract.py",
+      "tests/gr00t/model/test_zero3_module_boundaries.py",
+      "tests/gr00t/model/test_action_horizon_validation.py",
+      "tests/gr00t/model/test_model_forward.py"
+    ],
+    "additional_test": "tests/examples/test_contact_input_evaluation.py",
+    "additional_case": "tests/gr00t/model/test_contact_input_moe.py::test_embedded_surprise_checkpoint_reload",
+    "full_repository_suite_run": false
+  },
+  "checks": {
+    "ruff": "pass",
+    "shell_syntax": "pass",
+    "git_diff_check": "pass",
+    "cli_help": "pass"
+  },
+  "real_checkpoint_smoke": {
+    "loss": 1.8876771926879883,
+    "injection_scale_grad_norm": 0.000339508056640625,
+    "injection_scale": 0.00099945068359375,
+    "original_dit_sha256": "0c47a0b606df1bc23dc2b03fee4026f400a8303b0e4edd0b82f645502ce16ed0",
+    "inference_shape": [
+      1,
+      2,
+      132
+    ],
+    "adapter_parameters": 1287171,
+    "full_pipeline": "not tested",
+    "device": "cpu"
+  },
+  "real_smoke_command": "uv run --no-sync python scripts/smoke_test_contact_input.py --checkpoint /ssdg/spl_yeongyoo/.cache/huggingface/hub/models--nvidia--GR00T-N1.7-3B/snapshots/2fc962b973bccdd5d8ce4f67cc63b264d6886495 --sparsh /ssdg/spl_yeongyoo/.cache/huggingface/hub/models--facebook--sparsh-dino-base/snapshots/89e38eaade8eeedfa0f9c8857a76f57a2acd8206 --output-dir outputs/contact_input/real_smoke_cpu_final",
+  "adapter_parameters": {
+    "B0": 0,
+    "B1": 1187073,
+    "B2": 1187462,
+    "B3": 1287171,
+    "B4_total": 2377220,
+    "B4_trainable": 1685508
+  },
+  "overfit_subset": {
+    "path": "outputs/contact_input/data/overfit5",
+    "episodes": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "frames": 265,
+    "training_started": false
+  },
+  "unverified": [
+    "Full real VLM/processor/dataset training or validation",
+    "Full-size HF model save/reload",
+    "GPU kernels",
+    "Distributed ZeRO-3 training/resume/export",
+    "Isaac closed-loop rollout",
+    "Real predictor quality/provenance",
+    "Five-episode convergence",
+    "Memory/latency and task success"
+  ],
+  "surprise_actual_comparison_available": false,
+  "no_push_merge_commit_or_worktree_deletion": true
+}

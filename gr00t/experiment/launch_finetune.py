@@ -74,7 +74,10 @@ if __name__ == "__main__":
         list(tactile_modality.delta_indices) if tactile_modality is not None else [-1, 0]
     )
     if (
-        ft_config.dit_type == "multimodal_conditioned_dit"
+        (
+            ft_config.dit_type == "multimodal_conditioned_dit"
+            or ft_config.contact_input_mode != "none"
+        )
         and ft_config.use_tactile_conditioning
         and ft_config.tactile_encoder_cfg == "sparsh_dino_base"
         and (
@@ -118,6 +121,18 @@ if __name__ == "__main__":
     config.model.lora_bias = ft_config.lora_bias
     config.model.dit_type = ft_config.dit_type
     config.model.use_point_conditioning = ft_config.use_point_conditioning
+    for name in (
+        "contact_input_mode",
+        "contact_hidden_dim",
+        "contact_num_tokens",
+        "contact_moe_use_surprise",
+        "contact_predictor_checkpoint",
+        "freeze_pretrained_dit",
+        "train_contact_input_adapter",
+        "train_contact_router",
+        "contact_input_diagnostics",
+    ):
+        setattr(config.model, name, getattr(ft_config, name))
     config.model.use_tactile_conditioning = ft_config.use_tactile_conditioning
     config.model.point_input_dim = ft_config.point_input_dim
     config.model.tactile_input_channels = ft_config.tactile_input_channels
