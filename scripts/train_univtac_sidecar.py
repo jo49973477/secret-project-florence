@@ -46,6 +46,7 @@ PRESETS = {
             "model.use_point_conditioning=true",
             "model.use_tactile_conditioning=true",
             "model.tactile_fusion_mode=surprise",
+            "model.freeze_contact_teacher=false",
         ],
     },
 }
