@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Mapping
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -24,6 +25,34 @@ from gr00t.model.gr00t_n1d7.sensor_loading import (
     SIDECAR_ADAPTER_PREFIXES,
 )
 import torch
+
+
+DEFAULT_BASE_MODEL = "nvidia/GR00T-N1.7-3B"
+
+
+def resolve_reference_checkpoint(source: str) -> Path:
+    """Use a local checkpoint or download a Hugging Face model into the shared cache."""
+    source = source.strip() or DEFAULT_BASE_MODEL
+    path = Path(source).expanduser()
+    if path.is_dir():
+        return path.resolve(strict=True)
+    if path.is_absolute() or source.startswith((".", "~")) or source.count("/") != 1:
+        raise FileNotFoundError(f"Reference checkpoint directory not found: {source}")
+
+    from huggingface_hub import snapshot_download
+
+    print(f"Resolving Hugging Face checkpoint: {source}", file=sys.stderr)
+    snapshot_path = snapshot_download(
+        repo_id=source,
+        allow_patterns=[
+            "config.json",
+            "model*.safetensors",
+            "model.safetensors.index.json",
+            "pytorch_model*.bin",
+            "pytorch_model.bin.index.json",
+        ],
+    )
+    return Path(snapshot_path).resolve(strict=True)
 
 
 class CheckpointTensors(Mapping):
@@ -76,7 +105,11 @@ class CheckpointTensors(Mapping):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--reference-checkpoint", required=True, type=Path)
+    parser.add_argument(
+        "--reference-checkpoint",
+        default=os.environ.get("BASE_MODEL") or DEFAULT_BASE_MODEL,
+        help="Local checkpoint directory or Hugging Face model ID (default: nvidia/GR00T-N1.7-3B)",
+    )
     source = parser.add_mutually_exclusive_group()
     source.add_argument(
         "--candidate-checkpoint",
@@ -105,14 +138,18 @@ def main():
     parser.add_argument("--rtol", type=float, default=0.0)
     args = parser.parse_args()
     args.report.parent.mkdir(parents=True, exist_ok=True)
+    reference_source = args.reference_checkpoint.strip() or DEFAULT_BASE_MODEL
     report = {
-        "reference_checkpoint": str(args.reference_checkpoint.resolve()),
+        "reference_source": reference_source,
+        "reference_checkpoint": reference_source,
         "forward_check": {
             "status": "SKIP",
             "reason": "Enable --forward-parity to run real DiT inputs.",
         },
     }
     try:
+        reference_checkpoint = resolve_reference_checkpoint(reference_source)
+        report["reference_checkpoint"] = str(reference_checkpoint)
         from gr00t.model.extension.multimodal_dit import MultiModalConditionedDiT
         from gr00t.model.extension.sidecar_dit import SidecarConditionedDiT
         from gr00t.model.modules.dit import AlternateVLDiT
@@ -127,11 +164,11 @@ def main():
             if args.dit_type == "sidecar_conditioned_dit"
             else MULTIMODAL_ADAPTER_PREFIXES
         )
-        reference = CheckpointTensors(args.reference_checkpoint)
+        reference = CheckpointTensors(reference_checkpoint)
         from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
 
         checkpoint_config = Gr00tN1d7Config.from_pretrained(
-            args.reference_checkpoint, local_files_only=True
+            reference_checkpoint, local_files_only=True
         )
         if checkpoint_config.dit_type not in {"alternate_vl_dit", "multimodal_conditioned_dit"}:
             raise ValueError("Reference must use AlternateVLDiT or its multimodal extension")
