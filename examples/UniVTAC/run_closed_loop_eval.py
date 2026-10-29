@@ -182,29 +182,44 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             cwd=args.univtac_root.resolve(),
             log_path=output_dir / "logs" / f"{task}.log",
         )
-        if result_json.is_file():
-            task_episodes, task_metadata = _load_worker_result(result_json)
-            all_episodes.extend(task_episodes)
-            runtime_metadata[task] = task_metadata
-            write_results(
-                output_dir,
-                all_episodes,
-                tasks,
-                checkpoint=args.checkpoint,
-                execution_horizon=args.execution_horizon,
-                episodes_per_task=episodes_per_task,
-                metadata={
-                    "mode": args.mode,
-                    "seed_start": args.seed_start,
-                    "server": f"{args.server_host}:{args.server_port}",
-                    "runtime_by_task": runtime_metadata,
-                },
+        worker_log = output_dir / "logs" / f"{task}.log"
+        if not result_json.is_file():
+            raise RuntimeError(
+                f"UniVTAC worker for {task} exited with code {return_code} but did not produce "
+                f"the worker_results JSON: {result_json}. See {worker_log}"
             )
+
+        task_episodes, task_metadata = _load_worker_result(result_json)
+        if not task_episodes:
+            raise RuntimeError(
+                f"UniVTAC worker for {task} exited with code {return_code} but produced zero "
+                f"episode results in {result_json}. Evaluation failed. See {worker_log}"
+            )
+
+        all_episodes.extend(task_episodes)
+        runtime_metadata[task] = task_metadata
+        write_results(
+            output_dir,
+            all_episodes,
+            tasks,
+            checkpoint=args.checkpoint,
+            execution_horizon=args.execution_horizon,
+            episodes_per_task=episodes_per_task,
+            metadata={
+                "mode": args.mode,
+                "seed_start": args.seed_start,
+                "server": f"{args.server_host}:{args.server_port}",
+                "runtime_by_task": runtime_metadata,
+            },
+        )
         if return_code != 0:
             raise RuntimeError(
                 f"UniVTAC worker for {task} exited with code {return_code}. "
-                f"See {output_dir / 'logs' / f'{task}.log'}"
+                f"See {worker_log}"
             )
+
+    if not all_episodes:
+        raise RuntimeError("Evaluation failed because zero episodes were executed.")
 
     aggregate = write_results(
         output_dir,

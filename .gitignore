@@ -174,3 +174,9 @@ offline_open_loop_eval_plots/
 /data
 
 tmp/
+
+demo_data/
+examples/
+*mp4
+*.parquet
+*.whl

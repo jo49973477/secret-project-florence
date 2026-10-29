@@ -312,6 +312,50 @@ class TestSinCosEncoding:
 class TestStatistics:
     """Test statistics management."""
 
+    @staticmethod
+    def _single_action_fixture(shape):
+        modality_configs = {
+            "robot": {
+                "action": {
+                    "delta_indices": list(range(16)),
+                    "modality_keys": ["joint"],
+                }
+            }
+        }
+        statistics = {
+            "robot": {
+                "action": {
+                    "joint": {
+                        "min": np.full(shape, -1.0).tolist(),
+                        "max": np.full(shape, 1.0).tolist(),
+                        "mean": np.zeros(shape).tolist(),
+                        "std": np.ones(shape).tolist(),
+                        "q01": np.full(shape, -0.9).tolist(),
+                        "q99": np.full(shape, 0.9).tolist(),
+                    }
+                }
+            }
+        }
+        return modality_configs, statistics
+
+    @pytest.mark.parametrize("stats_shape", [(8,), (16, 8)])
+    def test_action_dim_uses_final_statistics_axis(self, stats_shape):
+        modality_configs, statistics = self._single_action_fixture(stats_shape)
+        proc = StateActionProcessor(modality_configs=modality_configs, statistics=statistics)
+
+        assert proc.get_action_dim("robot") == 8
+        normalized = {"joint": np.zeros((1, 16, 8), dtype=np.float32)}
+        decoded = proc.unapply_action(normalized, "robot")
+        assert decoded["joint"].shape == (1, 16, 8)
+
+    @pytest.mark.parametrize("mismatched_key", ["min", "max", "mean", "std"])
+    def test_normalization_statistics_shapes_must_match(self, mismatched_key):
+        modality_configs, statistics = self._single_action_fixture((8,))
+        statistics["robot"]["action"]["joint"][mismatched_key] = np.zeros((2, 8)).tolist()
+
+        with pytest.raises(ValueError, match="must have matching min/max/mean/std shapes"):
+            StateActionProcessor(modality_configs=modality_configs, statistics=statistics)
+
     def test_set_statistics(self):
         modality_configs, statistics = _load_fixture_configs()
         proc = StateActionProcessor(modality_configs=modality_configs)

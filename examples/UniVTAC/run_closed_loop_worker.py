@@ -202,15 +202,34 @@ def _finish_video(
 
 
 def _run(args: argparse.Namespace) -> None:
-    import torch
+    print("Entering _run()", flush=True)
 
+    print("[diagnostic] START import torch", flush=True)
+    import torch
+    print("[diagnostic] DONE import torch", flush=True)
+
+    print("[diagnostic] START Resolving UNIVTAC_ROOT", flush=True)
     root = args.univtac_root.resolve()
     sys.path.insert(0, str(root))
-    task_config, task_config_path = _load_yaml(args.task_config, root)
-    instructions = _load_instructions(root, args.task, args.instruction_type)
-    task_module = importlib.import_module(f"envs.{args.task}")
+    print(f"[diagnostic] DONE Resolving UNIVTAC_ROOT: {root}", flush=True)
 
+    print("[diagnostic] START Loading task YAML", flush=True)
+    task_config, task_config_path = _load_yaml(args.task_config, root)
+    print(f"[diagnostic] DONE Loading task YAML: {task_config_path}", flush=True)
+
+    print("[diagnostic] START Loading instructions", flush=True)
+    instructions = _load_instructions(root, args.task, args.instruction_type)
+    print("[diagnostic] DONE Loading instructions", flush=True)
+
+    print(f"[diagnostic] START Importing envs.{args.task}", flush=True)
+    task_module = importlib.import_module(f"envs.{args.task}")
+    print(f"[diagnostic] DONE Importing envs.{args.task}", flush=True)
+
+    print("[diagnostic] START Constructing TaskCfg()", flush=True)
     env_cfg = task_module.TaskCfg()
+    print("[diagnostic] DONE Constructing TaskCfg()", flush=True)
+
+    print("[diagnostic] START Applying task configuration", flush=True)
     env_cfg.save_dir = args.output_dir / "logs" / "univtac" / args.task
     env_cfg.decimation = task_config.get("decimation", env_cfg.decimation)
     env_cfg.obs_data_type = task_config.get("observations", {})
@@ -240,7 +259,9 @@ def _run(args: argparse.Namespace) -> None:
                 f"Task config {task_config_path} must request {group} observations {sorted(required)}; "
                 f"got {sorted(actual)}."
             )
+    print("[diagnostic] DONE Applying task configuration", flush=True)
 
+    print("[diagnostic] START Collecting runtime metadata", flush=True)
     metadata = _runtime_metadata(root)
     metadata.update(
         {
@@ -249,20 +270,38 @@ def _run(args: argparse.Namespace) -> None:
             "device": str(env_cfg.sim.device),
         }
     )
-    print("Runtime metadata:")
-    print(json.dumps(metadata, indent=2))
+    print("[diagnostic] DONE Collecting runtime metadata", flush=True)
+    print("Runtime metadata:", flush=True)
+    print(json.dumps(metadata, indent=2), flush=True)
 
     task = None
     episodes: list[EpisodeResult] = []
     try:
+        print("[diagnostic] START Creating Gr00tUniVTACPolicy", flush=True)
         policy = Gr00tUniVTACPolicy(
             args.server_host,
             args.server_port,
             execution_horizon=args.execution_horizon,
             timeout_ms=round(args.request_timeout_seconds * 1000),
         )
+        print("[diagnostic] DONE Creating Gr00tUniVTACPolicy", flush=True)
         try:
-            task = task_module.Task(env_cfg, mode="eval")
+            print("[diagnostic] START Creating the UniVTAC Task", flush=True)
+            try:
+                print("[DEBUG] Entering Task constructor", flush=True)
+
+                task = task_module.Task(env_cfg, mode="eval")
+
+                print("[DEBUG] Task constructor completed", flush=True)
+
+            except BaseException as exc:
+                print(
+                    f"[DEBUG] Task constructor failed: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                traceback.print_exc()
+                raise RuntimeError("UniVTAC Task initialization failed") from exc
+            print("[diagnostic] DONE Creating the UniVTAC Task", flush=True)
             limits = _qpos_limits(task)
             if limits is None:
                 print(
@@ -273,6 +312,7 @@ def _run(args: argparse.Namespace) -> None:
                     f"Validated qpos limits lower={limits[0].tolist()} upper={limits[1].tolist()}"
                 )
 
+            print("[diagnostic] START Entering the episode loop", flush=True)
             for episode_index in range(args.episodes):
                 seed = args.seed_start + episode_index
                 start = time.perf_counter()
@@ -400,6 +440,7 @@ def _run(args: argparse.Namespace) -> None:
                     f"result={termination_reason} actions={result.num_steps} "
                     f"elapsed={result.elapsed_seconds:.2f}s video={video_path or 'MISSING'}"
                 )
+            print("[diagnostic] DONE Entering the episode loop", flush=True)
         finally:
             policy.close()
     finally:
@@ -408,11 +449,21 @@ def _run(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    args, simulation_app = _parse_args()
     try:
-        _run(args)
-    finally:
-        simulation_app.close()
+        args, simulation_app = _parse_args()
+        try:
+            _run(args)
+        finally:
+            simulation_app.close()
+    except BaseException as exc:
+        print(
+            f"Unhandled {type(exc).__name__} in closed-loop worker; complete traceback follows:",
+            file=sys.stderr,
+            flush=True,
+        )
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+        raise
 
 
 if __name__ == "__main__":

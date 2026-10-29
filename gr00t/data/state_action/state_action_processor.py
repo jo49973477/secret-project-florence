@@ -144,17 +144,52 @@ class StateActionProcessor:
     def _compute_normalization_parameters(self) -> None:
         """Compute and cache normalization parameters from statistics for all embodiments and modalities."""
 
-        def select_normalization_params(stats: dict[str, list[float]]) -> dict[str, np.ndarray]:
-            """Copy stats and apply the active min/max policy without mutating source data."""
+        def select_normalization_params(
+            stats: dict[str, list[float]], stats_path: str
+        ) -> dict[str, np.ndarray]:
+            """Validate and copy stats without mutating the source data."""
+            params = {
+                name: np.asarray(stats[name]).copy() for name in ("min", "max", "mean", "std")
+            }
+            shapes = {name: values.shape for name, values in params.items()}
+            expected_shape = shapes["min"]
+            if not expected_shape:
+                raise ValueError(
+                    f"Normalization statistics for {stats_path} must have a feature axis, "
+                    f"got scalar min shape {expected_shape}."
+                )
+            if any(shape != expected_shape for shape in shapes.values()):
+                shape_details = ", ".join(f"{name}={shape}" for name, shape in shapes.items())
+                raise ValueError(
+                    f"Normalization statistics for {stats_path} must have matching "
+                    f"min/max/mean/std shapes, got {shape_details}."
+                )
+
             min_key, max_key = ("q01", "q99") if self.use_percentiles else ("min", "max")
-            min_vals = np.asarray(stats[min_key]).copy()
-            max_vals = np.asarray(stats[max_key]).copy()
+            if self.use_percentiles:
+                params["q01"] = np.asarray(stats["q01"]).copy()
+                params["q99"] = np.asarray(stats["q99"]).copy()
+                percentile_shapes = {name: params[name].shape for name in ("q01", "q99")}
+                if any(shape != expected_shape for shape in percentile_shapes.values()):
+                    shape_details = ", ".join(
+                        f"{name}={shape}" for name, shape in percentile_shapes.items()
+                    )
+                    raise ValueError(
+                        f"Percentile statistics for {stats_path} must match min shape "
+                        f"{expected_shape}, got {shape_details}."
+                    )
+
+            min_vals = params[min_key]
+            max_vals = params[max_key]
             return {
                 "min": min_vals,
                 "max": max_vals,
-                "dim": np.array(min_vals.shape[0]),
-                "mean": np.asarray(stats["mean"]).copy(),
-                "std": np.asarray(stats["std"]).copy(),
+                # Statistics may be global (D,) or per-timestep (T, D). The
+                # feature dimension is always the final axis; leading axes are
+                # normalization/broadcasting axes, not action dimensions.
+                "dim": np.array(min_vals.shape[-1]),
+                "mean": params["mean"],
+                "std": params["std"],
             }
 
         for embodiment_tag in self.statistics:
@@ -168,7 +203,9 @@ class StateActionProcessor:
 
                 for joint_group, stats in self.statistics[embodiment_tag][modality].items():
                     self.norm_params[embodiment_tag][modality][joint_group] = (
-                        select_normalization_params(stats)
+                        select_normalization_params(
+                            stats, f"{embodiment_tag}/{modality}/{joint_group}"
+                        )
                     )
 
             # Override absolute action stats with relative stats where specified
@@ -196,7 +233,8 @@ class StateActionProcessor:
                             # as absolute actions while retaining relative mean/std.
                             self.norm_params[embodiment_tag]["action"][key] = (
                                 select_normalization_params(
-                                    self.statistics[embodiment_tag]["relative_action"][key]
+                                    self.statistics[embodiment_tag]["relative_action"][key],
+                                    f"{embodiment_tag}/relative_action/{key}",
                                 )
                             )
 

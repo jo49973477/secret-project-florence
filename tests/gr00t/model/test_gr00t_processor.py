@@ -364,6 +364,71 @@ class TestProcessorDecodeAction:
         result = processor.decode_action(dummy_action, EmbodimentTag(EMBODIMENT))
         assert set(result.keys()) == set(action_keys)
 
+    def test_temporal_statistics_decode_only_actual_action_dimensions(self):
+        from gr00t.data.state_action.state_action_processor import StateActionProcessor
+        from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7Processor
+
+        horizon, action_dim, padded_dim = 16, 8, 16
+        modality_configs = {
+            "new_embodiment": {
+                "state": {
+                    "delta_indices": [0],
+                    "modality_keys": ["joint"],
+                },
+                "action": {
+                    "delta_indices": list(range(horizon)),
+                    "modality_keys": ["joint"],
+                    "action_configs": [
+                        {
+                            "rep": "RELATIVE",
+                            "type": "NON_EEF",
+                            "format": "DEFAULT",
+                            "state_key": "joint",
+                        }
+                    ],
+                },
+            }
+        }
+
+        def stats(shape):
+            return {
+                "min": np.full(shape, -1.0).tolist(),
+                "max": np.full(shape, 1.0).tolist(),
+                "mean": np.zeros(shape).tolist(),
+                "std": np.ones(shape).tolist(),
+                "q01": np.full(shape, -0.9).tolist(),
+                "q99": np.full(shape, 0.9).tolist(),
+            }
+
+        statistics = {
+            "new_embodiment": {
+                "state": {"joint": stats((action_dim,))},
+                "action": {"joint": stats((action_dim,))},
+                "relative_action": {"joint": stats((horizon, action_dim))},
+            }
+        }
+        state_action = StateActionProcessor(
+            modality_configs=modality_configs,
+            statistics=statistics,
+            use_relative_action=True,
+        )
+        processor = object.__new__(Gr00tN1d7Processor)
+        processor.modality_configs = state_action.modality_configs
+        processor.state_action_processor = state_action
+        processor.max_action_horizon = horizon
+        processor.max_action_dim = padded_dim
+
+        model_output = np.zeros((1, horizon, padded_dim), dtype=np.float32)
+        state = {"joint": np.zeros((1, 1, action_dim), dtype=np.float32)}
+        decoded = processor.decode_action(model_output, EmbodimentTag.NEW_EMBODIMENT, state=state)
+        action_mask = processor._make_action_mask("new_embodiment")
+
+        assert state_action.get_action_dim("new_embodiment") == action_dim
+        assert model_output.shape == (1, horizon, padded_dim)
+        assert decoded["joint"].shape == (1, horizon, action_dim)
+        assert torch.all(action_mask[:, :action_dim] == 1)
+        assert torch.all(action_mask[:, action_dim:] == 0)
+
 
 class TestProcessorStatistics:
     """Test statistics management."""
