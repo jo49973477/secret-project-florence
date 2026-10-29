@@ -370,7 +370,12 @@ def run(config: Config):
 
                 wandb.init(
                     project=config.training.wandb_project,
-                    name=experiment_name,
+                    name=config.training.wandb_name or experiment_name,
+                    **(
+                        {"group": config.training.wandb_group}
+                        if config.training.wandb_group
+                        else {}
+                    ),
                     config=config_dict,
                     tags=[config.data.mode],
                 )
@@ -418,6 +423,9 @@ def run(config: Config):
         resolved_tactile_encoder_lr,
         config.training.learning_rate,
     )
+    from gr00t.utils.model_load_diagnostics import log_model_load_memory
+
+    log_model_load_memory("before TrainingArguments / ZeRO-3 setup")
     training_args = TrainingArguments(
         output_dir=str(output_dir),
         max_steps=config.training.max_steps,

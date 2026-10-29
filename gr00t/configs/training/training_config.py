@@ -126,6 +126,8 @@ class TrainingConfig:
     # Experiment tracking
     use_wandb: bool = False
     wandb_project: str = "finetune-gr00t-n1d7"
+    wandb_group: str | None = None
+    wandb_name: str | None = None
 
     # Telegram notifications. The bot token is intentionally never part of config.
     telegram_on: bool = False

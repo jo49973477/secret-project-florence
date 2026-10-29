@@ -14,6 +14,7 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 from gr00t.configs.hydra_config import build_gr00t_config, preflight
+from gr00t.utils.sensor_dependency_preflight import check_sensor_dependencies
 
 
 def validate_checkpoint(path: Path) -> None:
@@ -83,6 +84,7 @@ def resolve_resume(cfg: DictConfig, config) -> Path | None:
         "save_total_limit",
         "use_wandb",
         "wandb_project",
+        "wandb_group",
         "telegram_on",
         "telegram_chat_id",
         "telegram_notify_start",
@@ -103,7 +105,13 @@ def resolve_resume(cfg: DictConfig, config) -> Path | None:
         ignored = (
             allowed_training_changes
             if section == "training"
-            else {"master_port", "cuda_visible_devices", "dataloader_num_workers"}
+            else {
+                "master_port",
+                "cuda_visible_devices",
+                "dataloader_num_workers",
+                "global_batch_size",
+                "gradient_accumulation_steps",
+            }
             if section == "hardware"
             else set()
         )
@@ -117,6 +125,7 @@ def resolve_resume(cfg: DictConfig, config) -> Path | None:
     if old["name"] != new["name"]:
         raise ValueError("Resume must use the original experiment name")
     cfg.run_id = old["run_id"]
+    config.training.wandb_name = f"{cfg.name}-{cfg.run_id}"
     step = json.loads((checkpoint / "trainer_state.json").read_text())["global_step"]
     if (
         config.training.max_steps <= step
@@ -227,6 +236,7 @@ def launch(cfg: DictConfig) -> int:
         return 0
     if "RANK" in os.environ:
         raise ValueError("Run train_hydra.py once as the parent; it launches Torchrun itself")
+    check_sensor_dependencies(config.model)
     validate_dataset_inputs(cfg)
     checkpoint = resolve_resume(cfg, config)
     output = Path(cfg.output_dir).resolve()

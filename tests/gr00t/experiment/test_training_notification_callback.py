@@ -187,3 +187,33 @@ def test_one_transport_failure_does_not_prevent_another(tmp_path):
 
     failing_notifier.send.assert_called_once()
     working_notifier.send.assert_called_once()
+
+
+def test_failure_delivery_marker_written_atomically_and_sent_once(tmp_path):
+    marker = tmp_path / "notifications/delivered"
+    notifier = Mock()
+    notifier.send.return_value = True
+    callback, _ = _callback(tmp_path, notifier=notifier, failure_delivery_marker=str(marker))
+    callback.notify_failure(KeyError("bfloat16"), args=_args(tmp_path), state=_state())
+    assert marker.read_text() == "delivered\n"
+    assert not list(marker.parent.glob("*.tmp"))
+    callback.notify_failure(RuntimeError("second failure"), args=_args(tmp_path), state=_state())
+    notifier.send.assert_called_once()
+
+
+def test_failure_marker_write_error_does_not_hide_original_failure(tmp_path, monkeypatch, caplog):
+    from gr00t.experiment import training_notification_callback as notifications
+
+    def failed_replace(*args):
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(notifications.os, "replace", failed_replace)
+    notifier = Mock()
+    notifier.send.return_value = True
+    callback, _ = _callback(
+        tmp_path, notifier=notifier, failure_delivery_marker=str(tmp_path / "delivered")
+    )
+    callback.notify_failure(KeyError("bfloat16"), args=_args(tmp_path), state=_state())
+    assert callback._failure_sent
+    assert "Could not record failure notification delivery" in caplog.text
+    assert not (tmp_path / "delivered").exists()

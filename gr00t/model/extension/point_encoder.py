@@ -10,6 +10,7 @@ need the sparse-convolution stack.
 
 from contextlib import nullcontext
 import importlib
+import inspect
 import logging
 import os
 from pathlib import Path
@@ -362,6 +363,7 @@ class ConcertoPointEncoder(nn.Module):
         backbone: nn.Module | None = None,
         backbone_output_dim: int | None = None,
         pretrained_loaded: bool = False,
+        memory_map_checkpoint: bool = False,
     ) -> None:
         super().__init__()
         if input_dim != 6:
@@ -402,6 +404,7 @@ class ConcertoPointEncoder(nn.Module):
                 checkpoint_path=checkpoint_path,
                 download_root=download_root,
                 enable_flash=enable_flash,
+                memory_map_checkpoint=memory_map_checkpoint,
             )
             pretrained_loaded = True
             LOGGER.info("Point encoder: %s", model_name.replace("_", "-").title())
@@ -434,6 +437,7 @@ class ConcertoPointEncoder(nn.Module):
             )
         assert backbone_output_dim is not None
         self.backbone = backbone
+        self._configure_sparse_conv_precision()
         self._configure_zero3_sparse_conv_leaves()
         if constructing_official_backbone and torch.cuda.is_available():
             # Fail during setup, rather than at the first sparse GEMM, when
@@ -481,6 +485,92 @@ class ConcertoPointEncoder(nn.Module):
     def _mark_hf_initialized(self) -> None:
         for module in self.backbone.modules():
             module._is_hf_initialized = True
+
+    def _configure_sparse_conv_precision(self) -> None:
+        """Cast operation arguments, never Parameters, for each sparse convolution.
+
+        spconv's eval path bypasses custom_fwd's AMP casts and forwards its
+        registered bias straight to tensorview. DeepSpeed stores that bias in
+        BF16, which tensorview does not support in our spconv build. The local
+        boundary covers training and eval, including the fused inference bias.
+        ZeRO's module/leaf hooks still run normally before this method receives
+        the gathered parameters. Differentiable casts feed gradients back to
+        those same parameters; no converted tensors are cached across calls.
+        """
+        for name, module in self.backbone.named_modules():
+            if not module.__class__.__module__.startswith("spconv."):
+                continue
+            if not isinstance(getattr(module, "weight", None), nn.Parameter):
+                continue
+            if getattr(module, "_gr00t_sparse_precision", False):
+                continue
+            original = getattr(module, "_conv_forward", None)
+            if not callable(original) or list(inspect.signature(original).parameters)[:4] != [
+                "training",
+                "input",
+                "weight",
+                "bias",
+            ]:
+                raise RuntimeError(
+                    f"Unsupported spconv convolution API at {name}; expected "
+                    "_conv_forward(training, input, weight, bias, ...). "
+                    "Cannot enforce the Concerto precision boundary safely."
+                )
+
+            def conv_with_supported_precision(
+                training,
+                input,
+                weight,
+                bias,
+                add_input=None,
+                *args,
+                _forward=original,
+                _name=name,
+                _module=module,
+                **kwargs,
+            ):
+                features = input.features
+                dtype = torch.float16 if features.is_cuda else torch.float32
+                sparse = input.replace_feature(features.to(dtype=dtype))
+                residual = (
+                    add_input.replace_feature(add_input.features.to(dtype=dtype))
+                    if add_input is not None
+                    else None
+                )
+                compute_weight = weight.to(dtype=dtype)
+                compute_bias = bias.to(dtype=dtype) if bias is not None else None
+                debug = not getattr(_module, "_gr00t_sparse_precision_logged", False) and any(
+                    os.environ.get(key, "").lower() in {"1", "true", "yes"}
+                    for key in ("GR00T_DTYPE_DEBUG", "GROOT_DEBUG_CONCERTO_PRECISION")
+                )
+                if debug:
+                    LOGGER.info(
+                        "Concerto sparse boundary [%s] training=%s features=%s->%s "
+                        "weight=%s->%s bias=%s->%s",
+                        _name,
+                        training,
+                        features.dtype,
+                        sparse.features.dtype,
+                        weight.dtype,
+                        compute_weight.dtype,
+                        bias.dtype if bias is not None else None,
+                        compute_bias.dtype if compute_bias is not None else None,
+                    )
+                # Explicitly cover eval, native/implicit GEMM, 1x1, and bias
+                # addition outside the custom autograd function's AMP scope.
+                with torch.autocast(features.device.type, enabled=False):
+                    output = _forward(
+                        training, sparse, compute_weight, compute_bias, residual, *args, **kwargs
+                    )
+                if debug:
+                    LOGGER.info(
+                        "Concerto sparse boundary [%s] output=%s", _name, output.features.dtype
+                    )
+                    _module._gr00t_sparse_precision_logged = True
+                return output
+
+            module._conv_forward = conv_with_supported_precision
+            module._gr00t_sparse_precision = True
 
     def _configure_zero3_sparse_conv_leaves(self) -> None:
         """Keep spconv weights gathered through sparse backward under ZeRO-3.
@@ -542,6 +632,7 @@ class ConcertoPointEncoder(nn.Module):
         checkpoint_path: str | None,
         download_root: str | None,
         enable_flash: bool | None,
+        memory_map_checkpoint: bool = False,
     ) -> tuple[nn.Module, int, str, int, dict]:
         concerto = ConcertoPointEncoder._import_concerto()
 
@@ -550,13 +641,38 @@ class ConcertoPointEncoder(nn.Module):
         if enable_flash is not None:
             custom_config["enable_flash"] = enable_flash
         try:
-            checkpoint = concerto.load(
-                checkpoint_name,
-                repo_id=repo_id,
-                download_root=download_root,
-                custom_config=custom_config or None,
-                ckpt_only=True,
-            )
+            if memory_map_checkpoint:
+                from huggingface_hub import hf_hub_download
+
+                from gr00t.utils.checkpoint_io import load_torch_checkpoint
+                from gr00t.utils.model_load_diagnostics import model_load_phase
+
+                # Same official ckpt_only resolution/config policy, with PyTorch's
+                # file-backed storages. Do not create an upstream model as well.
+                path = (
+                    Path(checkpoint_path).expanduser()
+                    if checkpoint_path
+                    else Path(
+                        hf_hub_download(
+                            repo_id=repo_id,
+                            filename=f"{model_name}.pth",
+                            repo_type="model",
+                            revision="main",
+                            local_dir=download_root or os.path.expanduser("~/.cache/concerto/ckpt"),
+                        )
+                    )
+                )
+                with model_load_phase("Concerto.read", checkpoint=path):
+                    checkpoint = load_torch_checkpoint(path, weights_only=True)
+                checkpoint["config"].update(custom_config)
+            else:
+                checkpoint = concerto.load(
+                    checkpoint_name,
+                    repo_id=repo_id,
+                    download_root=download_root,
+                    custom_config=custom_config or None,
+                    ckpt_only=True,
+                )
         except Exception as exc:
             raise RuntimeError(
                 f"Failed to load requested pretrained Concerto checkpoint {checkpoint_name!r} "
@@ -796,10 +912,10 @@ class ConcertoPointEncoder(nn.Module):
                 torch.get_autocast_dtype("cuda"),
             )
 
-        # This spconv build has no BF16 tensorview mapping. Its sparse autograd
-        # functions use custom_fwd(cast_inputs=float16) when CUDA autocast is
-        # active, casting both gathered ZeRO weights and features for the GEMM.
-        # No Parameter objects or module storage are replaced here.
+        # Dense Concerto operations use local CUDA FP16 autocast. Each sparse
+        # convolution also casts its features/weight/bias explicitly, because
+        # spconv's eval path bypasses the AMP-decorated autograd function.
+        # Registered parameter storage and ZeRO ownership stay unchanged.
         autocast_context = (
             torch.autocast("cuda", dtype=torch.float16) if points.is_cuda else nullcontext()
         )

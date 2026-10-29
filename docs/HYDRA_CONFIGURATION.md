@@ -307,3 +307,23 @@ Intentional migration differences: RGB recipes explicitly disable inactive senso
 machine-specific shell paths; output naming/retention follows the selected YAML recipe.
 The SO100 baseline keeps the common five-checkpoint retention instead of the overfit shell
 script's keep-all policy; set training.save_total_limit=20 for its 2000-step/100-save recipe.
+
+
+Real launches also run an isolated sensor dependency import check once before
+Torchrun and checkpoint loading. Configuration-only `dry_run=true` is unchanged.
+See [sensor dependency installation and compatibility](sensor_dependencies.md)
+for Concerto/SPARSH requirements and Python 3.12 / Torch 2.9.0+cu128 guidance.
+
+
+Relative action statistics use the resolved per-embodiment Hydra modalities from
+`config.data.modality_configs`, including custom `new_embodiment` definitions.
+`generate_rel_stats(..., modality_configs=resolved_modalities)` passes those same
+settings to the relative-action loader and cache fingerprint. Omitting the
+argument retains the built-in registry fallback. Existing fingerprint payloads
+and atomic cache writes are unchanged; changed horizons or action semantics
+regenerate incompatible entries. UniVTAC retains relative `joint` actions
+against state `joint` (`NON_EEF`, `DEFAULT`, `state_key=joint`), with the RGB
+recipe's 16-step and multimodal recipe's 40-step data horizons.
+
+Experiment identity, W&B grouping and hardware batch defaults are documented in
+[experiment_identity.md](experiment_identity.md).

@@ -22,3 +22,4 @@ tune_vlln: false
 tune_diffusion_model: false
 tune_point_encoder: false
 tune_tactile_encoder: false
+load_bf16: true

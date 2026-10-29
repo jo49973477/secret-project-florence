@@ -76,9 +76,12 @@ def test_sparse_conv_container_is_zero3_leaf_without_replacing_parameters() -> N
             self.weight = nn.Parameter(torch.ones(4, 3, 3, 3, 4))
             self.seen_features = None
 
+        def _conv_forward(self, training, input, weight, bias, add_input=None):
+            return SparseTensor(input.features * weight.mean())
+
         def forward(self, sparse):
             self.seen_features = sparse.features
-            return SparseTensor(sparse.features * self.weight.mean())
+            return self._conv_forward(self.training, sparse, self.weight, None)
 
     class PointSequential(nn.Module):
         def __init__(self):
@@ -112,6 +115,7 @@ def test_sparse_conv_container_is_zero3_leaf_without_replacing_parameters() -> N
     assert encoder.backbone.block.cpe.conv.weight is sparse_weight
     assert set(encoder.backbone.state_dict()) == state_keys
 
+    backbone.to(dtype=torch.bfloat16)
     # Simulate ZeRO's input hook replacing Point.feat but not the sparse
     # structure's feature reference. The conv must consume the hooked tensor.
     old_feature = torch.randn(3, 4, requires_grad=True)
@@ -123,6 +127,8 @@ def test_sparse_conv_container_is_zero3_leaf_without_replacing_parameters() -> N
     assert hooked_feature.grad is not None
     assert old_feature.grad is None
     assert sparse_weight.grad is not None
+    assert sparse_weight.dtype == torch.bfloat16
+    assert torch.isfinite(sparse_weight.grad).all()
 
 
 def _checkpoint(value: float) -> dict:
@@ -324,3 +330,28 @@ def test_all_zero_checkpoint_is_rejected(monkeypatch: pytest.MonkeyPatch) -> Non
 
     with pytest.raises(RuntimeError, match="no non-zero pretrained parameters"):
         _load_backbone()
+
+
+def test_mapped_local_checkpoint_matches_official_loader(monkeypatch, tmp_path):
+    checkpoint = _checkpoint(0.375)
+    load = _install_fake_concerto(monkeypatch, checkpoint)
+    path = tmp_path / "concerto_small.pth"
+    torch.save(checkpoint, path)
+    torch.manual_seed(31)
+    legacy, *_ = _load_backbone()
+    legacy_rng = torch.random.get_rng_state()
+    torch.manual_seed(31)
+    mapped, *_ = ConcertoPointEncoder._load_official_backbone(
+        model_name="concerto_small",
+        repo_id="Pointcept/Concerto",
+        checkpoint_path=str(path),
+        download_root=None,
+        enable_flash=None,
+        memory_map_checkpoint=True,
+    )
+    assert load.call_count == 1  # optimized local reads must not call the upstream eager reader too
+    assert torch.equal(torch.random.get_rng_state(), legacy_rng)
+    assert all(
+        torch.equal(value, mapped.state_dict()[key]) for key, value in legacy.state_dict().items()
+    )
+    _assert_materialized_checkpoint(mapped, 0.375)

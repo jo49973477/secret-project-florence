@@ -34,3 +34,6 @@ action_head_dropout_override: null
 vl_self_attention_dropout_override: null
 load_bf16: false
 backbone_trainable_params_fp32: true
+
+# Validate complete VLM coverage before skipping the external pretrained VLM load.
+optimize_pretrained_loading: true

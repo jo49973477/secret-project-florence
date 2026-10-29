@@ -36,6 +36,8 @@ class Gr00tN1d7Config(PretrainedConfig):
     model_type: str = "Gr00tN1d7"
     model_dtype: str = "bfloat16"  # Use bfloat16 for Flash Attention compatibility
 
+    optimize_pretrained_loading: bool = True
+
     # Backbone configuration
     model_name: str = "nvidia/Cosmos-Reason2-2B"
     backbone_model_type: str = "qwen"

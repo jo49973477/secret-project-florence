@@ -42,7 +42,11 @@ from gr00t.utils.dist_utils import (
     run_or_wait_on_rank0,
     run_serialized_across_ranks,
 )
-from gr00t.utils.model_load_diagnostics import log_model_load_memory
+from gr00t.utils.model_load_diagnostics import (
+    log_model_load_memory,
+    model_load_phase,
+    trace_checkpoint_loading,
+)
 
 
 # Convert tensors to lists for JSON serialization
@@ -282,64 +286,92 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 if value is not None
             }
 
+            from gr00t.model.gr00t_n1d7.pretrained_loading import (
+                checkpoint_backbone_shapes,
+                finalize_pretrained_model,
+                initialize_missing_sidecar,
+            )
+
             def load_base_checkpoint():
+                shapes = None
+                bf16_shapes = None
+                if self.config.model.optimize_pretrained_loading:
+                    if self.config.training.bf16 and os.environ.get(
+                        "GROOT_MODEL_LOAD_PRESERVE_BF16", "1"
+                    ).lower() not in {"0", "false", "no"}:
+                        bf16_shapes = {}
+                    shapes = checkpoint_backbone_shapes(
+                        self.config.training.start_from_checkpoint,
+                        self.transformers_loading_kwargs,
+                        bf16_parameter_shapes=bf16_shapes,
+                    )
                 log_model_load_memory("before AutoModel.from_pretrained")
-                loaded = AutoModel.from_pretrained(
-                    self.config.training.start_from_checkpoint,
-                    tune_llm=self.config.model.tune_llm,
-                    tune_visual=self.config.model.tune_visual,
-                    tune_projector=self.config.model.tune_projector,
-                    tune_diffusion_model=self.config.model.tune_diffusion_model,
-                    tune_vlln=self.config.model.tune_vlln,
-                    state_dropout_prob=self.config.model.state_dropout_prob,
-                    backbone_trainable_params_fp32=(
-                        self.config.model.backbone_trainable_params_fp32
+                with (
+                    model_load_phase(
+                        "GR00T.from_pretrained",
+                        checkpoint=self.config.training.start_from_checkpoint,
                     ),
-                    load_bf16=self.config.model.load_bf16,
-                    transformers_loading_kwargs=self.transformers_loading_kwargs,
-                    dit_type=self.config.model.dit_type,
-                    sidecar_num_stages=self.config.model.sidecar_num_stages,
-                    sidecar_stage_indices=self.config.model.sidecar_stage_indices,
-                    sidecar_hidden_dim=self.config.model.sidecar_hidden_dim,
-                    sidecar_num_heads=self.config.model.sidecar_num_heads,
-                    sidecar_num_point_tokens=self.config.model.sidecar_num_point_tokens,
-                    tactile_fusion_mode=self.config.model.tactile_fusion_mode,
-                    contact_num_tokens=self.config.model.contact_num_tokens,
-                    contact_hidden_dim=self.config.model.contact_hidden_dim,
-                    contact_prediction_loss_weight=self.config.model.contact_prediction_loss_weight,
-                    freeze_pretrained_dit=self.config.model.freeze_pretrained_dit,
-                    freeze_contact_teacher=self.config.model.freeze_contact_teacher,
-                    contact_injection_enabled=self.config.model.contact_injection_enabled,
-                    contact_predictor_warmup=self.config.model.contact_predictor_warmup,
-                    use_point_conditioning=self.config.model.use_point_conditioning,
-                    use_tactile_conditioning=self.config.model.use_tactile_conditioning,
-                    point_input_dim=self.config.model.point_input_dim,
-                    tactile_input_channels=self.config.model.tactile_input_channels,
-                    point_encoder_cfg=self.config.model.point_encoder_cfg,
-                    point_encoder_checkpoint_path=self.config.model.point_encoder_checkpoint_path,
-                    point_encoder_repo_id=self.config.model.point_encoder_repo_id,
-                    point_encoder_download_root=self.config.model.point_encoder_download_root,
-                    point_encoder_grid_size=self.config.model.point_encoder_grid_size,
-                    point_encoder_enable_flash=self.config.model.point_encoder_enable_flash,
-                    point_encoder_pretrained_load_on_init=point_load_on_init,
-                    point_encoder_deferred_bootstrap=point_deferred,
-                    point_encoder_model_config=point_model_config,
-                    tactile_encoder_cfg=self.config.model.tactile_encoder_cfg,
-                    tactile_pretrained_model=self.config.model.tactile_pretrained_model,
-                    tactile_checkpoint_filename=self.config.model.tactile_checkpoint_filename,
-                    tactile_background_path=self.config.model.tactile_background_path,
-                    tactile_pretrained_load_on_init=tactile_load_on_init,
-                    tactile_encoder_deferred_bootstrap=tactile_deferred,
-                    tactile_temporal_delta_indices=(
-                        self.config.model.tactile_temporal_delta_indices
-                    ),
-                    tune_point_encoder=self.config.model.tune_point_encoder,
-                    tune_tactile_encoder=self.config.model.tune_tactile_encoder,
-                    tune_multimodal_adapter=self.config.model.tune_multimodal_adapter,
-                    output_loading_info=True,
-                    **dropout_overrides,
-                    **self.transformers_loading_kwargs,
-                )
+                    trace_checkpoint_loading(),
+                ):
+                    loaded = AutoModel.from_pretrained(
+                        self.config.training.start_from_checkpoint,
+                        low_cpu_mem_usage=True,
+                        checkpoint_backbone_shapes=shapes,
+                        checkpoint_bf16_shapes=bf16_shapes,
+                        tune_llm=self.config.model.tune_llm,
+                        tune_visual=self.config.model.tune_visual,
+                        tune_projector=self.config.model.tune_projector,
+                        tune_diffusion_model=self.config.model.tune_diffusion_model,
+                        tune_vlln=self.config.model.tune_vlln,
+                        state_dropout_prob=self.config.model.state_dropout_prob,
+                        backbone_trainable_params_fp32=(
+                            self.config.model.backbone_trainable_params_fp32
+                        ),
+                        load_bf16=self.config.model.load_bf16,
+                        transformers_loading_kwargs=self.transformers_loading_kwargs,
+                        dit_type=self.config.model.dit_type,
+                        sidecar_num_stages=self.config.model.sidecar_num_stages,
+                        sidecar_stage_indices=self.config.model.sidecar_stage_indices,
+                        sidecar_hidden_dim=self.config.model.sidecar_hidden_dim,
+                        sidecar_num_heads=self.config.model.sidecar_num_heads,
+                        sidecar_num_point_tokens=self.config.model.sidecar_num_point_tokens,
+                        tactile_fusion_mode=self.config.model.tactile_fusion_mode,
+                        contact_num_tokens=self.config.model.contact_num_tokens,
+                        contact_hidden_dim=self.config.model.contact_hidden_dim,
+                        contact_prediction_loss_weight=self.config.model.contact_prediction_loss_weight,
+                        freeze_pretrained_dit=self.config.model.freeze_pretrained_dit,
+                        freeze_contact_teacher=self.config.model.freeze_contact_teacher,
+                        contact_injection_enabled=self.config.model.contact_injection_enabled,
+                        contact_predictor_warmup=self.config.model.contact_predictor_warmup,
+                        use_point_conditioning=self.config.model.use_point_conditioning,
+                        use_tactile_conditioning=self.config.model.use_tactile_conditioning,
+                        point_input_dim=self.config.model.point_input_dim,
+                        tactile_input_channels=self.config.model.tactile_input_channels,
+                        point_encoder_cfg=self.config.model.point_encoder_cfg,
+                        point_encoder_checkpoint_path=self.config.model.point_encoder_checkpoint_path,
+                        point_encoder_repo_id=self.config.model.point_encoder_repo_id,
+                        point_encoder_download_root=self.config.model.point_encoder_download_root,
+                        point_encoder_grid_size=self.config.model.point_encoder_grid_size,
+                        point_encoder_enable_flash=self.config.model.point_encoder_enable_flash,
+                        point_encoder_pretrained_load_on_init=point_load_on_init,
+                        point_encoder_deferred_bootstrap=point_deferred,
+                        point_encoder_model_config=point_model_config,
+                        tactile_encoder_cfg=self.config.model.tactile_encoder_cfg,
+                        tactile_pretrained_model=self.config.model.tactile_pretrained_model,
+                        tactile_checkpoint_filename=self.config.model.tactile_checkpoint_filename,
+                        tactile_background_path=self.config.model.tactile_background_path,
+                        tactile_pretrained_load_on_init=tactile_load_on_init,
+                        tactile_encoder_deferred_bootstrap=tactile_deferred,
+                        tactile_temporal_delta_indices=(
+                            self.config.model.tactile_temporal_delta_indices
+                        ),
+                        tune_point_encoder=self.config.model.tune_point_encoder,
+                        tune_tactile_encoder=self.config.model.tune_tactile_encoder,
+                        tune_multimodal_adapter=self.config.model.tune_multimodal_adapter,
+                        output_loading_info=True,
+                        **dropout_overrides,
+                        **self.transformers_loading_kwargs,
+                    )
                 log_model_load_memory("after AutoModel.from_pretrained")
                 return loaded
 
@@ -351,6 +383,14 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 not in {"0", "false", "no"}
             )
             if serialize_loading:
+                from transformers.integrations import is_deepspeed_zero3_enabled
+
+                if is_deepspeed_zero3_enabled():
+                    raise RuntimeError(
+                        "Serialized checkpoint loading cannot run inside active ZeRO-3 initialization: "
+                        "its internal collectives require all ranks. Keep this pipeline's existing "
+                        "model-before-TrainingArguments order; no initialization order was changed."
+                    )
                 logging.info("Serializing multimodal model loading across distributed ranks.")
                 model, loading_info = run_serialized_across_ranks(
                     load_base_checkpoint,
@@ -413,6 +453,11 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                     f"{self.config.training.start_from_checkpoint}:\n" + "\n".join(errors)
                 )
 
+            with model_load_phase("Sidecar.initialize_missing"):
+                initialize_missing_sidecar(model, missing_keys)
+            with model_load_phase("GR00T.finalize"):
+                finalize_pretrained_model(model)
+
             if checkpoint_has_point or checkpoint_has_tactile:
                 model.action_head.validate_embedded_sensor_backbones()
 
@@ -420,7 +465,8 @@ class Gr00tN1d7Pipeline(ModelPipeline):
 
                 def bootstrap_sensor_backbones():
                     log_model_load_memory("before external sensor bootstrap")
-                    model.action_head.bootstrap_deferred_sensor_backbones()
+                    with model_load_phase("sensors.bootstrap"), trace_checkpoint_loading():
+                        model.action_head.bootstrap_deferred_sensor_backbones()
                     log_model_load_memory("after external sensor bootstrap")
 
                 if serialize_loading:
@@ -486,6 +532,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
         log_parameter_summary(model)
         logging.debug(f"Model architecture: {model}")
 
+        log_model_load_memory("model loading complete")
         return model
 
     def _get_statistics(

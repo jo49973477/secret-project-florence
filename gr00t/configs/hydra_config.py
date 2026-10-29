@@ -38,7 +38,7 @@ MODEL_FIELDS = frozenset(
     tune_projector tune_diffusion_model tune_vlln tune_point_encoder tune_tactile_encoder
     tune_multimodal_adapter use_lora lora_r lora_alpha lora_dropout lora_bias
     state_dropout_prob action_head_dropout_override vl_self_attention_dropout_override
-    load_bf16 backbone_trainable_params_fp32 model_revision
+    load_bf16 backbone_trainable_params_fp32 model_revision optimize_pretrained_loading
 """.split()
 )
 PREPROCESSING_FIELDS = frozenset(
@@ -56,7 +56,10 @@ HARDWARE_FIELDS = frozenset(
     ddp_bucket_cap_mb
 """.split()
 )
+BATCH_FIELDS = {"global_batch_size", "gradient_accumulation_steps"}
+
 TRAINING_RESERVED = HARDWARE_FIELDS | {
+    "wandb_name",
     "output_dir",
     "experiment_name",
     "start_from_checkpoint",
@@ -289,13 +292,19 @@ def build_gr00t_config(cfg: DictConfig) -> Config:
     for key in ("cuda_visible_devices", "master_port", "num_gpus"):
         if key not in hardware:
             raise ValueError(f"hardware.{key} is required")
-    _keys(hardware, HARDWARE_FIELDS | {"cuda_visible_devices", "master_port"}, "hardware")
+    _keys(
+        hardware,
+        HARDWARE_FIELDS | BATCH_FIELDS | {"cuda_visible_devices", "master_port"},
+        "hardware",
+    )
     launch_hw = _typed(
         Hardware, {k: hardware.pop(k) for k in ("cuda_visible_devices", "master_port")}, "hardware"
     )
     training = dict(raw["training"])
     _keys(training, {f.name for f in fields(TrainingConfig)} - TRAINING_RESERVED, "training")
-    training.update(_typed(TrainingConfig, hardware, "hardware"))
+    hardware = _typed(TrainingConfig, hardware, "hardware")
+    batch_defaults = {k: hardware.pop(k) for k in BATCH_FIELDS if k in hardware}
+    training = {**batch_defaults, **training, **hardware}
     training = _typed(TrainingConfig, training, "training")
     resume = Resume(**_typed(Resume, raw["resume"], "resume"))
     if resume.checkpoint_path and resume.auto_find_latest:
@@ -309,6 +318,7 @@ def build_gr00t_config(cfg: DictConfig) -> Config:
     training.update(
         output_dir=raw["output_dir"],
         experiment_name=None,
+        wandb_name=f"{raw['name']}-{raw['run_id']}",
         start_from_checkpoint=base,
         resume_from_checkpoint=resume.checkpoint_path or resume.auto_find_latest,
     )
@@ -325,7 +335,13 @@ def build_gr00t_config(cfg: DictConfig) -> Config:
     ).items():
         cfg[key] = value
     for key in cfg.hardware:
-        cfg.hardware[key] = launch_hw[key] if key in launch_hw else getattr(config.training, key)
+        cfg.hardware[key] = (
+            launch_hw[key]
+            if key in launch_hw
+            else batch_defaults[key]
+            if key in BATCH_FIELDS
+            else getattr(config.training, key)
+        )
     for key in cfg.training:
         cfg.training[key] = getattr(config.training, key)
     for key in raw["model"]:
@@ -367,6 +383,8 @@ def validate_compatibility(config: Config, hardware: dict) -> None:
         )
     if not 1 <= hardware["master_port"] <= 65535:
         raise ValueError("hardware.master_port must be between 1 and 65535")
+    if t.gradient_accumulation_steps < 1:
+        raise ValueError("training.gradient_accumulation_steps must be >= 1")
     if t.global_batch_size < 1 or t.global_batch_size % t.num_gpus:
         raise ValueError(
             "training.global_batch_size must be positive and divisible by hardware.num_gpus"
@@ -483,8 +501,16 @@ def preflight(cfg: DictConfig, config: Config) -> dict[str, Any]:
     """Requested policy summary; actual tensor ownership is only known after model loading."""
     t, m = config.training, config.model
     return {
+        "wandb": {
+            "enabled": t.use_wandb,
+            "project": t.wandb_project,
+            "name": t.wandb_name,
+            "group": t.wandb_group,
+        },
         "gpu_ids": cfg.hardware.cuda_visible_devices,
         "world_size": t.num_gpus,
+        "global_batch_size": t.global_batch_size,
+        "gradient_accumulation_steps": t.gradient_accumulation_steps,
         "per_device_batch_size": t.global_batch_size // t.num_gpus,
         "effective_batch_size": t.accumulated_batch_size,
         "requested_learning_rates": {

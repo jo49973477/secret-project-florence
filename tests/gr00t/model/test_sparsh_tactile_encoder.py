@@ -255,3 +255,23 @@ def test_sparsh_cuda_bf16_forward_backward_without_layer_norm_mismatch(
         encoder.projection[1].weight,
     ):
         assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
+
+
+def test_mapped_bootstrap_preserves_all_weights_projection_and_rng(tiny_sparsh, tmp_path):
+    checkpoint = _checkpoint(tmp_path / "sparsh.pth", value=0.375)
+    torch.manual_seed(47)
+    legacy = tiny_sparsh.SparshDinoTactileEncoder(
+        output_dim=8, pretrained_model=str(checkpoint), memory_map_checkpoint=False
+    )
+    legacy_rng = torch.random.get_rng_state()
+    torch.manual_seed(47)
+    mapped = tiny_sparsh.SparshDinoTactileEncoder(
+        output_dim=8, pretrained_model=str(checkpoint), memory_map_checkpoint=True
+    )
+    assert torch.equal(torch.random.get_rng_state(), legacy_rng)
+    assert all(
+        torch.equal(value, mapped.state_dict()[name]) for name, value in legacy.state_dict().items()
+    )
+    assert [p.requires_grad for p in legacy.parameters()] == [
+        p.requires_grad for p in mapped.parameters()
+    ]

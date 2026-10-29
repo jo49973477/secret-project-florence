@@ -8,10 +8,10 @@ Edit PRESETS for stage behavior; edit YAML for model/training defaults.
 Extra Hydra overrides always win over the preset.
 """
 
+from pathlib import Path
 import shlex
 import subprocess
 import sys
-from pathlib import Path
 
 
 PRESETS = {
@@ -21,6 +21,7 @@ PRESETS = {
         "overrides": [
             "model.tactile_fusion_mode=none",
             "model.use_tactile_conditioning=false",
+            "name=sidecar-point-full",
         ],
     },
     # Train the contact predictor without injecting contact into actions.
@@ -29,6 +30,7 @@ PRESETS = {
         "overrides": [
             "model.contact_predictor_warmup=true",
             "model.contact_injection_enabled=false",
+            "name=sidecar-contact-warmup",
         ],
     },
     # Full Point + Tactile Sidecar.
@@ -37,6 +39,7 @@ PRESETS = {
         "overrides": [
             "model.contact_predictor_warmup=false",
             "model.contact_injection_enabled=true",
+            "name=sidecar-full",
         ],
     },
     # Five-episode overfit with BOTH Point + Tactile enabled.
@@ -47,6 +50,7 @@ PRESETS = {
             "model.use_tactile_conditioning=true",
             "model.tactile_fusion_mode=surprise",
             "model.freeze_contact_teacher=false",
+            "name=sidecar-full-overfit5",
         ],
     },
 }
@@ -65,6 +69,7 @@ def build_command(stage: str, overrides: list[str]) -> list[str]:
         f"experiment/{preset['experiment']}",
         "model=gr00t_sidecar",
         "data=univtac_multimodal",
+        "training.wandb_group=sidecar",
         *preset["overrides"],
         *overrides,
     ]

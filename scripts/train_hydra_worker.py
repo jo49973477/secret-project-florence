@@ -18,6 +18,7 @@ def main(path: str) -> None:
     config = build_gr00t_config(cfg)
     resolve_resume(cfg, config)
     # Fetch configuration only here, never in parent/preflight. setup.py still owns loading.
+    from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7
     from transformers import AutoConfig
 
     checkpoint = AutoConfig.from_pretrained(

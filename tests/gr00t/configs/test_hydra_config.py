@@ -59,6 +59,8 @@ def test_overrides_hardware_and_rates(monkeypatch):
         overrides=[
             "hardware=single_3090",
             "training.max_steps=2000",
+            "training.global_batch_size=2",
+            "training.gradient_accumulation_steps=16",
             "training.action_head_learning_rate=5e-5",
             "training.point_encoder_learning_rate=1e-5",
         ]
@@ -248,7 +250,7 @@ def test_snapshots_resume_and_compatibility(tmp_path):
     check = checkpoint(output / "checkpoint-100", ds=True)
     cfg.resume.enabled = True
     cfg.resume.auto_find_latest = True
-    cfg.training.max_steps = 6000
+    cfg.training.max_steps = config.training.max_steps + 100
     assert resolve_resume(cfg, build_gr00t_config(cfg)) == check
     cfg.training.action_head_learning_rate = 5e-5
     with pytest.raises(ValueError, match="training.action_head_learning_rate"):
@@ -404,3 +406,12 @@ def test_ineffective_legacy_controls_fail_early():
     cfg = composed(overrides=["training.eval_strategy=steps"])
     with pytest.raises(ValueError, match="separate open_loop_eval"):
         build_gr00t_config(cfg)
+
+
+@pytest.mark.parametrize("model", ["gr00t_multimodal", "gr00t_sidecar"])
+@pytest.mark.parametrize("enabled", [True, False])
+def test_pretrained_loading_override(enabled, model):
+    cfg = composed(
+        overrides=[f"model={model}", f"model.optimize_pretrained_loading={str(enabled).lower()}"]
+    )
+    assert build_gr00t_config(cfg).model.optimize_pretrained_loading is enabled

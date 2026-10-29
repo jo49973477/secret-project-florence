@@ -6,7 +6,7 @@ defaults:
 - /hardware: dual_3090_zero3
 - _self_
 - override /hydra/job_logging: disabled
-name: univtac_full
+name: multimodal-full
 run_id: ${now:%Y%m%d_%H%M%S}
 output_dir: outputs/${name}/${run_id}
 dry_run: false
@@ -20,3 +20,6 @@ hydra:
   run:
     dir: .
   output_subdir: null
+
+training:
+  wandb_group: multimodal

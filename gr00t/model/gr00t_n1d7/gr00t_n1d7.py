@@ -269,6 +269,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 grid_size=config.point_encoder_grid_size,
                 enable_flash=config.point_encoder_enable_flash,
                 load_pretrained=True,
+                memory_map_checkpoint=config.optimize_pretrained_loading,
             )
             if not hasattr(self.point_encoder, "architecture_config"):
                 raise RuntimeError("Deferred point bootstrap did not create a Concerto encoder.")
@@ -288,6 +289,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 background_path=config.tactile_background_path,
                 load_pretrained=True,
                 backbone_trainable=config.tune_tactile_encoder,
+                memory_map_checkpoint=config.optimize_pretrained_loading,
             )
             config.tactile_pretrained_load_on_init = False
             config.tactile_encoder_deferred_bootstrap = False
@@ -999,6 +1001,8 @@ class Gr00tN1d7(PreTrainedModel):
         self,
         config: Gr00tN1d7Config,
         transformers_loading_kwargs: dict = {"trust_remote_code": True},
+        checkpoint_backbone_shapes: dict | None = None,
+        checkpoint_bf16_shapes: dict | None = None,
     ):
         """
         Initialize Gr00tN1d7 model.
@@ -1021,7 +1025,11 @@ class Gr00tN1d7(PreTrainedModel):
         log_model_load_memory("Gr00tN1d7 construction start")
 
         backbone_cls = get_backbone_cls(config)
+        backbone_loading_kwargs = {}
+        if checkpoint_backbone_shapes is not None:
+            backbone_loading_kwargs["checkpoint_backbone_shapes"] = checkpoint_backbone_shapes
         self.backbone = backbone_cls(
+            **backbone_loading_kwargs,
             model_name=config.model_name,
             tune_llm=config.tune_llm,
             tune_visual=config.tune_visual,
@@ -1050,6 +1058,10 @@ class Gr00tN1d7(PreTrainedModel):
             model_type=config.backbone_model_type,
             transformers_loading_kwargs=transformers_loading_kwargs,
         )
+        if checkpoint_bf16_shapes:
+            from .pretrained_loading import prepare_bf16_checkpoint_parameters
+
+            prepare_bf16_checkpoint_parameters(self, checkpoint_bf16_shapes)
         log_model_load_memory("Gr00tN1d7 construction complete")
 
     def enable_lora(

@@ -464,6 +464,10 @@ Qwen3-VL or Concerto.
 
 ### Concerto installation and checkpoint smoke test
 
+Hydra now checks sensor imports before launching workers or loading GR00T. See
+[the dependency preflight and installation guide](../../docs/sensor_dependencies.md)
+for Python 3.12 / Torch 2.9.0+cu128, torch-scatter wheels, and spconv-cu126 caveats.
+
 Concerto is optional so RGB-only and lightweight PointNet++ workflows keep working. Install the
 official [Pointcept/Concerto](https://github.com/Pointcept/Concerto) package-mode dependencies using
 versions matching the active GR00T PyTorch/CUDA environment. The official instructions derive the

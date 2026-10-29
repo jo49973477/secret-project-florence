@@ -1,8 +1,8 @@
 defaults:
 - finetune
-- _self_
-gradient_accumulation_steps: 1
-learning_rate: 0.0003
+max_steps: 5000
 weight_decay: 0.0
 warmup_ratio: 0.0
 save_total_limit: 50
+
+gradient_accumulation_steps: 1

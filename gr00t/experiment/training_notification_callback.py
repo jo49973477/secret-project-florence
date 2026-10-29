@@ -9,6 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import logging
 import math
+import os
 from pathlib import Path
 import re
 import socket
@@ -294,4 +295,6 @@ class TrainingNotificationCallback(TrainerCallback):
                     temporary.write_text("delivered\n", encoding="utf-8")
                     os.replace(temporary, marker_path)
                 except OSError as exc:
-                    logger.warning("Could not record failure notification delivery (%s).", type(exc).__name__)
+                    logger.warning(
+                        "Could not record failure notification delivery (%s).", type(exc).__name__
+                    )
