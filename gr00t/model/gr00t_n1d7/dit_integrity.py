@@ -14,6 +14,10 @@ from gr00t.model.gr00t_n1d7.sensor_loading import (
 
 
 def is_new_multimodal_adapter_key(name: str) -> bool:
+    if name.startswith("action_head.temporal_fusion.") or (
+        name.startswith("action_head.model.") and ".lora_" in name
+    ):
+        return True
     return any(
         name.startswith(prefix) if prefix.endswith(".") else name == prefix
         for prefix in MULTIMODAL_ADAPTER_PREFIXES + SIDECAR_ADAPTER_PREFIXES
@@ -88,7 +92,11 @@ def compare_shared_tensors(
             float((diff / ref.abs().clamp_min(denominator_floor)).max()) if diff.numel() else 0.0
         )
         max_abs, max_rel = max(max_abs, abs_error), max(max_rel, rel_error)
-        okay = torch.allclose(got, ref, atol=atol, rtol=rtol)
+        okay = (
+            torch.equal(got, ref)
+            if atol == rtol == 0
+            else torch.allclose(got, ref, atol=atol, rtol=rtol)
+        )
         tensors.append(
             {
                 "name": name,
@@ -97,6 +105,7 @@ def compare_shared_tensors(
                 "candidate_dtype": got_dtype,
                 "finite": True,
                 "allclose": okay,
+                "torch_equal_after_dtype_conversion": torch.equal(got, ref),
                 "max_abs_error": abs_error,
                 "max_relative_error": rel_error,
             }

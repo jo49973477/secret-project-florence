@@ -30,6 +30,8 @@ MODEL_FIELDS = frozenset(
     sidecar_num_point_tokens tactile_fusion_mode contact_num_tokens contact_hidden_dim
     contact_prediction_loss_weight freeze_pretrained_dit freeze_contact_teacher
     contact_injection_enabled contact_predictor_warmup
+    dit_training_mode dit_lora_rank dit_lora_alpha dit_lora_dropout temporal_window_size
+    contact_input_mode
     dit_type use_point_conditioning use_tactile_conditioning point_input_dim
     tactile_input_channels tactile_encoder_cfg tactile_pretrained_model
     tactile_checkpoint_filename tactile_background_path point_encoder_cfg
@@ -39,6 +41,7 @@ MODEL_FIELDS = frozenset(
     tune_multimodal_adapter use_lora lora_r lora_alpha lora_dropout lora_bias
     state_dropout_prob action_head_dropout_override vl_self_attention_dropout_override
     load_bf16 backbone_trainable_params_fp32 model_revision optimize_pretrained_loading
+    use_flash_attention
 """.split()
 )
 PREPROCESSING_FIELDS = frozenset(
@@ -274,6 +277,8 @@ def build_gr00t_config(cfg: DictConfig) -> Config:
             "training",
             "hardware",
             "resume",
+            "temporal",
+            "dit_training",
         },
         "experiment",
     )
@@ -285,7 +290,25 @@ def build_gr00t_config(cfg: DictConfig) -> Config:
         {k: raw[k] for k in ("name", "run_id", "output_dir", "dry_run") if k in raw},
         "experiment",
     )
-    base, model, expectations = _model_values(raw["model"])
+    model_input = dict(raw["model"])
+    if "temporal" in raw:
+        _keys(raw["temporal"], {"window_size"}, "temporal")
+        model_input["temporal_window_size"] = raw["temporal"]["window_size"]
+        OmegaConf.update(
+            cfg.model, "temporal_window_size", raw["temporal"]["window_size"], force_add=True
+        )
+    if "dit_training" in raw:
+        _keys(raw["dit_training"], {"mode", "rank", "alpha", "dropout"}, "dit_training")
+        for field, target in (
+            ("mode", "dit_training_mode"),
+            ("rank", "dit_lora_rank"),
+            ("alpha", "dit_lora_alpha"),
+            ("dropout", "dit_lora_dropout"),
+        ):
+            if field in raw["dit_training"]:
+                model_input[target] = raw["dit_training"][field]
+                OmegaConf.update(cfg.model, target, raw["dit_training"][field], force_add=True)
+    base, model, expectations = _model_values(model_input)
     data, preprocessing = _data_values(raw["data"])
     model.update(preprocessing)
     hardware = dict(raw["hardware"])
@@ -376,6 +399,25 @@ def validate_compatibility(config: Config, hardware: dict) -> None:
         raise ValueError("Each dataset mix_ratio must be positive")
     if m.point_encoder_grid_size <= 0:
         raise ValueError("model.point_encoder_grid_size must be positive")
+    if m.dit_type == "sidecar_conditioned_dit":
+        if m.dit_training_mode not in {"frozen", "lora", "full"}:
+            raise ValueError("dit_training.mode must be frozen, lora or full")
+        if m.freeze_pretrained_dit != (m.dit_training_mode != "full") or m.tune_diffusion_model != (
+            m.dit_training_mode == "full"
+        ):
+            raise ValueError("DiT trainability flags conflict with dit_training.mode")
+        if m.temporal_window_size not in {0, 5, 10}:
+            raise ValueError("temporal.window_size must be 5 or 10 when enabled")
+        if m.temporal_window_size and m.contact_input_mode != "none":
+            raise ValueError("Temporal and Contact MoE are separate architecture families")
+        if m.contact_input_mode != "none" and (
+            m.contact_input_mode != "moe_soft" or m.tactile_fusion_mode != "none"
+        ):
+            raise ValueError("Contact MoE requires moe_soft and no duplicate tactile injection")
+        if m.temporal_window_size and m.tactile_fusion_mode != "none":
+            raise ValueError(
+                "Temporal Fusion already includes tactile; disable legacy tactile injection"
+            )
     ids = [v.strip() for v in hardware["cuda_visible_devices"].split(",") if v.strip()]
     if t.num_gpus < 1 or len(ids) != t.num_gpus or len(set(ids)) != len(ids):
         raise ValueError(
@@ -463,9 +505,16 @@ def validate_compatibility(config: Config, hardware: dict) -> None:
                 raise ValueError(f"action state_key={a.state_key!r} is missing from state modality")
         if m.use_point_conditioning:
             point = modalities.get("pointcloud")
-            if point is None or point.modality_keys != ["scene"] or point.delta_indices != [0]:
+            expected_point = (
+                list(range(1 - m.temporal_window_size, 1)) if m.temporal_window_size else [0]
+            )
+            if (
+                point is None
+                or point.modality_keys != ["scene"]
+                or point.delta_indices != expected_point
+            ):
                 raise ValueError(
-                    "point conditioning requires pointcloud.scene with delta_indices=[0]"
+                    f"point conditioning requires pointcloud.scene delta_indices={expected_point}"
                 )
             if m.point_input_dim != 6:
                 raise ValueError(
@@ -488,13 +537,16 @@ def validate_compatibility(config: Config, hardware: dict) -> None:
             if m.tactile_encoder_cfg not in {"sparsh_dino_base", "resnet18"}:
                 raise ValueError(f"unsupported tactile encoder {m.tactile_encoder_cfg!r}")
             indices = tactile.delta_indices
-            if m.tactile_encoder_cfg == "sparsh_dino_base" and (
-                len(indices) != 2 or indices[0] >= 0 or indices[1] != 0
-            ):
-                raise ValueError(
-                    "Sparsh-DINO requires two chronological frames [previous,current]: [negative_offset,0]"
-                )
+            expected_tactile = (
+                list(range(-m.temporal_window_size, 1)) if m.temporal_window_size else [-1, 0]
+            )
+            if m.tactile_encoder_cfg == "sparsh_dino_base" and indices != expected_tactile:
+                raise ValueError(f"Sparsh-DINO requires chronological offsets {expected_tactile}")
             m.tactile_temporal_delta_indices = list(indices)
+        if m.temporal_window_size:
+            expected_state = list(range(1 - m.temporal_window_size, 1))
+            if modalities["state"].delta_indices != expected_state:
+                raise ValueError(f"Temporal state offsets must be {expected_state}")
 
 
 def preflight(cfg: DictConfig, config: Config) -> dict[str, Any]:

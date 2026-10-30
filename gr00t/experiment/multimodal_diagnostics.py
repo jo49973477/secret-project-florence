@@ -10,6 +10,8 @@ from pathlib import Path
 import torch
 from transformers.trainer_callback import TrainerCallback
 
+from gr00t.model.extension.dit_lora import original_dit_parameters
+
 
 def residual_ratio(hidden, update):
     """Detached FP32 norm of the actual injected residual, with no graph retention."""
@@ -211,11 +213,14 @@ class MultimodalDiagnostics(TrainerCallback):
                 for g in (stage.point_gate, stage.action_gate)
             ]
             + [module.scale for module in self.dit.contact_injections],
-            "dit": [
-                p
-                for n, p in self.dit.named_parameters()
-                if not n.startswith(("sidecar_", "contact_"))
-            ],
+            "dit": [p for _, p in original_dit_parameters(self.dit)],
+            "lora": [p for n, p in self.dit.named_parameters() if ".lora_" in n],
+            "temporal": list(head.temporal_fusion.parameters())
+            if getattr(head, "temporal_fusion", None) is not None
+            else [],
+            "moe": list(self.dit.input_contact_adapter.parameters())
+            if getattr(self.dit, "input_contact_adapter", None) is not None
+            else [],
         }
         groups.update(
             {

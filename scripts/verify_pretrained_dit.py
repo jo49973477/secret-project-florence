@@ -131,9 +131,14 @@ def main():
         choices=("multimodal_conditioned_dit", "sidecar_conditioned_dit"),
         default="multimodal_conditioned_dit",
     )
+    parser.add_argument("--dit-training-mode", choices=("frozen", "lora", "full"), default="frozen")
+    parser.add_argument("--lora-rank", type=int, default=16)
+    parser.add_argument("--lora-alpha", type=float, default=32)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--dtype", choices=("float32", "bfloat16", "float16"), default="float32")
-    parser.add_argument("--report", type=Path, default=Path("pretrained_dit_report.json"))
+    parser.add_argument(
+        "--report", type=Path, default=Path("outputs/preflight/dit_verification.json")
+    )
     parser.add_argument("--atol", type=float, default=0.0)
     parser.add_argument("--rtol", type=float, default=0.0)
     args = parser.parse_args()
@@ -183,6 +188,9 @@ def main():
             schema = AlternateVLDiT(**config)
         expected = [prefix + k for k in schema.state_dict()]
         report["expected_original_parameter_tensors"] = len(list(schema.named_parameters()))
+        report["original_parameter_count"] = sum(p.numel() for p in schema.parameters())
+        report["transformer_layers"] = len(schema.transformer_blocks)
+        report["checkpoint_revision"] = reference_checkpoint.name
         report["architecture"] = {"class": "MultiModalConditionedDiT", "configuration": config}
         report["skip_weight_loading"] = False
         runtime_model = None
@@ -226,7 +234,20 @@ def main():
                 "reason": "Encoders excluded from Action DiT audit.",
             }
         else:
-            candidate_dit = adapter_class(**config).to(dtype=dtype)
+            insert_after_loading = (
+                args.dit_type == "sidecar_conditioned_dit" and args.dit_training_mode == "lora"
+            )
+            options = (
+                dict(
+                    dit_training_mode="frozen" if insert_after_loading else args.dit_training_mode,
+                    dit_lora_rank=args.lora_rank,
+                    dit_lora_alpha=args.lora_alpha,
+                    freeze_pretrained_dit=args.dit_training_mode != "full",
+                )
+                if args.dit_type == "sidecar_conditioned_dit"
+                else {}
+            )
+            candidate_dit = adapter_class(**config, **options).to(dtype=dtype)
             candidate_state = candidate_dit.state_dict()
             shared, mismatched = {}, []
             source_keys = [k for k in reference if k.startswith(prefix)]
@@ -249,9 +270,50 @@ def main():
                 "unexpected_keys": [prefix + k for k in info.unexpected_keys],
                 "mismatched_keys": mismatched,
             }
-            report["loading_check"] = validate_loading_info(loading, adapter_prefixes)
+            allowed = adapter_prefixes + tuple(
+                prefix + name for name, _ in candidate_dit.named_parameters() if ".lora_" in name
+            )
+            report["loading_check"] = validate_loading_info(loading, allowed)
+            if insert_after_loading:
+                from gr00t.model.extension.dit_lora import insert_dit_lora, original_dit_parameters
+
+                before = {prefix + key: value for key, value in candidate_dit.state_dict().items()}
+                report["lora_pre_insertion"] = compare_shared_tensors(
+                    reference, before, expected_keys=expected, atol=args.atol, rtol=args.rtol
+                )
+                if report["lora_pre_insertion"]["status"] != "PASS":
+                    raise RuntimeError("Original pretrained DiT failed before LoRA insertion")
+                insert_dit_lora(candidate_dit, args.lora_rank, args.lora_alpha, 0.0)
+                candidate_dit.dit_training_mode = "lora"
+                report["lora_post_insertion"] = compare_shared_tensors(
+                    reference,
+                    {prefix + key: value for key, value in candidate_dit.state_dict().items()},
+                    expected_keys=expected,
+                    atol=args.atol,
+                    rtol=args.rtol,
+                )
+                base = list(original_dit_parameters(candidate_dit))
+                lora = [
+                    (name, p) for name, p in candidate_dit.named_parameters() if ".lora_" in name
+                ]
+                report["lora_base_frozen"] = bool(base) and all(
+                    not p.requires_grad for _, p in base
+                )
+                report["lora_trainable"] = bool(lora) and all(p.requires_grad for _, p in lora)
+                optimizer = torch.optim.AdamW(
+                    (p for p in candidate_dit.parameters() if p.requires_grad), lr=1e-4
+                )
+                owned = {id(p) for group in optimizer.param_groups for p in group["params"]}
+                report["lora_optimizer_inclusion"] = all(id(p) in owned for _, p in lora)
+                if (
+                    report["lora_post_insertion"]["status"] != "PASS"
+                    or not report["lora_base_frozen"]
+                    or not report["lora_trainable"]
+                    or not report["lora_optimizer_inclusion"]
+                ):
+                    raise RuntimeError("LoRA insertion changed base weights or optimizer ownership")
             report["loading_scope"] = (
-                "Action DiT only: same architecture and key validation as training; no VLM or sensor encoder allocation. Use --training-config to audit full pipeline."
+                "Action DiT only: strict original-key validation and optional post-load LoRA insertion; no VLM or sensor encoder allocation. Use --training-config to audit full pipeline."
             )
             report["sensor_loading"] = {
                 "status": "SKIP",
@@ -260,6 +322,29 @@ def main():
             candidate = {prefix + k: v for k, v in candidate_dit.state_dict().items()}
             del shared
         if candidate_dit is not None:
+            report["lora_parameter_count"] = sum(
+                p.numel() for name, p in candidate_dit.named_parameters() if ".lora_" in name
+            )
+            if args.dit_type == "sidecar_conditioned_dit":
+                from gr00t.model.extension.dit_lora import original_dit_parameters
+
+                base_parameters = list(original_dit_parameters(candidate_dit))
+                expected_trainable = args.dit_training_mode == "full"
+                report["base_trainability_matches_mode"] = bool(base_parameters) and all(
+                    p.requires_grad == expected_trainable for _, p in base_parameters
+                )
+                if not report["base_trainability_matches_mode"]:
+                    raise RuntimeError("Original DiT trainability differs from requested mode")
+                if expected_trainable:
+                    optimizer = torch.optim.AdamW(
+                        (p for p in candidate_dit.parameters() if p.requires_grad), lr=1e-5
+                    )
+                    owned = {id(p) for group in optimizer.param_groups for p in group["params"]}
+                    report["full_optimizer_inclusion"] = all(
+                        id(p) in owned for _, p in base_parameters
+                    )
+                    if not report["full_optimizer_inclusion"]:
+                        raise RuntimeError("Full DiT parameters missing from optimizer")
             report["architecture"] = {
                 "class": type(candidate_dit).__name__,
                 "configuration": dict(candidate_dit.config),
@@ -321,6 +406,22 @@ def main():
 
         traceback.print_exc()
     args.report.write_text(json.dumps(report, indent=2, allow_nan=False, default=str) + "\n")
+    weights = report.get("weight_check", {})
+    args.report.with_suffix(".txt").write_text(
+        "\n".join(
+            (
+                f"Status: {report['overall']}",
+                f"Checkpoint: {report['reference_checkpoint']}",
+                f"Original pretrained DiT parameters: {report.get('original_parameter_count', 'NOT VERIFIED')}",
+                f"Matched tensors: {weights.get('matched_tensors', 'NOT VERIFIED')}",
+                f"Missing tensors: {len(weights.get('missing', [])) if weights else 'NOT VERIFIED'}",
+                f"Mismatched tensors: {len(weights.get('mismatched', [])) if weights else 'NOT VERIFIED'}",
+                f"Maximum absolute difference: {weights.get('max_abs_error', 'NOT VERIFIED')}",
+                "Scope: actual pretrained checkpoint" if weights else "Scope: NOT VERIFIED",
+            )
+        )
+        + "\n"
+    )
     print("════════ Pretrained DiT Integrity Check ════════")
     print(f"Checkpoint: {report['reference_checkpoint']}")
     weights = report.get("weight_check", {})

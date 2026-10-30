@@ -45,6 +45,7 @@ class TrainingConfig:
     learning_rate: float = 1e-4
     vlm_learning_rate: float | None = None
     action_head_learning_rate: float | None = None
+    dit_learning_rate: float | None = None
     point_encoder_learning_rate: float | None = None
     tactile_encoder_learning_rate: float | None = None
     lr_scheduler_type: str = "cosine"
@@ -201,6 +202,14 @@ class TrainingConfig:
         )
 
     @property
+    def resolved_dit_learning_rate(self) -> float:
+        return (
+            self.resolved_action_head_learning_rate
+            if self.dit_learning_rate is None
+            else self.dit_learning_rate
+        )
+
+    @property
     def resolved_tactile_encoder_learning_rate(self) -> float:
         return (
             self.resolved_action_head_learning_rate
@@ -240,6 +249,8 @@ class TrainingConfig:
                 "resolved action_head_learning_rate must be positive, got "
                 f"{self.resolved_action_head_learning_rate}"
             )
+        if self.resolved_dit_learning_rate <= 0:
+            raise ValueError("resolved dit_learning_rate must be positive")
         if self.resolved_point_encoder_learning_rate <= 0:
             raise ValueError(
                 "resolved point_encoder_learning_rate must be positive, got "

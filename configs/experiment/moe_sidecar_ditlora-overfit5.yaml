@@ -1,0 +1,7 @@
+# @package _global_
+defaults:
+- moe_sidecar_ditfrozen-overfit5
+- _self_
+name: moe_sidecar_ditlora-overfit5
+dit_training:
+  mode: lora

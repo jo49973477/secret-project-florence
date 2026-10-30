@@ -6,7 +6,9 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from gr00t.model.extension.contact_input_moe import ContactInputAdapter
 from gr00t.model.extension.contact_surprise import ContactInjection, ContactSurprise
+from gr00t.model.extension.dit_lora import insert_dit_lora
 from gr00t.model.extension.multimodal_dit import MultiModalConditionedDiT
 from gr00t.model.extension.point_action_sidecar import PointActionStage, TokenPool, stage_indices
 from gr00t.model.modules.dit import (
@@ -31,6 +33,12 @@ class SidecarConditionedDiT(AlternateVLDiT):
         freeze_pretrained_dit=True,
         freeze_contact_teacher=True,
         contact_injection_enabled=True,
+        dit_training_mode="frozen",
+        dit_lora_rank=16,
+        dit_lora_alpha=32,
+        dit_lora_dropout=0.0,
+        contact_input_mode="none",
+        contact_state_dim=132,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -63,6 +71,24 @@ class SidecarConditionedDiT(AlternateVLDiT):
         self.contact_injection_enabled = contact_injection_enabled
         self.freeze_contact_teacher = freeze_contact_teacher
         self.freeze_pretrained_dit = freeze_pretrained_dit
+        self.dit_training_mode = dit_training_mode
+        if dit_training_mode not in {"frozen", "lora", "full"}:
+            raise ValueError(f"Invalid DiT training mode: {dit_training_mode}")
+        if dit_training_mode == "lora":
+            insert_dit_lora(self, dit_lora_rank, dit_lora_alpha, dit_lora_dropout)
+        self.input_contact_adapter = (
+            ContactInputAdapter(
+                self.inner_dim,
+                contact_state_dim,
+                mode=contact_input_mode,
+                contact_dim=contact_hidden_dim,
+                num_tokens=contact_num_tokens,
+                use_surprise=False,
+                diagnostics=True,
+            )
+            if contact_input_mode != "none"
+            else None
+        )
 
     _run_original_gr00t_block = MultiModalConditionedDiT._run_original_gr00t_block
 
@@ -72,8 +98,10 @@ class SidecarConditionedDiT(AlternateVLDiT):
             self.sidecar_stages,
             self.contact_adapter,
             self.contact_injections,
+            self.input_contact_adapter,
         ):
-            module.requires_grad_(trainable)
+            if module is not None:
+                module.requires_grad_(trainable)
         self.contact_adapter.projector.requires_grad_(trainable and not self.freeze_contact_teacher)
         if self.tactile_fusion_mode == "none":
             self.contact_adapter.requires_grad_(False)
@@ -90,8 +118,10 @@ class SidecarConditionedDiT(AlternateVLDiT):
             self.sidecar_stages,
             self.contact_adapter,
             self.contact_injections,
+            self.input_contact_adapter,
         ):
-            module.train(training)
+            if module is not None:
+                module.train(training)
 
     def forward(
         self,

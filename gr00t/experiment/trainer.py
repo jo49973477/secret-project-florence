@@ -223,6 +223,7 @@ class Gr00tTrainer(Trainer):
         self.multiprocessing_context = kwargs.pop("multiprocessing_context", "fork")
         self.vlm_learning_rate = kwargs.pop("vlm_learning_rate", None)
         self.action_head_learning_rate = kwargs.pop("action_head_learning_rate", None)
+        self.dit_learning_rate = kwargs.pop("dit_learning_rate", None)
         self.point_encoder_learning_rate = kwargs.pop("point_encoder_learning_rate", None)
         self.tactile_encoder_learning_rate = kwargs.pop("tactile_encoder_learning_rate", None)
         dashboard_enabled = kwargs.pop("enable_training_dashboard", None)
@@ -415,6 +416,18 @@ class Gr00tTrainer(Trainer):
                     "Tactile encoder backbone is frozen; no tactile-backbone LR group created"
                 )
         action_head_standard_parameter_ids -= tactile_backbone_parameter_ids
+        dit_parameter_ids: set[int] = set()
+        if self.dit_learning_rate is not None and hasattr(action_head, "model"):
+            dit = action_head.model
+            if hasattr(dit, "dit_training_mode"):
+                from gr00t.model.extension.dit_lora import original_dit_parameters
+
+                dit_parameter_ids = {
+                    id(parameter)
+                    for _, parameter in original_dit_parameters(dit)
+                    if parameter.requires_grad
+                }
+                action_head_standard_parameter_ids -= dit_parameter_ids
 
         duplicate_parameter_ids = vlm_parameter_ids & action_head_parameter_ids
         classified_parameter_ids = vlm_parameter_ids | action_head_parameter_ids
@@ -477,6 +490,8 @@ class Gr00tTrainer(Trainer):
                 False,
                 self.action_head_learning_rate,
             ),
+            ("Pretrained DiT decay", dit_parameter_ids, True, self.dit_learning_rate),
+            ("Pretrained DiT no_decay", dit_parameter_ids, False, self.dit_learning_rate),
             (
                 "Point Encoder Backbone decay",
                 point_backbone_parameter_ids,
@@ -619,6 +634,35 @@ class Gr00tTrainer(Trainer):
             loss_ratios(logs)
             self._forward_diagnostics = {}
             self._forward_diagnostics_count = 0
+        for source, target in (
+            ("loss/action", "train/action_loss"),
+            ("loss/total", "train/total_loss"),
+            ("loss/zero_prediction_mse", "train/zero_prediction_mse"),
+            ("loss/action_to_zero_ratio", "train/action_to_zero_ratio"),
+            ("grad_norm/dit", "train/grad_norm_dit"),
+            ("grad_norm/lora", "train/grad_norm_lora"),
+            ("grad_norm/sidecar", "train/grad_norm_sidecar"),
+            ("grad_norm/temporal", "train/grad_norm_temporal"),
+            ("grad_norm/moe", "train/grad_norm_moe"),
+        ):
+            if source in logs and logs[source] is not None:
+                logs[target] = logs[source]
+        if logs.get("grad_norm") is not None:
+            logs["train/grad_norm_global"] = logs["grad_norm"]
+        import time
+
+        now = time.monotonic()
+        last_time = getattr(self, "_last_system_log_time", None)
+        last_step = getattr(self, "_last_system_log_step", None)
+        if last_time is not None and last_step is not None and self.state.global_step > last_step:
+            seconds = now - last_time
+            if seconds > 0:
+                logs["system/step_time"] = seconds / (self.state.global_step - last_step)
+                logs["system/steps_per_second"] = (self.state.global_step - last_step) / seconds
+        self._last_system_log_time = now
+        self._last_system_log_step = self.state.global_step
+        if torch.cuda.is_available():
+            logs["system/gpu_memory_allocated"] = torch.cuda.memory_allocated() / (1024**3)
         if logs.get("grad_norm") is not None:
             import math
 

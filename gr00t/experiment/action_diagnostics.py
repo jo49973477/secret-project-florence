@@ -40,6 +40,6 @@ def loss_ratios(values):
     zero, total = values.get("loss/zero_prediction_mse"), values.get("loss/total")
     if zero is not None and zero > 0:
         values["loss/action_to_zero_ratio"] = values["loss/action"] / zero
-    if total is not None and total != 0:
+    if total is not None and total != 0 and "loss/contact_weighted" in values:
         values["loss/contact_fraction"] = values["loss/contact_weighted"] / total
     return values

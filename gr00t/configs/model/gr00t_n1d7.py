@@ -115,6 +115,12 @@ class Gr00tN1d7Config(PretrainedConfig):
     freeze_contact_teacher: bool = True
     contact_injection_enabled: bool = True
     contact_predictor_warmup: bool = False
+    dit_training_mode: str = "frozen"
+    dit_lora_rank: int = 16
+    dit_lora_alpha: float = 32.0
+    dit_lora_dropout: float = 0.0
+    temporal_window_size: int = 0
+    contact_input_mode: str = "none"
     use_point_conditioning: bool = True
     use_tactile_conditioning: bool = True
     point_input_dim: int = 3

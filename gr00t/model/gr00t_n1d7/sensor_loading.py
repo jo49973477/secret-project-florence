@@ -17,7 +17,13 @@ MULTIMODAL_ADAPTER_PREFIXES = (
 
 SIDECAR_ADAPTER_PREFIXES = tuple(
     "action_head.model." + name + "."
-    for name in ("sidecar_pool", "sidecar_stages", "contact_adapter", "contact_injections")
+    for name in (
+        "sidecar_pool",
+        "sidecar_stages",
+        "contact_adapter",
+        "contact_injections",
+        "input_contact_adapter",
+    )
 )
 
 

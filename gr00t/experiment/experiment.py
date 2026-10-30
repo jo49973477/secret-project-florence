@@ -367,6 +367,26 @@ def run(config: Config):
                     config_dict["hydra_resolved"] = OmegaConf.to_container(
                         OmegaConf.load(hydra_path), resolve=True
                     )
+                florence_preflight = os.environ.get("GR00T_FLORENCE_PREFLIGHT")
+                if florence_preflight:
+                    report = json.loads(Path(florence_preflight).read_text())
+                    config_dict["experiment_architecture"] = (
+                        "temporal_sidecar" if config.model.temporal_window_size else "moe_sidecar"
+                    )
+                    config_dict["dit_training_mode"] = config.model.dit_training_mode
+                    config_dict["temporal_window_size"] = config.model.temporal_window_size
+                    config_dict["dit_lora_rank"] = config.model.dit_lora_rank
+                    config_dict["dit_lora_alpha"] = config.model.dit_lora_alpha
+                    config_dict["pretrained_dit_verified"] = False
+                    config_dict["pretrained_dit_action_audit_passed"] = (
+                        report.get("checks", {}).get("actual_pretrained_dit") == "PASSED"
+                    )
+                    config_dict["pretrained_model_checkpoint_revision"] = report.get(
+                        "actual_pretrained_checkpoint", {}
+                    ).get("revision")
+                    config_dict["dit_lora_parameter_count"] = report.get(
+                        "actual_pretrained_checkpoint", {}
+                    ).get("lora_parameter_count")
 
                 wandb.init(
                     project=config.training.wandb_project,
@@ -384,6 +404,51 @@ def run(config: Config):
     pipeline = MODEL_REGISTRY.get(type(config.model))(config, save_cfg_dir)
     pipeline.setup()
     model = pipeline.return_model()
+    if os.environ.get("GR00T_FLORENCE_PREFLIGHT"):
+        from gr00t.model.gr00t_n1d7.dit_integrity import compare_shared_tensors
+
+        with run_or_wait_on_rank0(label="runtime pretrained DiT verification") as is_rank0:
+            if is_rank0:
+                from scripts.verify_pretrained_dit import CheckpointTensors
+
+                parent_report = json.loads(Path(os.environ["GR00T_FLORENCE_PREFLIGHT"]).read_text())
+                checkpoint = parent_report["actual_pretrained_checkpoint"]["checkpoint"]
+                dit = model.action_head.model
+                if any(hasattr(parameter, "ds_id") for parameter in dit.parameters()):
+                    raise RuntimeError(
+                        "Runtime DiT tensors are already ZeRO partitioned; cannot prove every value without a coordinated per-layer gather"
+                    )
+                prefix = "action_head.model."
+                candidate = {prefix + name: tensor for name, tensor in dit.state_dict().items()}
+                original_names = [
+                    row["name"]
+                    for row in parent_report["actual_pretrained_checkpoint"]["weights"]["tensors"]
+                ]
+                runtime = compare_shared_tensors(
+                    CheckpointTensors(checkpoint), candidate, expected_keys=original_names
+                )
+                preflight_dir = output_dir / "preflight"
+                preflight_dir.mkdir(parents=True, exist_ok=True)
+                (preflight_dir / "runtime_dit_verification.json").write_text(
+                    json.dumps(runtime, indent=2) + "\n"
+                )
+                if runtime["status"] != "PASS":
+                    raise RuntimeError(
+                        "Actual training model DiT differs from pretrained checkpoint"
+                    )
+                metadata_path = output_dir / "metadata.json"
+                metadata = json.loads(metadata_path.read_text())
+                metadata["pretrained_dit_verified"] = True
+                metadata["runtime_dit_matched_tensors"] = runtime["matched_tensors"]
+                metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
+                if wandb.run is not None:
+                    wandb.config.update(
+                        {
+                            "pretrained_dit_verified": True,
+                            "runtime_dit_matched_tensors": runtime["matched_tensors"],
+                        },
+                        allow_val_change=True,
+                    )
     log_memory_snapshot("after_model_loading")
     log_trainable_parameter_summary(model)
     train_dataset, eval_dataset = pipeline.return_dataset()
@@ -476,6 +541,7 @@ def run(config: Config):
         multiprocessing_context=config.data.multiprocessing_context,
         vlm_learning_rate=resolved_vlm_lr,
         action_head_learning_rate=resolved_action_head_lr,
+        dit_learning_rate=config.training.resolved_dit_learning_rate,
         point_encoder_learning_rate=resolved_point_encoder_lr,
         tactile_encoder_learning_rate=resolved_tactile_encoder_lr,
         enable_training_dashboard=config.training.enable_training_dashboard,
@@ -484,6 +550,52 @@ def run(config: Config):
         multimodal_diagnostics_interval=config.training.multimodal_diagnostics_interval,
         multimodal_diagnostics_level=config.training.multimodal_diagnostics_level,
     )
+    if os.environ.get("GR00T_FLORENCE_PREFLIGHT"):
+        groups = trainer._create_split_optimizer_groups(model)
+        action_head = model.action_head
+        dit = action_head.model
+        from gr00t.model.extension.dit_lora import original_dit_parameters
+
+        base = list(original_dit_parameters(dit))
+        lora = [(name, p) for name, p in dit.named_parameters() if ".lora_" in name]
+        mode = config.model.dit_training_mode
+        if any(p.requires_grad != (mode == "full") for _, p in base):
+            raise RuntimeError("Original DiT requires_grad disagrees with training mode")
+        if any(p.requires_grad != (mode == "lora") for _, p in lora):
+            raise RuntimeError("DiT LoRA requires_grad disagrees with training mode")
+        if mode == "lora" and not lora:
+            raise RuntimeError("LoRA mode has no trainable DiT adapters")
+        owned = {id(p) for group in groups for p in group["params"]}
+        if any(
+            id(p) not in owned
+            for _, p in (lora if mode == "lora" else base if mode == "full" else [])
+        ):
+            raise RuntimeError("Intended DiT parameters missing from optimizer groups")
+        if global_rank == 0:
+            counts = {
+                "mode": mode,
+                "original_dit_parameters": sum(p.numel() for _, p in base),
+                "lora_parameters": sum(p.numel() for _, p in lora),
+                "trainable_parameters": sum(
+                    p.numel() for p in model.parameters() if p.requires_grad
+                ),
+                "frozen_parameters": sum(
+                    p.numel() for p in model.parameters() if not p.requires_grad
+                ),
+                "optimizer_groups": [
+                    {
+                        "name": g["name"],
+                        "learning_rate": g["lr"],
+                        "parameters": sum(p.numel() for p in g["params"]),
+                    }
+                    for g in groups
+                ],
+            }
+            (output_dir / "preflight" / "parameter_ownership.json").write_text(
+                json.dumps(counts, indent=2) + "\n"
+            )
+            if wandb.run is not None:
+                wandb.config.update(counts, allow_val_change=True)
     from gr00t.experiment.optimizer_artifacts import EffectiveOptimizerCallback
 
     trainer.add_callback(EffectiveOptimizerCallback(trainer))

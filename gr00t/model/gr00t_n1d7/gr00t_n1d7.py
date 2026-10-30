@@ -127,6 +127,12 @@ class Gr00tN1d7ActionHead(nn.Module):
                 freeze_pretrained_dit=config.freeze_pretrained_dit,
                 freeze_contact_teacher=config.freeze_contact_teacher,
                 contact_injection_enabled=config.contact_injection_enabled,
+                dit_training_mode=config.dit_training_mode,
+                dit_lora_rank=config.dit_lora_rank,
+                dit_lora_alpha=config.dit_lora_alpha,
+                dit_lora_dropout=config.dit_lora_dropout,
+                contact_input_mode=config.contact_input_mode,
+                contact_state_dim=config.max_state_dim,
             )
         elif config.dit_type == "multimodal_conditioned_dit":
             self.model = MultiModalConditionedDiT(
@@ -211,6 +217,18 @@ class Gr00tN1d7ActionHead(nn.Module):
                 # Persisting this flag prevents an unnecessary Hub download on reload.
                 if isinstance(self.tactile_encoder, SparshDinoTactileEncoder):
                     config.tactile_pretrained_load_on_init = False
+
+        self.temporal_fusion = None
+        self._temporal_ring = None
+        if config.temporal_window_size:
+            if not isinstance(self.model, SidecarConditionedDiT):
+                raise ValueError("Temporal Fusion requires SidecarConditionedDiT")
+            from gr00t.model.extension.temporal_fusion import LatentRingBuffer, TemporalFusion
+
+            self.temporal_fusion = TemporalFusion(
+                self.model.inner_dim, config.max_state_dim, config.temporal_window_size
+            )
+            self._temporal_ring = LatentRingBuffer(config.temporal_window_size)
 
         self.vlln = (
             nn.LayerNorm(config.backbone_embedding_dim) if config.use_vlln else nn.Identity()
@@ -343,6 +361,12 @@ class Gr00tN1d7ActionHead(nn.Module):
         self.tune_point_encoder = tune_point_encoder
         self.tune_tactile_encoder = tune_tactile_encoder
         self.tune_multimodal_adapter = tune_multimodal_adapter
+        if isinstance(self.model, SidecarConditionedDiT):
+            mode = self.config.dit_training_mode
+            if self.config.freeze_pretrained_dit != (mode != "full"):
+                raise ValueError("freeze_pretrained_dit conflicts with dit_training_mode")
+            if tune_diffusion_model != (mode == "full"):
+                raise ValueError("tune_diffusion_model conflicts with dit_training_mode")
         for p in self.parameters():
             p.requires_grad = True
         if not tune_projector:
@@ -358,6 +382,16 @@ class Gr00tN1d7ActionHead(nn.Module):
         if isinstance(self.model, (MultiModalConditionedDiT, SidecarConditionedDiT)):
             # The base DiT can remain frozen while the new residual adapters train.
             self.model.set_multimodal_adapter_trainable(tune_multimodal_adapter)
+        if isinstance(self.model, SidecarConditionedDiT):
+            from gr00t.model.extension.dit_lora import original_dit_parameters
+
+            for _, parameter in original_dit_parameters(self.model):
+                parameter.requires_grad_(self.config.dit_training_mode == "full")
+            for name, parameter in self.model.named_parameters():
+                if ".lora_" in name:
+                    parameter.requires_grad_(self.config.dit_training_mode == "lora")
+        if self.temporal_fusion is not None:
+            self.temporal_fusion.requires_grad_(tune_multimodal_adapter)
         if self.point_encoder is not None:
             if isinstance(self.point_encoder, ConcertoPointEncoder):
                 self.point_encoder.set_trainable(
@@ -436,6 +470,8 @@ class Gr00tN1d7ActionHead(nn.Module):
         need to call model.eval() for the frozen modules.
         """
         if self.training:
+            if self._temporal_ring is not None:
+                self._temporal_ring.reset()
             if not self.tune_projector:
                 self.state_encoder.eval()
                 self.action_encoder.eval()
@@ -495,6 +531,111 @@ class Gr00tN1d7ActionHead(nn.Module):
         self, action_input: BatchFeature
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         """Encode static sensor observations once per action-head invocation."""
+        if self.temporal_fusion is not None:
+            if (
+                "points" not in action_input
+                or "tactile" not in action_input
+                or "temporal_state" not in action_input
+            ):
+                raise KeyError(
+                    "Temporal Fusion requires synchronized point, tactile and state history"
+                )
+            points = action_input.points
+            tactile = action_input.tactile
+            state = action_input.temporal_state
+            window = self.config.temporal_window_size
+            if (
+                points.ndim != 4
+                or points.shape[1] != window
+                or tactile.ndim != 5
+                or tactile.shape[1] != window + 1
+            ):
+                raise ValueError("Temporal observations have wrong history length")
+            valid = action_input.get("temporal_valid")
+            if valid is None:
+                raise ValueError("Temporal validity mask is required")
+            valid = valid.bool()
+            environment_ids = action_input.get("temporal_environment_ids")
+            use_ring = environment_ids is not None and not torch.is_grad_enabled()
+            if use_ring:
+                if len(environment_ids) != points.shape[0] or len(set(environment_ids)) != len(
+                    environment_ids
+                ):
+                    raise ValueError("Temporal environment IDs must be unique within the batch")
+                resets = action_input.get("temporal_reset")
+                if resets is None:
+                    resets = [False] * len(environment_ids)
+                for environment_id, reset in zip(environment_ids, resets):
+                    if reset:
+                        self._temporal_ring.reset(environment_id)
+                need_seed = any(not self._temporal_ring.has(eid) for eid in environment_ids)
+                indices = range(window) if need_seed else (window - 1,)
+            else:
+                indices = range(window)
+            point_frames, point_masks, tactile_frames = [], [], []
+            for index in indices:
+                encoded, mask = self.point_encoder(points[:, index], return_mask=True)
+                point_frames.append(encoded)
+                point_masks.append(mask)
+                tactile_frames.append(self.tactile_encoder(tactile[:, index : index + 2]))
+            if use_ring:
+                packed_frames = []
+                for local_index, index in enumerate(indices):
+                    point_mask = point_masks[local_index].to(point_frames[local_index].dtype)
+                    pooled_point = (point_frames[local_index] * point_mask[..., None]).sum(
+                        1
+                    ) / point_mask.sum(1).clamp_min(1)[:, None]
+                    pooled_tactile = tactile_frames[local_index].mean(1)
+                    projected_state = self.temporal_fusion.state_projection(
+                        state[:, index].to(self.temporal_fusion.state_projection.weight.dtype)
+                    )
+                    packed_frames.append(
+                        torch.stack((pooled_point, pooled_tactile, projected_state), 1)
+                    )
+                for batch_index, environment_id in enumerate(environment_ids):
+                    if not self._temporal_ring.has(environment_id):
+                        for local_index, index in enumerate(indices):
+                            if valid[batch_index, index]:
+                                self._temporal_ring.push(
+                                    environment_id, packed_frames[local_index][batch_index]
+                                )
+                    else:
+                        self._temporal_ring.push(environment_id, packed_frames[-1][batch_index])
+                windows = [
+                    self._temporal_ring.window(eid, packed_frames[-1][i])
+                    for i, eid in enumerate(environment_ids)
+                ]
+                packed = torch.stack([item[0] for item in windows])
+                fused_mask = torch.stack([item[1] for item in windows])
+                fused, fused_mask = self.temporal_fusion.forward_pooled(
+                    packed[:, :, 0], packed[:, :, 1], packed[:, :, 2], fused_mask
+                )
+                self._temporal_feature_diagnostics = {
+                    "features/point_norm": packed[:, :, 0].detach().float().norm(dim=-1).mean(),
+                    "features/tactile_norm": packed[:, :, 1].detach().float().norm(dim=-1).mean(),
+                    "features/fused_norm": fused.detach().float().norm(dim=-1).mean(),
+                    "temporal/valid_frame_ratio": fused_mask.detach().float().mean(),
+                }
+            else:
+                point_history = torch.stack(point_frames, 1)
+                point_mask_history = torch.stack(point_masks, 1)
+                tactile_history = torch.stack(tactile_frames, 1)
+                fused, fused_mask = self.temporal_fusion(
+                    point_history, tactile_history, state, valid, point_mask_history
+                )
+                self._temporal_feature_diagnostics = {
+                    "features/point_norm": point_history.detach().float().norm(dim=-1).mean(),
+                    "features/tactile_norm": tactile_history.detach().float().norm(dim=-1).mean(),
+                    "features/fused_norm": fused.detach().float().norm(dim=-1).mean(),
+                    "temporal/valid_frame_ratio": valid.detach().float().mean(),
+                }
+            current_points = point_frames[-1]
+            current_mask = point_masks[-1]
+            return (
+                torch.cat((current_points, fused.to(current_points.dtype)), 1),
+                torch.cat((current_mask, fused_mask), 1),
+                None,
+            )
         point_tokens = None
         point_attention_mask = None
         if self.point_encoder is not None:
@@ -509,6 +650,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         if self.tactile_encoder is not None and not (
             isinstance(self.model, SidecarConditionedDiT)
             and self.config.tactile_fusion_mode == "none"
+            and self.config.contact_input_mode == "none"
         ):
             if "tactile" not in action_input:
                 raise KeyError(
@@ -564,6 +706,16 @@ class Gr00tN1d7ActionHead(nn.Module):
         # Embed state.
         state_features = self.state_encoder(action_input.state, embodiment_id)
         contact_state_features = state_features
+        prepared_multimodal = None
+        contact_representation = None
+        if (
+            isinstance(self.model, SidecarConditionedDiT)
+            and self.model.input_contact_adapter is not None
+        ):
+            prepared_multimodal = self._encode_multimodal_inputs(action_input)
+            contact_representation = self.model.input_contact_adapter.prepare_contact(
+                prepared_multimodal[2], action_input.state
+            )
 
         # Dropout state features (training only): zero out dropped states.
         if self.training and self.state_dropout_prob > 0:
@@ -597,6 +749,10 @@ class Gr00tN1d7ActionHead(nn.Module):
             pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
             pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
             action_features = action_features + pos_embs
+        if contact_representation is not None:
+            action_features = self.model.input_contact_adapter(
+                action_features, contact_representation, action_input.state, action_token_mask
+            )
         action_features = action_features * action_token_mask.unsqueeze(-1).to(
             dtype=action_features.dtype
         )
@@ -626,8 +782,10 @@ class Gr00tN1d7ActionHead(nn.Module):
                 hidden_attention_mask=hidden_attention_mask,
             )
         elif self.config.dit_type in {"multimodal_conditioned_dit", "sidecar_conditioned_dit"}:
-            point_tokens, point_attention_mask, tactile_tokens = self._encode_multimodal_inputs(
-                action_input
+            point_tokens, point_attention_mask, tactile_tokens = (
+                prepared_multimodal
+                if prepared_multimodal is not None
+                else self._encode_multimodal_inputs(action_input)
             )
 
             model_output, _ = self.model(
@@ -693,6 +851,30 @@ class Gr00tN1d7ActionHead(nn.Module):
             self.config.contact_prediction_loss_weight if is_sidecar else 0.0,
             is_sidecar and self.config.contact_predictor_warmup,
         )
+        if is_sidecar and self.config.contact_prediction_loss_weight == 0:
+            diagnostics.pop("loss/contact_raw", None)
+            diagnostics.pop("loss/contact_weighted", None)
+        if self.temporal_fusion is not None:
+            diagnostics.update(self._temporal_feature_diagnostics)
+        elif (
+            isinstance(self.model, SidecarConditionedDiT)
+            and self.model.input_contact_adapter is not None
+        ):
+            diagnostics["features/point_norm"] = point_tokens.detach().float().norm(dim=-1).mean()
+            diagnostics["features/tactile_norm"] = (
+                tactile_tokens.detach().float().norm(dim=-1).mean()
+            )
+            diagnostics["features/fused_norm"] = (
+                action_features.detach().float().norm(dim=-1).mean()
+            )
+            metrics = self.model.input_contact_adapter.last_diagnostics
+            for source, target in (
+                ("contact_router_noop_probability", "moe/noop_probability"),
+                ("contact_router_direct_probability", "moe/direct_probability"),
+                ("contact_router_entropy", "moe/router_entropy"),
+            ):
+                if source in metrics:
+                    diagnostics[target] = metrics[source]
         if not self._dtype_diagnostics_logged and os.environ.get(
             "GR00T_DTYPE_DEBUG", ""
         ).lower() in {"1", "true", "yes"}:
@@ -853,6 +1035,14 @@ class Gr00tN1d7ActionHead(nn.Module):
             point_tokens, point_attention_mask, tactile_tokens = self._encode_multimodal_inputs(
                 action_input
             )
+        contact_representation = None
+        if (
+            isinstance(self.model, SidecarConditionedDiT)
+            and self.model.input_contact_adapter is not None
+        ):
+            contact_representation = self.model.input_contact_adapter.prepare_contact(
+                tactile_tokens, action_input.state
+            )
 
         # Run denoising steps.
         for t in range(self.num_inference_timesteps):
@@ -871,6 +1061,10 @@ class Gr00tN1d7ActionHead(nn.Module):
                 pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
                 pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
                 action_features = action_features + pos_embs
+            if contact_representation is not None:
+                action_features = self.model.input_contact_adapter(
+                    action_features, contact_representation, action_input.state, action_token_mask
+                )
             if action_token_mask is not None:
                 action_features = action_features * action_token_mask.unsqueeze(-1).to(
                     dtype=action_features.dtype

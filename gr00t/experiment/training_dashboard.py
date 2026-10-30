@@ -45,7 +45,10 @@ class TrainingDashboardCallback(TrainerCallback):
             f"grad_norm/{name}": name.replace("_", " ").title()
             for name in (
                 "dit",
+                "lora",
                 "sidecar",
+                "temporal",
+                "moe",
                 "point_encoder",
                 "tactile_encoder",
                 "contact_teacher",
@@ -67,6 +70,8 @@ class TrainingDashboardCallback(TrainerCallback):
         "clip_limit": "Gradient Clip",
         "precision": "Precision",
         "distributed": "Distributed",
+        "system/gpu_memory_allocated": "GPU GiB",
+        "system/steps_per_second": "Steps/s",
     }
     DIAGNOSTICS = {
         "contact/observed_variance": "Teacher Variance",
@@ -362,15 +367,29 @@ class TrainingDashboardCallback(TrainerCallback):
         if self._live is not None:
             self._refresh()
         else:
-            # Trainer already decides logging cadence. Keep eval/final/diagnostic
-            # events even when several occur at the same global step.
-            clean = " ".join(
-                f"{k}={self._format(v)}"
-                for k, v in logs.items()
-                if (isinstance(v, (float, int)) or v is None) and k != "total_flos"
+            elapsed = max(time.monotonic() - self._started, 0.001)
+            completed = max(state.global_step - self._initial_step, 0)
+            remaining = max(int(state.max_steps) - state.global_step, 0)
+            eta = elapsed * remaining / completed if completed else None
+            fields = (
+                ("action", "loss/action"),
+                ("total", "loss/total"),
+                ("lr", "learning_rate"),
+                ("grad", "grad_norm/pre_clip"),
+                ("gpu_gib", "system/gpu_memory_allocated"),
+                ("steps/s", "system/steps_per_second"),
             )
-            if clean:
-                print(f"Step {state.global_step}: {clean}", flush=True)
+            summary = " ".join(
+                f"{label}={self._format(logs[key])}"
+                for label, key in fields
+                if key in logs and logs[key] is not None
+            )
+            if summary:
+                eta_text = f"{eta:.0f}s" if eta is not None else "?"
+                print(
+                    f"Step {state.global_step}/{state.max_steps} ETA {eta_text} {summary}",
+                    flush=True,
+                )
         return control
 
     def on_prediction_step(self, args, state, control, eval_dataloader=None, **kwargs):

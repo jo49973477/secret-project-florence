@@ -328,6 +328,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                             self.config.model.backbone_trainable_params_fp32
                         ),
                         load_bf16=self.config.model.load_bf16,
+                        use_flash_attention=self.config.model.use_flash_attention,
                         transformers_loading_kwargs=self.transformers_loading_kwargs,
                         dit_type=self.config.model.dit_type,
                         sidecar_num_stages=self.config.model.sidecar_num_stages,
@@ -343,6 +344,12 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                         freeze_contact_teacher=self.config.model.freeze_contact_teacher,
                         contact_injection_enabled=self.config.model.contact_injection_enabled,
                         contact_predictor_warmup=self.config.model.contact_predictor_warmup,
+                        dit_training_mode=self.config.model.dit_training_mode,
+                        dit_lora_rank=self.config.model.dit_lora_rank,
+                        dit_lora_alpha=self.config.model.dit_lora_alpha,
+                        dit_lora_dropout=self.config.model.dit_lora_dropout,
+                        temporal_window_size=self.config.model.temporal_window_size,
+                        contact_input_mode=self.config.model.contact_input_mode,
                         use_point_conditioning=self.config.model.use_point_conditioning,
                         use_tactile_conditioning=self.config.model.use_tactile_conditioning,
                         point_input_dim=self.config.model.point_input_dim,
@@ -409,6 +416,15 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                     if requested_dit_type == "sidecar_conditioned_dit"
                     else MULTIMODAL_ADAPTER_PREFIXES
                 )
+            if requested_dit_type == "sidecar_conditioned_dit":
+                if self.config.model.temporal_window_size:
+                    newly_enabled_prefixes += ("action_head.temporal_fusion.",)
+                if self.config.model.dit_training_mode == "lora":
+                    newly_enabled_prefixes += tuple(
+                        name
+                        for name, _ in model.named_parameters()
+                        if name.startswith("action_head.model.") and ".lora_" in name
+                    )
             if point_deferred:
                 newly_enabled_prefixes += ("action_head.point_encoder.",)
             if tactile_deferred:

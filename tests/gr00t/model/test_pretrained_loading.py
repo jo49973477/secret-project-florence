@@ -251,7 +251,13 @@ def test_memory_comparison(checkpoint):
     for mode in ("legacy", "optimized"):
         output = subprocess.check_output(
             [sys.executable, __file__, str(checkpoint), mode],
-            env={**os.environ, "GROOT_DEBUG_MODEL_LOAD_MEMORY": "1"},
+            env={
+                **os.environ,
+                "GROOT_DEBUG_MODEL_LOAD_MEMORY": "1",
+                "PYTHONPATH": str(Path(__file__).resolve().parents[3])
+                + os.pathsep
+                + os.environ.get("PYTHONPATH", ""),
+            },
             timeout=60,
             text=True,
         )

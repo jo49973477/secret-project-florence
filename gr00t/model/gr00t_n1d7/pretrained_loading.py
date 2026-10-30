@@ -99,11 +99,19 @@ def initialize_missing_sidecar(model, missing_keys):
     import torch
     from transformers.integrations import is_deepspeed_zero3_enabled
 
+    from gr00t.model.extension.contact_input_moe import ContactInputAdapter
     from gr00t.model.extension.contact_surprise import ContactInjection, ContactSurprise
     from gr00t.model.extension.point_action_sidecar import PointActionStage, TokenPool
+    from gr00t.model.extension.temporal_fusion import TemporalFusion
     from gr00t.model.gr00t_n1d7.sensor_loading import SIDECAR_ADAPTER_PREFIXES
 
-    keys = {key for key in missing_keys if key.startswith(SIDECAR_ADAPTER_PREFIXES)}
+    keys = {
+        key
+        for key in missing_keys
+        if key.startswith(SIDECAR_ADAPTER_PREFIXES)
+        or key.startswith("action_head.temporal_fusion.")
+        or (key.startswith("action_head.model.") and ".lora_" in key)
+    }
     if not keys:
         return
     cfg = model.config
@@ -130,14 +138,30 @@ def initialize_missing_sidecar(model, missing_keys):
             ContactInjection(dit.inner_dim, cfg.contact_hidden_dim, cfg.sidecar_num_heads)
             for _ in dit.contact_injections
         ),
+        "input_contact_adapter": lambda: ContactInputAdapter(
+            dit.inner_dim,
+            cfg.max_state_dim,
+            mode=cfg.contact_input_mode,
+            contact_dim=cfg.contact_hidden_dim,
+            num_tokens=cfg.contact_num_tokens,
+            use_surprise=False,
+            diagnostics=True,
+        ),
+        "temporal_fusion": lambda: TemporalFusion(
+            dit.inner_dim, cfg.max_state_dim, cfg.temporal_window_size
+        ),
     }
     for name, factory in factories.items():
-        prefix = f"action_head.model.{name}."
+        prefix = (
+            ("action_head." if name == "temporal_fusion" else "action_head.model.") + name + "."
+        )
         selected = {key.removeprefix(prefix) for key in keys if key.startswith(prefix)}
         if not selected:
             continue
         fresh = factory().state_dict()
-        target = getattr(dit, name).state_dict(keep_vars=True)
+        target = getattr(model.action_head if name == "temporal_fusion" else dit, name).state_dict(
+            keep_vars=True
+        )
         for key in sorted(selected):
             parameter = target[key]
             context = nullcontext()
@@ -147,6 +171,24 @@ def initialize_missing_sidecar(model, missing_keys):
                 context = deepspeed.zero.GatheredParameters([parameter], modifier_rank=0)
             with context, torch.no_grad():
                 parameter.copy_(fresh[key].to(device=parameter.device, dtype=parameter.dtype))
+
+    import math
+
+    for name, parameter in model.named_parameters():
+        if name not in missing_keys or not name.startswith("action_head.model."):
+            continue
+        if ".lora_A.weight" not in name and ".lora_B.weight" not in name:
+            continue
+        context = nullcontext()
+        if is_deepspeed_zero3_enabled():
+            import deepspeed
+
+            context = deepspeed.zero.GatheredParameters([parameter], modifier_rank=0)
+        with context, torch.no_grad():
+            if ".lora_A.weight" in name:
+                torch.nn.init.kaiming_uniform_(parameter, a=math.sqrt(5))
+            else:
+                torch.nn.init.zeros_(parameter)
 
 
 def prepare_bf16_checkpoint_parameters(model, shapes):

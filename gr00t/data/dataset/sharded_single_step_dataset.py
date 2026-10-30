@@ -92,6 +92,14 @@ def extract_step_data(
         actions=action_data,
         text=text,
         embodiment=embodiment_tag,
+        metadata={
+            "temporal_valid": [
+                0 <= step_index + offset < len(episode_data)
+                for offset in modality_configs["pointcloud"].delta_indices
+            ]
+        }
+        if "pointcloud" in modality_configs
+        else {},
     )
     return vla_step_data
 

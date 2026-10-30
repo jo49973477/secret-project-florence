@@ -143,7 +143,9 @@ def resolve_resume(cfg: DictConfig, config) -> Path | None:
     return checkpoint
 
 
-def write_snapshots(cfg: DictConfig, config, checkpoint: Path | None = None) -> Path:
+def write_snapshots(
+    cfg: DictConfig, config, checkpoint: Path | None = None, florence_audit: Path | None = None
+) -> Path:
     output = Path(cfg.output_dir).resolve()
     output.mkdir(parents=True, exist_ok=True)
     (output / "logs").mkdir(exist_ok=True)
@@ -186,6 +188,30 @@ def write_snapshots(cfg: DictConfig, config, checkpoint: Path | None = None) -> 
         "resume_source": str(checkpoint) if checkpoint else None,
         **preflight(cfg, config),
     }
+    if cfg.name in {
+        "temporal_sidecar_ditfrozen-overfit5",
+        "temporal_sidecar_ditlora-overfit5",
+        "temporal_sidecar_ditfull-overfit5",
+        "moe_sidecar_ditfrozen-overfit5",
+        "moe_sidecar_ditlora-overfit5",
+    }:
+        audit = json.loads(florence_audit.read_text()) if florence_audit else {}
+        metadata.update(
+            {
+                "pretrained_dit_verified": False,
+                "pretrained_dit_action_audit_passed": audit.get("checks", {}).get(
+                    "actual_pretrained_dit"
+                )
+                == "PASSED",
+                "pretrained_model_checkpoint_revision": audit.get(
+                    "actual_pretrained_checkpoint", {}
+                ).get("revision"),
+                "dit_training_mode": config.model.dit_training_mode,
+                "temporal_window_size": config.model.temporal_window_size,
+                "dit_lora_rank": config.model.dit_lora_rank,
+                "dit_lora_alpha": config.model.dit_lora_alpha,
+            }
+        )
     (snapshot / "metadata.json").write_text(json.dumps(metadata, indent=2))
     (output / "metadata.json").write_text(json.dumps(metadata, indent=2))
     return snapshot / "config.yaml"
@@ -247,6 +273,25 @@ def launch(cfg: DictConfig) -> int:
         raise ValueError(
             f"Fresh run requires an empty output_dir: {output}; use resume.enabled=true or a new run_id"
         )
+    florence_names = {
+        "temporal_sidecar_ditfrozen-overfit5",
+        "temporal_sidecar_ditlora-overfit5",
+        "temporal_sidecar_ditfull-overfit5",
+        "moe_sidecar_ditfrozen-overfit5",
+        "moe_sidecar_ditlora-overfit5",
+    }
+    florence_report_path = None
+    if cfg.name in florence_names:
+        from scripts.preflight_florence_ablations import run as run_florence_preflight
+
+        florence_report_path = (
+            Path("outputs/preflight") / f"{cfg.name}-{cfg.run_id}" / "florence_preflight.json"
+        ).resolve()
+        result = run_florence_preflight(cfg, config, florence_report_path)
+        if result["status"] != "PASSED":
+            raise RuntimeError(
+                f"Florence preflight failed: {result.get('error')}; see {florence_report_path}"
+            )
     # Serialize resolved literals so ranks cannot resolve environment/time independently.
     cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True))
     cfg.output_dir = str(output)
@@ -256,13 +301,36 @@ def launch(cfg: DictConfig) -> int:
         cfg.resume.auto_find_latest = False
     print(OmegaConf.to_yaml(cfg, resolve=True), flush=True)
     print(json.dumps(preflight(cfg, config), indent=2), flush=True)
-    path = write_snapshots(cfg, config, checkpoint)
+    path = write_snapshots(cfg, config, checkpoint, florence_report_path)
+    if florence_report_path is not None:
+        import shutil
+
+        run_preflight = output / "preflight"
+        run_preflight.mkdir(exist_ok=True)
+        for source, destination in (
+            (florence_report_path, run_preflight / "florence_preflight.json"),
+            (
+                florence_report_path.with_name("dit_verification.json"),
+                run_preflight / "dit_verification.json",
+            ),
+            (
+                florence_report_path.with_name("dit_verification.txt"),
+                run_preflight / "dit_verification.txt",
+            ),
+        ):
+            shutil.copy2(source, destination)
+        for name in ("dit_verification.json", "dit_verification.txt"):
+            shutil.copy2(run_preflight / name, Path("outputs/preflight") / name)
+        florence_report_path = run_preflight / "florence_preflight.json"
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = cfg.hardware.cuda_visible_devices
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     env.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
     env.setdefault("LOGURU_LEVEL", "INFO")
     env["GR00T_HYDRA_CONFIG"] = str(path)
+    env["GROOT_COMMIT_HASH"] = json.loads((output / "metadata.json").read_text())["git_commit"]
+    if florence_report_path is not None:
+        env["GR00T_FLORENCE_PREFLIGHT"] = str(florence_report_path)
     env.update(
         GR00T_EXPERIMENT_NAME=cfg.name,
         GR00T_OUTPUT_DIR=str(output),
