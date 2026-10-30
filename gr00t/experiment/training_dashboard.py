@@ -29,35 +29,55 @@ class QuietProgressCallback(ProgressCallback):
 class TrainingDashboardCallback(TrainerCallback):
     """Display already logged CPU scalars; never touch model tensors."""
 
+    LOSS = {
+        "loss/total": "Total",
+        "loss/action": "Action (contribution)",
+        "loss/contact_weighted": "Contact (weighted)",
+        "loss/contact_raw": "Contact (raw)",
+        "loss/zero_prediction_mse": "Zero Baseline",
+        "loss/action_to_zero_ratio": "Action / Zero",
+    }
+    GRADIENT = {
+        "grad_status/sample_step": "Module sample step",
+        "grad_norm/pre_clip": "Global Pre",
+        "grad_norm/post_clip": "Global Post",
+        **{
+            f"grad_norm/{name}": name.replace("_", " ").title()
+            for name in (
+                "dit",
+                "sidecar",
+                "point_encoder",
+                "tactile_encoder",
+                "contact_teacher",
+                "contact_predictor",
+                "contact_injection",
+                "gates",
+            )
+        },
+    }
+    ACTION = {
+        "action/predicted_velocity_std": "Predicted Std",
+        "action/target_velocity_std": "Target Std",
+        "action/valid_action_ratio": "Valid Ratio",
+        "action/valid_dimension_count": "Valid Dimensions",
+        "action/valid_timestep_ratio": "Valid Timesteps",
+    }
     TRAINING = {
-        "loss": "Loss",
-        "grad_norm": "Gradient Norm",
         "learning_rate": "Learning Rate",
-        "predicted_velocity_std": "Pred. Velocity Std",
-        "target_velocity_std": "Target Velocity Std",
-        "zero_prediction_mse": "Zero Prediction MSE",
-        "valid_action_ratio": "Valid Action Ratio",
+        "clip_limit": "Gradient Clip",
+        "precision": "Precision",
+        "distributed": "Distributed",
     }
     DIAGNOSTICS = {
-        "sidecar_action_gate_mean_abs": "Sidecar Action Gate",
-        "sidecar_point_gate_mean_abs": "Sidecar Point Gate",
-        "sidecar_grad_norm": "Sidecar Gradient",
-        "contact_prediction_loss": "Contact Prediction Loss",
-        "observed_contact_variance": "Observed Contact Variance",
-        "predicted_contact_variance": "Predicted Contact Variance",
-        "contact_surprise_norm": "Contact Surprise Norm",
-        "contact_gate_mean": "Contact Gate",
-        "contact_predictor_grad_norm": "Contact Predictor Gradient",
-        "point_gate_mean_abs": "Point Gate Mean |·|",
-        "tactile_gate_mean_abs": "Tactile Gate Mean |·|",
-        "point_gate_grad_norm": "Point Gate Grad",
-        "tactile_gate_grad_norm": "Tactile Gate Grad",
-        "point_encoder_grad_norm": "Point Encoder Grad",
-        "tactile_encoder_grad_norm": "Tactile Encoder Grad",
-        "point_cross_attention_grad_norm": "Point Attention Grad",
-        "tactile_cross_attention_grad_norm": "Tactile Attention Grad",
-        "point_residual_ratio_mean": "Point Residual Ratio",
-        "tactile_residual_ratio_mean": "Tactile Residual Ratio",
+        "contact/observed_variance": "Teacher Variance",
+        "contact/observed_norm": "Teacher Norm",
+        "contact/predicted_variance": "Predictor Variance",
+        "contact/surprise_norm": "Surprise Norm",
+        "contact/gate_mean": "Contact Gate",
+        "sidecar/action_gate_mean_abs": "Action Gate",
+        "sidecar/point_gate_mean_abs": "Point Gate",
+        "sidecar/action_residual_ratio": "Action Residual",
+        "sidecar/point_residual_ratio": "Point Residual",
     }
 
     def __init__(
@@ -91,6 +111,26 @@ class TrainingDashboardCallback(TrainerCallback):
         self._started = time.monotonic()
         self._initial_step = state.global_step
         self._metrics.clear()
+        self._status = "Running"
+        self._checkpoint = "None"
+        deepspeed = getattr(args, "deepspeed", None)
+        stage = (
+            deepspeed.get("zero_optimization", {}).get("stage")
+            if isinstance(deepspeed, dict)
+            else None
+        )
+        distribution = (
+            f"ZeRO-{stage}" if stage is not None else "DeepSpeed" if deepspeed else "DDP/local"
+        )
+        self._metrics.update(
+            clip_limit=getattr(args, "max_grad_norm", None),
+            precision="BF16"
+            if getattr(args, "bf16", False)
+            else "FP16"
+            if getattr(args, "fp16", False)
+            else "FP32",
+            distributed=f"{distribution} / {getattr(args, 'world_size', 1)} GPUs",
+        )
         if not self._is_main(args) or not self.enabled:
             return control
         self._start_live()
@@ -127,10 +167,13 @@ class TrainingDashboardCallback(TrainerCallback):
             console=self._console,
             auto_refresh=False,
         )
+        self._wide_columns = self._progress.columns
         self._live = Live(
-            self._progress,
+            self,
             console=self._console,
             refresh_per_second=1 / self.refresh_seconds,
+            screen=True,
+            vertical_overflow="crop",
             redirect_stdout=True,
             redirect_stderr=True,
         )
@@ -181,15 +224,93 @@ class TrainingDashboardCallback(TrainerCallback):
         table.add_column(style="cyan")
         table.add_column(justify="right")
         for key, label in labels.items():
-            table.add_row(label, self._format(self._metrics.get(key)))
+            value = self._metrics.get(key)
+            text = value if isinstance(value, str) else self._format(value)
+            if key.startswith("grad_norm/") and self._metrics.get(
+                f"grad_status/{key.split('/')[-1]}/frozen"
+            ):
+                text = "N/A (Frozen)"
+            table.add_row(label, text)
         return self._Panel(table, title=title)
 
+    def __rich_console__(self, console, options):
+        # Live invokes this on refresh, so resize/elapsed time also work while saving.
+        yield self._render()
+
     def _render(self):
-        panels = [self._progress]
+        import os
+
+        from rich.table import Table
+        from rich.text import Text
+
+        width, height = self._console.size
+        self._progress.columns = (
+            self._wide_columns
+            if width >= 80
+            else tuple(self._wide_columns[i] for i in (1, 2, 3, 5))
+        )
+        panels = [
+            Text(
+                f"Florence | {os.environ.get('GR00T_EXPERIMENT_NAME', 'Training')}",
+                style="bold cyan",
+                no_wrap=True,
+                overflow="ellipsis",
+            ),
+            self._progress,
+        ]
         if self._training:
-            panels.append(self._panel("Training Metrics", self.TRAINING))
-            if self.diagnostics_enabled:
-                panels.append(self._panel("Multimodal Diagnostics", self.DIAGNOSTICS))
+            panels.append(
+                Text(
+                    f"{self._status} | Checkpoint: {self._checkpoint}",
+                    no_wrap=True,
+                    overflow="ellipsis",
+                )
+            )
+            if width < 80 or height < 20:
+                # A compact view fits narrow SSH panes without stacking four panels.
+                essential = {
+                    "loss/total": "LOSS Total",
+                    "loss/action": "Action",
+                    "loss/contact_weighted": "Contact",
+                    "loss/zero_prediction_mse": "Zero baseline",
+                    "grad_norm/pre_clip": "GRAD Pre",
+                    "grad_norm/post_clip": "Post",
+                    "action/predicted_velocity_std": "ACTION Pred std",
+                    "action/target_velocity_std": "Target std",
+                    "action/valid_action_ratio": "Valid ratio",
+                    "learning_rate": "OPTIMIZER LR",
+                }
+                labels = dict(list(essential.items())[: max(1, height - 6)])
+                panels.append(self._panel("Metrics", labels))
+            else:
+                compact = height < 38
+                loss = dict(list(self.LOSS.items())[:4]) if compact else self.LOSS
+                gradient = (
+                    {
+                        key: self.GRADIENT[key]
+                        for key in (
+                            "grad_norm/pre_clip",
+                            "grad_norm/post_clip",
+                            "grad_norm/dit",
+                            "grad_norm/sidecar",
+                        )
+                    }
+                    if compact
+                    else self.GRADIENT
+                )
+                action = dict(list(self.ACTION.items())[:3]) if compact else self.ACTION
+                optimizer = self.TRAINING
+                for row in (
+                    (("LOSS", loss), ("GRADIENT", gradient)),
+                    (("ACTION", action), ("OPTIMIZER", optimizer)),
+                ):
+                    table = Table.grid(expand=True, padding=(0, 1))
+                    table.add_column(ratio=1)
+                    table.add_column(ratio=1)
+                    table.add_row(*(self._panel(title, labels) for title, labels in row))
+                    panels.append(table)
+                if self.diagnostics_enabled and height >= 38:
+                    panels.append(self._panel("Multimodal Diagnostics", self.DIAGNOSTICS))
         evaluation = {
             key: key.removeprefix("eval_").replace("_", " ").title()
             for key in self._metrics
@@ -203,10 +324,23 @@ class TrainingDashboardCallback(TrainerCallback):
         if self._live is not None and (
             force or time.monotonic() - self._last_render >= self.refresh_seconds
         ):
-            self._live.update(self._render(), refresh=True)
+            self._live.update(self, refresh=True)
             self._last_render = time.monotonic()
 
+    def on_step_begin(self, args, state, control, **kwargs):
+        self._status = "Running"
+        return control
+
+    def on_save(self, args, state, control, **kwargs):
+        self._checkpoint = str(state.global_step)
+        self._status = "Running"
+        self._refresh(force=True)
+        return control
+
     def on_step_end(self, args, state, control, **kwargs):
+        if getattr(control, "should_save", False):
+            self._status = "Saving checkpoint"
+
         if self._progress is not None and self._task is not None:
             elapsed = max(time.monotonic() - self._started, 0.001)
             self._progress.update(
@@ -214,11 +348,12 @@ class TrainingDashboardCallback(TrainerCallback):
                 completed=state.global_step,
                 speed=f"{(state.global_step - self._initial_step) / elapsed:.2f} step/s",
             )
-            self._refresh()
+            self._refresh(force=True)
         return control
 
     def on_log(self, args, state, control, logs=None, **kwargs):
         logs = logs or {}
+        self._status = "Running" if self._training else "Idle"
         if not self._is_main(args):
             return control
         self._metrics.update(
@@ -269,6 +404,7 @@ class TrainingDashboardCallback(TrainerCallback):
         return self.on_evaluate(args, state, control, metrics=metrics, **kwargs)
 
     def on_train_end(self, args, state, control, **kwargs):
+        self._status = "Completed"
         self._refresh(force=True)
         self._stop_live()
         self._training = False

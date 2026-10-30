@@ -98,6 +98,9 @@ def resolve_resume(cfg: DictConfig, config) -> Path | None:
         "discord_notify_error",
         "enable_training_dashboard",
         "dashboard_refresh_seconds",
+        "enable_multimodal_diagnostics",
+        "multimodal_diagnostics_interval",
+        "multimodal_diagnostics_level",
     }
     differences = []
     for section in ("model", "data", "training", "hardware"):
@@ -280,26 +283,70 @@ def launch(cfg: DictConfig) -> int:
         env["GR00T_SUPERVISOR_NOTIFY"] = "1"
     # A separate process group allows forwarding termination to supervisor, Torchrun and ranks.
     with (output / "logs/train.log").open("a", buffering=1) as log:
+        master = slave = None
+        interactive = sys.stdout.isatty() and config.training.enable_training_dashboard is not False
+        if interactive:
+            import pty
+
+            from gr00t.experiment.console_logging import copy_terminal_size
+
+            master, slave = pty.openpty()
+            copy_terminal_size(sys.stdout.fileno(), slave)
+            env["GR00T_LIVE_CONSOLE"] = "1"
         process = subprocess.Popen(
             command,
             env=env,
-            stdout=subprocess.PIPE,
+            stdout=slave if interactive else subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             start_new_session=True,
         )
 
+        if slave is not None:
+            os.close(slave)
+
         def forward(signum, frame):
+            if interactive and signum == signal.SIGWINCH:
+                copy_terminal_size(sys.stdout.fileno(), master)
+                return
             if process.poll() is None:
                 os.killpg(process.pid, signum)
 
-        previous = {sig: signal.signal(sig, forward) for sig in (signal.SIGINT, signal.SIGTERM)}
+        signals = (signal.SIGINT, signal.SIGTERM) + ((signal.SIGWINCH,) if interactive else ())
+        previous = {sig: signal.signal(sig, forward) for sig in signals}
         try:
-            for line in process.stdout:
-                print(line, end="", flush=True)
-                log.write(line)
+            if interactive:
+                import codecs
+                import errno
+
+                decoder = codecs.getincrementaldecoder("utf-8")("replace")
+                while True:
+                    try:
+                        chunk = os.read(master, 65536)
+                    except OSError as exc:
+                        if exc.errno != errno.EIO:
+                            raise
+                        break
+                    if not chunk:
+                        break
+                    text = decoder.decode(chunk)
+                    sys.stdout.write(text)
+                    sys.stdout.flush()
+                    log.write(text)
+                tail = decoder.decode(b"", final=True)
+                sys.stdout.write(tail)
+                log.write(tail)
+            else:
+                for line in process.stdout:
+                    print(line, end="", flush=True)
+                    log.write(line)
             code = process.wait()
         finally:
+            if master is not None:
+                os.close(master)
+                # Last resort if a worker was killed before Rich's finally cleanup.
+                sys.stdout.write("\x1b[?1049l\x1b[?25h")
+                sys.stdout.flush()
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
             if process.poll() is None:

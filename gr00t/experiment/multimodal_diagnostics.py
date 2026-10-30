@@ -168,7 +168,7 @@ class MultimodalDiagnostics(TrainerCallback):
         if not self.sampled() or self.last_step == self.trainer.state.global_step + 1:
             return
         self.last_step = self.trainer.state.global_step + 1
-        self.record = {"global_step": self.last_step}
+        self.record = {"global_step": self.last_step, "grad_status/sample_step": self.last_step}
         optimizer = self._zero_optimizer or self.trainer.optimizer
         scale = float(getattr(optimizer, "loss_scale", 1.0))
         for label, attribute in (("point", "point_gate"), ("action", "action_gate")):
@@ -190,23 +190,97 @@ class MultimodalDiagnostics(TrainerCallback):
                 "grad_norm"
             ]
         head = self.trainer.model.action_head
-        for name, module in (
-            ("sidecar", self.dit.sidecar_stages),
-            ("point_encoder", head.point_encoder),
-            ("contact_predictor", self.dit.contact_adapter.predictor),
-        ):
-            if module is not None:
-                parameters = list(module.parameters())
-                if name == "sidecar":
-                    parameters += list(self.dit.sidecar_pool.parameters())
-                if name == "contact_predictor":
-                    parameters += list(self.dit.contact_adapter.scene_pool.parameters())
-                    parameters += list(self.dit.contact_adapter.state_projection.parameters())
-                self.record[f"{name}_grad_norm"] = gradient_stats(parameters, scale)["grad_norm"]
-        for key, value in getattr(self.dit, "contact_diagnostics", {}).items():
-            self.record[key] = float(value)
-        for (modality, stage), (total, count) in self.ratios.items():
-            self.record[f"{modality}_residual_ratio_stage_{stage}"] = float(total / count)
+        groups = {
+            "sidecar": list(self.dit.sidecar_stages.parameters())
+            + list(self.dit.sidecar_pool.parameters()),
+            "point_encoder": list(head.point_encoder.parameters())
+            if head.point_encoder is not None
+            else [],
+            "tactile_encoder": list(head.tactile_encoder.parameters())
+            if getattr(head, "tactile_encoder", None) is not None
+            else [],
+            "contact_teacher": list(self.dit.contact_adapter.projector.parameters()),
+            "contact_predictor": list(self.dit.contact_adapter.predictor.parameters())
+            + list(self.dit.contact_adapter.scene_pool.parameters())
+            + list(self.dit.contact_adapter.state_projection.parameters()),
+            "contact_injection": list(self.dit.contact_injections.parameters())
+            + list(self.dit.contact_adapter.gate.parameters()),
+            "gates": [
+                g
+                for stage in self.dit.sidecar_stages
+                for g in (stage.point_gate, stage.action_gate)
+            ]
+            + [module.scale for module in self.dit.contact_injections],
+            "dit": [
+                p
+                for n, p in self.dit.named_parameters()
+                if not n.startswith(("sidecar_", "contact_"))
+            ],
+        }
+        groups.update(
+            {
+                f"sidecar_stage_{i}": list(stage.parameters())
+                for i, stage in enumerate(self.dit.sidecar_stages)
+            }
+        )
+        self.record["gradient_timing"] = (
+            "before DeepSpeed optimizer step/unscale/clip"
+            if self._zero_optimizer
+            else "after Trainer clipping, before optimizer step"
+        )
+        for name, parameters in groups.items():
+            stats = gradient_stats(parameters, scale)
+            self.record[f"grad_norm/{name}"] = stats["grad_norm"]
+            self.record[f"{name}_grad_norm"] = stats["grad_norm"]
+            if stats["grad_finite"] is False:
+                logging.warning(
+                    "Non-finite %s gradients at optimizer step %s", name, self.last_step
+                )
+            # Non-DS callback runs after clipping: this is a real measured global post norm.
+            for field in ("grad_present", "grad_buffer_present", "grad_finite"):
+                self.record[f"grad_status/{name}/{field}"] = stats[field]
+            self.record[f"grad_status/{name}/trainable_numel"] = sum(
+                getattr(p, "ds_numel", p.numel()) for p in parameters if p.requires_grad
+            )
+            self.record[f"grad_status/{name}/frozen"] = not any(p.requires_grad for p in parameters)
+        if not self._zero_optimizer and hasattr(self.trainer.model, "parameters"):
+            stats = gradient_stats(list(self.trainer.model.parameters()), scale)
+            self.record["grad_norm/post_clip"] = stats["grad_norm"]
+        aliases = {
+            "observed_contact_variance": "contact/observed_variance",
+            "observed_contact_norm": "contact/observed_norm",
+            "predicted_contact_variance": "contact/predicted_variance",
+            "contact_surprise_norm": "contact/surprise_norm",
+            "contact_gate_mean": "contact/gate_mean",
+            "contact_prediction_loss": "contact/prediction_loss",
+        }
+        for key, alias in aliases.items():
+            value = getattr(self.dit, "contact_diagnostics", {}).get(key)
+            pair = torch.zeros(2, device=next(self.dit.parameters()).device)
+            if value is not None:
+                pair[0], pair[1] = value.detach(), 1
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(pair)
+            self.record[alias] = float(pair[0] / pair[1]) if pair[1] else None
+            self.record[key] = self.record[alias]
+        for label in ("action", "point"):
+            self.record[f"sidecar/{label}_gate_mean_abs"] = self.record[
+                f"sidecar_{label}_gate_mean_abs"
+            ]
+            pair = torch.zeros(2, device=next(self.dit.parameters()).device)
+            for stage in range(len(self.dit.sidecar_stages)):
+                total, count = self.ratios.get((f"sidecar_{label}", stage), (0, 0))
+                stage_pair = torch.zeros_like(pair)
+                stage_pair[0], stage_pair[1] = total, count
+                if torch.distributed.is_initialized():
+                    torch.distributed.all_reduce(stage_pair)
+                self.record[f"sidecar_{label}_residual_ratio_stage_{stage}"] = (
+                    float(stage_pair[0] / stage_pair[1]) if stage_pair[1] else None
+                )
+                pair += stage_pair
+            self.record[f"sidecar/{label}_residual_ratio"] = (
+                float(pair[0] / pair[1]) if pair[1] else None
+            )
 
     def pre_step(self):
         if hasattr(self.dit, "sidecar_stages"):

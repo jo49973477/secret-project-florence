@@ -178,7 +178,7 @@ def test_rich_render_smoke_and_cleanup(monkeypatch):
     finally:
         dashboard._stop_live()
     assert dashboard._live is None
-    assert "Training Metrics" in output.getvalue()
+    assert "LOSS" in output.getvalue()
 
 
 def test_trainer_off_no_hooks_and_callback_replacement(tmp_path):
@@ -383,3 +383,155 @@ def test_existing_logging_handler_coordinated_and_restored(monkeypatch):
     finally:
         dashboard._stop_live()
         logger.removeHandler(handler)
+
+
+@pytest.mark.parametrize("warmup", [False, True])
+def test_loss_decomposition_mask_and_no_gradient_changes(warmup):
+    from gr00t.experiment.action_diagnostics import action_diagnostics, loss_ratios
+
+    p = torch.nn.Parameter(torch.ones(1, 40, 132))
+    mask = torch.zeros_like(p)
+    mask[..., :8] = 1
+    target = torch.full_like(p, 2)
+    action = ((p - target).square() * mask).sum() / (mask.sum() + 1e-6)
+    contact = p.mean().square()
+    loss = 0.1 * contact if warmup else action + 0.1 * contact
+    stats = action_diagnostics(p, target, mask, loss, action, contact, 0.1, warmup)
+    assert stats["loss/total"] == stats["loss/action"] + stats["loss/contact_weighted"]
+    assert stats["action/valid_dimension_count"] == 8
+    assert stats["action/valid_timestep_ratio"] == 1
+    assert stats["action/valid_action_count"] == 320
+    assert stats["action/valid_action_ratio"] == pytest.approx(8 / 132)
+    assert not any(value.requires_grad for value in stats.values())
+    expected = torch.autograd.grad(loss, p, retain_graph=True)[0]
+    loss.backward()
+    torch.testing.assert_close(p.grad, expected, rtol=0, atol=0)
+    reduced = loss_ratios({key: float(value) for key, value in stats.items()})
+    assert reduced["loss/contact_fraction"] == pytest.approx(float(0.1 * contact / loss))
+
+
+def test_zero_padding_excluded_and_scale(monkeypatch):
+    import deepspeed.utils
+
+    p = torch.nn.Parameter(torch.empty(0))
+    p.ds_id, p.ds_numel, p._z3_optimizer = 1, 3, object()
+    monkeypatch.setattr(
+        deepspeed.utils, "safe_get_local_grad", lambda p: torch.tensor([8.0, 999.0])
+    )
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 1)
+    monkeypatch.setattr(torch.distributed, "get_backend", lambda group=None: "gloo")
+
+    def reduce(values, group=None):
+        values[0] += 9  # other rank contains 3,0 after unscaling
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
+    assert gradient_stats([p], scale=2)["grad_norm"] == 5
+
+
+def test_console_filter_preserves_details_and_errors():
+    from gr00t.experiment.console_logging import DetailedConsoleStream
+
+    console, detail = io.StringIO(), io.StringIO()
+    stream = DetailedConsoleStream(console, detail)
+    stream.write("Rank 2, Worker 0: Caching shard...\n")
+    stream.write("INFO checkpoint-memory phase=save point=during metrics={}\n")
+    stream.write("WARNING Rank 2, Worker 0: Caching shard failed!\n")
+    stream.flush()
+    assert "Caching shard..." not in console.getvalue()
+    assert "WARNING" in console.getvalue()
+    assert "checkpoint-memory" not in console.getvalue()
+    assert "checkpoint-memory" in detail.getvalue()
+    assert "Caching shard..." in detail.getvalue()
+
+
+def test_dashboard_checkpoint_and_rank_lifecycle(monkeypatch):
+    output = io.StringIO()
+    output.isatty = lambda: True
+    monkeypatch.setattr("sys.stdout", output)
+    dashboard = TrainingDashboardCallback(True)
+    args = SimpleNamespace(process_index=1)
+    state = SimpleNamespace(global_step=5, max_steps=10)
+    control = SimpleNamespace(should_save=True)
+    dashboard.on_train_begin(args, state, control)
+    assert dashboard._live is None
+    args.process_index = 0
+    dashboard.on_train_begin(args, state, control)
+    try:
+        dashboard.on_step_end(args, state, control)
+        assert dashboard._status == "Saving checkpoint"
+        dashboard.on_save(args, state, control)
+        assert dashboard._checkpoint == "5" and dashboard._status == "Running"
+    finally:
+        dashboard.on_train_end(args, state, control)
+    assert dashboard._live is None
+
+
+def test_window_reduction_and_canonical_wandb(tmp_path, monkeypatch):
+    import sys
+    from unittest.mock import Mock
+
+    from gr00t.experiment.trainer import Gr00tTrainer
+    from transformers import Trainer
+
+    trainer = Gr00tTrainer(
+        model=torch.nn.Linear(2, 2),
+        args=TrainingArguments(output_dir=str(tmp_path), report_to="none", use_cpu=True),
+        enable_training_dashboard=False,
+    )
+    trainer._forward_diagnostics = {
+        "loss/total": torch.tensor(12.0),
+        "loss/action": torch.tensor(8.0),
+        "loss/contact_weighted": torch.tensor(4.0),
+        "loss/zero_prediction_mse": torch.tensor(4.0),
+    }
+    trainer._forward_diagnostics_count = 4  # two steps, two accumulation microbatches
+    trainer.args.report_to = ["wandb"]
+    wandb = SimpleNamespace(run=object(), log=Mock())
+    monkeypatch.setitem(sys.modules, "wandb", wandb)
+    logged = []
+    monkeypatch.setattr(Trainer, "log", lambda self, logs, **kw: logged.append(logs))
+    trainer.log({"loss": 3.0, "grad_norm": 5.0})
+    assert logged[0]["loss/total"] == 3
+    assert logged[0]["loss/action"] == 2
+    assert logged[0]["loss/contact_fraction"] == pytest.approx(1 / 3)
+    assert logged[0]["loss/action_to_zero_ratio"] == 2
+    assert "grad_norm/post_clip" not in logged[0]
+    assert trainer._forward_diagnostics_count == 0
+    assert wandb.log.call_args.kwargs == {"commit": False}
+    assert wandb.log.call_args.args[0]["loss/total"] == 3
+    assert "train/global_step" in wandb.log.call_args.args[0]
+
+
+def test_worker_stdout_can_be_tty_without_forcing_redirected_console():
+    import os
+    import pty
+    import subprocess
+    import sys
+
+    master, slave = pty.openpty()
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", "import sys; print(sys.stdout.isatty(), flush=True)"],
+            stdout=slave,
+            check=True,
+        )
+        assert result.returncode == 0
+        assert b"True" in os.read(master, 100)
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+def test_horizon_mask_distinguished_from_dimension_padding():
+    from gr00t.experiment.action_diagnostics import action_diagnostics
+
+    prediction = torch.ones(2, 40, 132)
+    mask = torch.zeros_like(prediction)
+    mask[:, :30, :8] = 1
+    zero = torch.tensor(0.0)
+    stats = action_diagnostics(prediction, prediction, mask, zero, zero, zero, 0.1)
+    assert stats["action/valid_dimension_count"] == 8
+    assert stats["action/valid_timestep_ratio"] == 0.75
+    assert stats["action/valid_action_ratio"] == pytest.approx(0.75 * 8 / 132)
+    assert stats["action/valid_action_count"] == 2 * 30 * 8

@@ -667,6 +667,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         action_loss = F.mse_loss(pred_actions.float(), velocity.float(), reduction="none")
         action_loss = action_loss * action_mask.float()
         loss = action_loss.sum() / (action_mask.float().sum() + 1e-6)
+        diagnostic_action_loss = loss.detach()
         if isinstance(self.model, SidecarConditionedDiT):
             if self.config.contact_predictor_warmup:
                 loss = (
@@ -679,24 +680,19 @@ class Gr00tN1d7ActionHead(nn.Module):
                     * self.model.contact_prediction_loss
                 )
 
-        diagnostic_mask = action_mask.float()
-        valid_count = diagnostic_mask.sum().clamp_min(1.0)
-        pred_float = pred_actions.float()
-        target_float = velocity.float()
-        pred_mean = (pred_float * diagnostic_mask).sum() / valid_count
-        target_mean = (target_float * diagnostic_mask).sum() / valid_count
-        diagnostics = {
-            "predicted_velocity_std": ((pred_float - pred_mean).square() * diagnostic_mask)
-            .sum()
-            .div(valid_count)
-            .sqrt(),
-            "target_velocity_std": ((target_float - target_mean).square() * diagnostic_mask)
-            .sum()
-            .div(valid_count)
-            .sqrt(),
-            "zero_prediction_mse": (target_float.square() * diagnostic_mask).sum().div(valid_count),
-            "valid_action_ratio": action_mask.float().mean(),
-        }
+        from gr00t.experiment.action_diagnostics import action_diagnostics
+
+        is_sidecar = isinstance(self.model, SidecarConditionedDiT)
+        diagnostics = action_diagnostics(
+            pred_actions,
+            velocity,
+            action_mask,
+            loss,
+            diagnostic_action_loss,
+            self.model.contact_prediction_loss if is_sidecar else loss.new_zeros(()),
+            self.config.contact_prediction_loss_weight if is_sidecar else 0.0,
+            is_sidecar and self.config.contact_predictor_warmup,
+        )
         if not self._dtype_diagnostics_logged and os.environ.get(
             "GR00T_DTYPE_DEBUG", ""
         ).lower() in {"1", "true", "yes"}:

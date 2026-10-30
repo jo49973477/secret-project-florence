@@ -184,6 +184,7 @@ class SidecarConditionedDiT(AlternateVLDiT):
         if point_tokens is not None:
             points, point_mask = self.sidecar_pool(point_tokens, point_attention_mask)
         contact_tokens = contact_mask = None
+        self.contact_diagnostics = {}
         self.contact_prediction_loss = hidden_states.new_zeros((), dtype=torch.float32)
         if self.tactile_fusion_mode != "none" and tactile_tokens is not None:
             if point_tokens is None or robot_state is None:
@@ -199,6 +200,7 @@ class SidecarConditionedDiT(AlternateVLDiT):
             if getattr(self, "_diagnostic_observer", None) is not None:
                 self.contact_diagnostics = {
                     "contact_prediction_loss": loss.detach(),
+                    "observed_contact_norm": observed.detach().float().norm(dim=-1).mean(),
                     "observed_contact_variance": observed.detach()
                     .float()
                     .var(dim=(0, 1), unbiased=False)

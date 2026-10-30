@@ -256,6 +256,7 @@ class Gr00tTrainer(Trainer):
         self._forward_diagnostics_count = 0
         self._forward_diagnostics_step = None
         self._gradient_diagnostics: dict[str, torch.Tensor] = {}
+        self._clip_observations = []
         self.multimodal_monitor = None
         if self.enable_multimodal_diagnostics and diagnostics_level != "off":
             from gr00t.experiment.multimodal_diagnostics import MultimodalDiagnostics
@@ -592,19 +593,66 @@ class Gr00tTrainer(Trainer):
                 manager.register_module_override(module, "weight", {"optim_bits": 32})
         logging.info("bitsandbytes optimizer keeps %s embedding parameters in fp32", f"{skipped:,}")
 
+    def _maybe_log_save_evaluate(self, tr_loss, grad_norm, *args, **kwargs):
+        # Trainer calls this at optimizer boundaries and epoch end; count each step once.
+        if getattr(self, "_clip_step", None) != self.state.global_step and grad_norm is not None:
+            import math
+
+            norm = float(grad_norm)
+            if math.isfinite(norm) and self.args.max_grad_norm > 0:
+                self._clip_observations.append(float(norm > self.args.max_grad_norm))
+            self._clip_step = self.state.global_step
+        return super()._maybe_log_save_evaluate(tr_loss, grad_norm, *args, **kwargs)
+
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         logs = dict(logs)
-        for name, value in self._forward_diagnostics.items() if "loss" in logs else ():
-            reduced = value.detach().float().clone() / max(self._forward_diagnostics_count, 1)
+        if "loss" in logs and self._forward_diagnostics_count:
+            from gr00t.experiment.action_diagnostics import loss_ratios
+
+            names = sorted(self._forward_diagnostics)
+            # Sum microbatch observations and counts together; all ranks use the same schema.
+            values = torch.stack([self._forward_diagnostics[n].detach().float() for n in names])
+            packed = torch.cat((values, values.new_tensor([self._forward_diagnostics_count])))
             if torch.distributed.is_initialized():
-                torch.distributed.all_reduce(reduced)
-                reduced /= torch.distributed.get_world_size()
-            logs[name] = float(reduced.cpu())
+                torch.distributed.all_reduce(packed)
+            logs.update(zip(names, (packed[:-1] / packed[-1]).cpu().tolist()))
+            loss_ratios(logs)
+            self._forward_diagnostics = {}
+            self._forward_diagnostics_count = 0
+        if logs.get("grad_norm") is not None:
+            import math
+
+            norm = float(logs["grad_norm"])
+            logs["grad_norm/pre_clip"] = norm
+            logs["grad_norm/is_finite"] = float(math.isfinite(norm))
+            # This is the configured coefficient, not an observed post-clip norm.
+            if math.isfinite(norm) and self.args.max_grad_norm > 0:
+                coefficient = min(1.0, self.args.max_grad_norm / (norm + 1e-6))
+                logs["grad_norm/clip_coefficient"] = coefficient
+                observations = self._clip_observations
+                logs["grad_norm/clip_fraction"] = (
+                    sum(observations) / len(observations)
+                    if observations
+                    else float(coefficient < 1)
+                )
+                self._clip_observations = []
         # Hide epoch from logged metrics as it's misleading for Iterable datasets.
         epoch = self.state.epoch
         self.state.epoch = None
         try:
             super().log(logs, start_time=start_time)
+            # HF rewrites every custom name as train/<name>. Retain those and expose
+            # the canonical diagnostic namespaces in the same W&B optimizer-step axis.
+            if self.is_world_process_zero() and "wandb" in self.args.report_to:
+                import wandb
+
+                scalars = {
+                    k: v for k, v in logs.items() if "/" in k and isinstance(v, (int, float))
+                }
+                if wandb.run is not None and scalars:
+                    wandb.log(
+                        {**scalars, "train/global_step": self.state.global_step}, commit=False
+                    )
         finally:
             self.state.epoch = epoch
 
@@ -784,10 +832,6 @@ class Gr00tTrainer(Trainer):
                 monitor.dit._diagnostic_observer = None
         output_dict = outputs if isinstance(outputs, dict) else getattr(outputs, "__dict__", {})
         diagnostics = output_dict.get("diagnostics", {}) if model.training else {}
-        if self._forward_diagnostics_step != self.state.global_step:
-            self._forward_diagnostics = {}
-            self._forward_diagnostics_count = 0
-            self._forward_diagnostics_step = self.state.global_step
         for name, value in diagnostics.items():
             if torch.is_tensor(value):
                 detached = value.detach()
@@ -796,7 +840,8 @@ class Gr00tTrainer(Trainer):
                     if name not in self._forward_diagnostics
                     else self._forward_diagnostics[name] + detached
                 )
-        self._forward_diagnostics_count += 1
+        if diagnostics:
+            self._forward_diagnostics_count += 1
         # import ipdb; ipdb.set_trace()
         # # save the model's embedding for the first step
         # input_embeddings = model.get_input_embeddings().weight.data.cpu()
