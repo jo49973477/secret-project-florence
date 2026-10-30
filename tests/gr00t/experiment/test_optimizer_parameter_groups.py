@@ -5,6 +5,7 @@
 
 from types import SimpleNamespace
 
+from gr00t.configs.base_config import Config
 from gr00t.configs.finetune_config import FinetuneConfig
 from gr00t.configs.training.training_config import TrainingConfig
 from gr00t.experiment.trainer import Gr00tTrainer
@@ -332,3 +333,25 @@ def test_split_optimizer_rejects_duplicate_module_ownership(tmp_path):
 
     with pytest.raises(RuntimeError, match="duplicate="):
         trainer.create_optimizer()
+
+
+def test_deepspeed_accumulation_plugin_matches_trainer_before_prepare(tmp_path):
+    args = TrainingArguments(
+        output_dir=str(tmp_path),
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=8,
+        optim="adamw_torch_fused",
+        deepspeed=Config().get_deepspeed_config(),
+        report_to="none",
+    )
+    trainer = Gr00tTrainer(model=_ToySplitModel(), args=args)
+
+    assert trainer.args.gradient_accumulation_steps == 8
+    assert trainer.accelerator.gradient_accumulation_steps == 8
+    assert trainer.accelerator.state.deepspeed_plugin.get_value("gradient_accumulation_steps") == 8
+    optimizer = trainer.create_optimizer()
+    assert type(optimizer).__name__ == "AdamW"
+    before = trainer.model.action_head.projection.weight.detach().clone()
+    trainer.model()["loss"].backward()
+    optimizer.step()
+    assert not torch.equal(trainer.model.action_head.projection.weight.detach(), before)

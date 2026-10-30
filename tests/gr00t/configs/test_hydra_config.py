@@ -80,6 +80,35 @@ def test_overrides_hardware_and_rates(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "name",
+    [
+        "temporal_sidecar_ditfrozen-overfit5",
+        "temporal_sidecar_ditlora-overfit5",
+        "temporal_sidecar_ditfull-overfit5",
+        "moe_sidecar_ditfrozen-overfit5",
+        "moe_sidecar_ditlora-overfit5",
+    ],
+)
+def test_florence_default_optimizer_uses_existing_zero3_profile(name, monkeypatch):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    default = build_gr00t_config(composed(name))
+    zero = default.get_deepspeed_config()["zero_optimization"]
+    assert zero["stage"] == 3
+    assert "offload_optimizer" not in zero
+    assert "offload_param" not in zero
+    assert default.training.optim == "adamw_torch_fused"
+    assert default.training.gradient_accumulation_steps == 8
+    assert default.training.accumulated_batch_size == 32
+
+    offloaded = build_gr00t_config(composed(name, ["hardware=quad_3090_zero3_cpu_offload"]))
+    assert offloaded.get_deepspeed_config()["zero_optimization"]["offload_optimizer"] == {
+        "device": "cpu",
+        "pin_memory": False,
+    }
+    assert offloaded.training.accumulated_batch_size == default.training.accumulated_batch_size
+
+
+@pytest.mark.parametrize(
     "key,value,message",
     [
         ("model.base_model_path", None, "base_model_path"),

@@ -232,6 +232,11 @@ class Gr00tTrainer(Trainer):
         diagnostics_level = kwargs.pop("multimodal_diagnostics_level", "basic")
         self.multimodal_diagnostics_interval = kwargs.pop("multimodal_diagnostics_interval", 50)
         super().__init__(*args, **kwargs)
+        if self.is_deepspeed_enabled:
+            # Transformers leaves Accelerator's plugin at its default 1 while its
+            # TrainingArguments and the finalized DeepSpeed config use the requested
+            # accumulation count. Align the plugin before Accelerator.prepare().
+            self.accelerator.gradient_accumulation_steps = self.args.gradient_accumulation_steps
         # HF's PrinterCallback prints a raw dict for every Trainer.log call. Replace
         # both default renderers so rank zero owns one coordinated display.
         from transformers.trainer_callback import PrinterCallback, ProgressCallback
