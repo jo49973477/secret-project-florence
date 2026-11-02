@@ -2,6 +2,39 @@
 
 import torch
 from torch import nn
+import torch.nn.functional as F
+
+
+def stack_padded_point_frames(frames, masks):
+    """Pad only the token axis; retain each encoder-provided validity mask."""
+    if not frames or len(frames) != len(masks):
+        raise ValueError("Point frames and masks must be nonempty and aligned")
+    batch, _, width = frames[0].shape
+    max_tokens = max(frame.shape[1] for frame in frames)
+    for frame, mask in zip(frames, masks):
+        if frame.ndim != 3 or frame.shape[0] != batch or frame.shape[2] != width:
+            raise ValueError("Point frames must share batch size and embedding width")
+        if mask.shape != frame.shape[:2] or mask.dtype != torch.bool:
+            raise ValueError("Each point mask must be boolean [B,K]")
+    return (
+        torch.stack([F.pad(frame, (0, 0, 0, max_tokens - frame.shape[1])) for frame in frames], 1),
+        torch.stack([F.pad(mask, (0, max_tokens - mask.shape[1])) for mask in masks], 1),
+    )
+
+
+def masked_point_mean(points, mask):
+    """Pool valid point tokens; empty frames produce finite zero vectors."""
+    safe_points = torch.where(mask[..., None], points, torch.zeros_like(points))
+    return safe_points.sum(-2) / mask.sum(-1).clamp_min(1)[..., None]
+
+
+def masked_feature_norm_mean(features, mask):
+    """Exclude padded point tokens or missing frames from feature diagnostics."""
+    while mask.ndim < features.ndim - 1:
+        mask = mask.unsqueeze(-1)
+    mask = mask.expand(features.shape[:-1])
+    safe_features = torch.where(mask[..., None], features.detach().float(), 0)
+    return safe_features.norm(dim=-1).sum() / mask.sum().clamp_min(1)
 
 
 class LatentRingBuffer:
@@ -73,10 +106,7 @@ class TemporalFusion(nn.Module):
         else:
             if point_mask.shape != points.shape[:3]:
                 raise ValueError("point_mask must match [B,T,N]")
-            weights = point_mask.to(points.dtype)
-            point_features = (points * weights[..., None]).sum(2) / weights.sum(2).clamp_min(1)[
-                ..., None
-            ]
+            point_features = masked_point_mean(points, point_mask)
         tactile_features = tactile.mean(2)
         state_features = self.state_projection(state.to(self.state_projection.weight.dtype))
         return self.forward_pooled(point_features, tactile_features, state_features, valid)

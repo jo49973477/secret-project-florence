@@ -133,6 +133,7 @@ def test_nonzero_rank_suppresses_every_event(tmp_path):
 def test_on_save_contains_step_and_checkpoint_path(tmp_path):
     callback, notifier = _callback(tmp_path)
     args = _args(tmp_path)
+    (tmp_path / "checkpoint-25").mkdir()
 
     callback.on_save(args, _state(step=25), None)
 

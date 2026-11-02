@@ -12,5 +12,5 @@ zero3_offload_optimizer: false
 zero3_offload_param: false
 zero3_sub_group_size: null
 
-global_batch_size: 4
-gradient_accumulation_steps: 8
+global_batch_size: 8
+gradient_accumulation_steps: 4

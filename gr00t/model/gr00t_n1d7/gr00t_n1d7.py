@@ -579,12 +579,16 @@ class Gr00tN1d7ActionHead(nn.Module):
                 point_masks.append(mask)
                 tactile_frames.append(self.tactile_encoder(tactile[:, index : index + 2]))
             if use_ring:
+                from gr00t.model.extension.temporal_fusion import (
+                    masked_feature_norm_mean,
+                    masked_point_mean,
+                )
+
                 packed_frames = []
                 for local_index, index in enumerate(indices):
-                    point_mask = point_masks[local_index].to(point_frames[local_index].dtype)
-                    pooled_point = (point_frames[local_index] * point_mask[..., None]).sum(
-                        1
-                    ) / point_mask.sum(1).clamp_min(1)[:, None]
+                    pooled_point = masked_point_mean(
+                        point_frames[local_index], point_masks[local_index]
+                    )
                     pooled_tactile = tactile_frames[local_index].mean(1)
                     projected_state = self.temporal_fusion.state_projection(
                         state[:, index].to(self.temporal_fusion.state_projection.weight.dtype)
@@ -611,22 +615,30 @@ class Gr00tN1d7ActionHead(nn.Module):
                     packed[:, :, 0], packed[:, :, 1], packed[:, :, 2], fused_mask
                 )
                 self._temporal_feature_diagnostics = {
-                    "features/point_norm": packed[:, :, 0].detach().float().norm(dim=-1).mean(),
-                    "features/tactile_norm": packed[:, :, 1].detach().float().norm(dim=-1).mean(),
-                    "features/fused_norm": fused.detach().float().norm(dim=-1).mean(),
+                    "features/point_norm": masked_feature_norm_mean(packed[:, :, 0], fused_mask),
+                    "features/tactile_norm": masked_feature_norm_mean(packed[:, :, 1], fused_mask),
+                    "features/fused_norm": masked_feature_norm_mean(fused, fused_mask),
                     "temporal/valid_frame_ratio": fused_mask.detach().float().mean(),
                 }
             else:
-                point_history = torch.stack(point_frames, 1)
-                point_mask_history = torch.stack(point_masks, 1)
+                from gr00t.model.extension.temporal_fusion import (
+                    masked_feature_norm_mean,
+                    stack_padded_point_frames,
+                )
+
+                point_history, point_mask_history = stack_padded_point_frames(
+                    point_frames, point_masks
+                )
                 tactile_history = torch.stack(tactile_frames, 1)
                 fused, fused_mask = self.temporal_fusion(
                     point_history, tactile_history, state, valid, point_mask_history
                 )
                 self._temporal_feature_diagnostics = {
-                    "features/point_norm": point_history.detach().float().norm(dim=-1).mean(),
-                    "features/tactile_norm": tactile_history.detach().float().norm(dim=-1).mean(),
-                    "features/fused_norm": fused.detach().float().norm(dim=-1).mean(),
+                    "features/point_norm": masked_feature_norm_mean(
+                        point_history, point_mask_history & valid[..., None]
+                    ),
+                    "features/tactile_norm": masked_feature_norm_mean(tactile_history, valid),
+                    "features/fused_norm": masked_feature_norm_mean(fused, fused_mask),
                     "temporal/valid_frame_ratio": valid.detach().float().mean(),
                 }
             current_points = point_frames[-1]

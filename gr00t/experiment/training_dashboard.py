@@ -66,6 +66,8 @@ class TrainingDashboardCallback(TrainerCallback):
         "action/valid_timestep_ratio": "Valid Timesteps",
     }
     TRAINING = {
+        "samples_seen": "Samples Seen",
+        "effective_epoch": "Effective Epoch",
         "learning_rate": "Learning Rate",
         "clip_limit": "Gradient Clip",
         "precision": "Precision",
@@ -231,6 +233,10 @@ class TrainingDashboardCallback(TrainerCallback):
         for key, label in labels.items():
             value = self._metrics.get(key)
             text = value if isinstance(value, str) else self._format(value)
+            if key == "samples_seen" and isinstance(value, (int, float)):
+                text = f"{int(value):,}"
+            elif key == "effective_epoch" and isinstance(value, (int, float)):
+                text = f"{value:.2f}"
             if key.startswith("grad_norm/") and self._metrics.get(
                 f"grad_status/{key.split('/')[-1]}/frozen"
             ):
@@ -276,6 +282,8 @@ class TrainingDashboardCallback(TrainerCallback):
                 essential = {
                     "loss/total": "LOSS Total",
                     "loss/action": "Action",
+                    "samples_seen": "Samples Seen",
+                    "effective_epoch": "Effective Epoch",
                     "loss/contact_weighted": "Contact",
                     "loss/zero_prediction_mse": "Zero baseline",
                     "grad_norm/pre_clip": "GRAD Pre",
@@ -369,9 +377,11 @@ class TrainingDashboardCallback(TrainerCallback):
         else:
             elapsed = max(time.monotonic() - self._started, 0.001)
             completed = max(state.global_step - self._initial_step, 0)
-            remaining = max(int(state.max_steps) - state.global_step, 0)
+            max_steps = int(getattr(state, "max_steps", state.global_step))
+            remaining = max(max_steps - state.global_step, 0)
             eta = elapsed * remaining / completed if completed else None
             fields = (
+                ("loss", "loss"),
                 ("action", "loss/action"),
                 ("total", "loss/total"),
                 ("lr", "learning_rate"),
@@ -386,8 +396,13 @@ class TrainingDashboardCallback(TrainerCallback):
             )
             if summary:
                 eta_text = f"{eta:.0f}s" if eta is not None else "?"
+                exposure = ""
+                if logs.get("samples_seen") is not None:
+                    exposure += f" Samples Seen: {int(logs['samples_seen']):,}"
+                if logs.get("effective_epoch") is not None:
+                    exposure += f" Effective Epoch: {logs['effective_epoch']:.2f}"
                 print(
-                    f"Step {state.global_step}/{state.max_steps} ETA {eta_text} {summary}",
+                    f"Step {state.global_step}/{max_steps}{exposure} ETA {eta_text} {summary}",
                     flush=True,
                 )
         return control

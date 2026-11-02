@@ -43,6 +43,7 @@ from transformers.trainer import TRAINER_STATE_NAME, Trainer, TrainerState, get_
 from transformers.trainer_callback import TrainerCallback
 
 from gr00t.experiment.checkpoint_memory import monitor_checkpoint_memory
+from gr00t.experiment.sample_exposure import SampleExposure
 from gr00t.experiment.training_memory import log_deepspeed_engine_state, log_memory_snapshot
 
 
@@ -232,6 +233,7 @@ class Gr00tTrainer(Trainer):
         diagnostics_level = kwargs.pop("multimodal_diagnostics_level", "basic")
         self.multimodal_diagnostics_interval = kwargs.pop("multimodal_diagnostics_interval", 50)
         super().__init__(*args, **kwargs)
+        self.sample_exposure = SampleExposure(self.train_dataset, self.args)
         if self.is_deepspeed_enabled:
             # Transformers leaves Accelerator's plugin at its default 1 while its
             # TrainingArguments and the finalized DeepSpeed config use the requested
@@ -626,6 +628,10 @@ class Gr00tTrainer(Trainer):
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         logs = dict(logs)
+        if self.is_in_train:
+            # Plain keys are namespaced once by HF's existing W&B callback.
+            # TrainerState.global_step is restored before resumed logging.
+            logs.update(self.sample_exposure.metrics(self.state.global_step))
         if "loss" in logs and self._forward_diagnostics_count:
             from gr00t.experiment.action_diagnostics import loss_ratios
 
@@ -777,6 +783,12 @@ class Gr00tTrainer(Trainer):
             self.state = TrainerState.load_from_json(
                 os.path.join(latest_checkpoint, TRAINER_STATE_NAME)
             )
+
+        self.sample_exposure.prepare(
+            self.args.output_dir,
+            latest_checkpoint,
+            rank_zero=self.is_world_process_zero(),
+        )
 
         try:
             return super().train(resume_from_checkpoint=latest_checkpoint, **kwargs)

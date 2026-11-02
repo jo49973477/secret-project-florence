@@ -625,6 +625,7 @@ def run(config: Config):
         global_batch_size=config.training.global_batch_size,
         learning_rate=config.training.learning_rate,
         deepspeed_stage=config.training.deepspeed_stage if deepspeed_config is not None else None,
+        sample_exposure=trainer.sample_exposure,
     )
     notification_callbacks: list[TrainingNotificationCallback] = []
     if telegram_notifier is not None:
@@ -652,6 +653,7 @@ def run(config: Config):
                 # HF fires on_train_end before the explicit final save below.
                 defer_finish_until_final_save=True,
                 failure_delivery_marker=os.environ.get("GR00T_FAILURE_NOTIFICATION_MARKER"),
+                provider="discord",
             )
         )
     for notification_callback in notification_callbacks:
@@ -732,9 +734,12 @@ def run(config: Config):
                 "scripts/export_zero3_checkpoint.py for an inference model.",
                 final_checkpoint,
             )
+            final_artifact = final_checkpoint
         else:
             trainer.save_model()
             logging.info(f"Model saved to {output_dir}")
+            final_step_checkpoint = output_dir / f"checkpoint-{trainer.state.global_step}"
+            final_artifact = final_step_checkpoint if final_step_checkpoint.is_dir() else None
 
         if config.training.assert_loss_less_than is not None:
             final_loss = trainer.loss
@@ -749,7 +754,11 @@ def run(config: Config):
             eval_dataset.close()
 
         for notification_callback in notification_callbacks:
-            notification_callback.notify_finish(args=trainer.args, state=trainer.state)
+            notification_callback.notify_finish(
+                args=trainer.args,
+                state=trainer.state,
+                final_checkpoint=str(final_artifact) if final_artifact is not None else None,
+            )
     except Exception as exc:
         if zero3_debug:
             try:

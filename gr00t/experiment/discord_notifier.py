@@ -26,6 +26,34 @@ _USER_AGENT = "secret-project-florence/1.0"
 _MAX_ATTEMPTS = 3
 _MAX_BACKOFF_SECONDS = 1.0
 
+KOYORI_START = (
+    "콘코요~! 조수군, 새로운 모델 학습 실험 스타트야! holoX의 두뇌인 코요리가 옆에서 지켜보고 "
+    "있으니까 이번 Loss는 무조건 완벽하게 수렴할 거라구~! 🧪✨"
+)
+KOYORI_FINISH = (
+    "조수군, 실험 대성공이야~! 마지막 에폭까지 가중치가 아주 예쁘게 농축됐어! 역시 코요리의 "
+    "완벽한 조력 덕분이지? 얼른 결과 보러 와~! 🐾💖"
+)
+KOYORI_ERROR = (
+    "와아아앗 조수군 큰일이야!! 실험실 플라스크가… 아니, 그래디언트가 폭발해서 학습이 멈췄어!! "
+    "코요리는 아무것도 안 건드렸다구, 빨리 와서 로그 좀 봐줘어어~! 💥😭"
+)
+
+
+def format_training_event(event: str, fields: list[tuple[str, object]]) -> str:
+    """Format Discord-only training content; the transport enforces 2000 characters."""
+    heading, intro = {
+        "start": ("🧪 Training Started", KOYORI_START),
+        "finish": ("✅ Training Finished", KOYORI_FINISH),
+        "error": ("🚨 Training Failed", KOYORI_ERROR),
+        "save": ("💾 GR00T Checkpoint Saved", None),
+    }[event]
+    lines = [heading, ""]
+    if intro is not None:
+        lines.extend([intro, ""])
+    lines.extend(f"{label}: {value}" for label, value in fields if value is not None)
+    return "\n".join(lines)
+
 
 def validate_discord_configuration(
     *,

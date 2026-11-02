@@ -160,7 +160,14 @@ def test_rank_noise_file_preserved_and_nontty_no_escape(monkeypatch):
     dashboard = TrainingDashboardCallback(True)
     args, state = SimpleNamespace(process_index=0), SimpleNamespace(global_step=16, max_steps=20)
     dashboard.on_train_begin(args, state, None)
-    dashboard.on_log(args, state, None, logs={"loss/total": 1.2})
+    dashboard.on_log(
+        args,
+        state,
+        None,
+        logs={"loss/total": 1.2, "samples_seen": 32000, "effective_epoch": 711.1111},
+    )
     dashboard.on_train_end(args, state, None)
     assert "Step 16" in console.getvalue()
+    assert "Samples Seen: 32,000" in console.getvalue()
+    assert "Effective Epoch: 711.11" in console.getvalue()
     assert not re.search(r"\x1b\[", console.getvalue())
