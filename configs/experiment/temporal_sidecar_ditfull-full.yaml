@@ -1,0 +1,10 @@
+# @package _global_
+defaults:
+- temporal_sidecar_ditlora-full
+- _self_
+name: temporal_sidecar_ditfull-full
+dit_training:
+  mode: full
+model:
+  tune_diffusion_model: true
+  freeze_pretrained_dit: false
