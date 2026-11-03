@@ -194,6 +194,7 @@ def write_snapshots(
         "temporal_sidecar_ditfull-overfit5",
         "moe_sidecar_ditfrozen-overfit5",
         "moe_sidecar_ditlora-overfit5",
+        "moe_sidecar_ditfull-overfit5",
     }:
         audit = json.loads(florence_audit.read_text()) if florence_audit else {}
         metadata.update(
@@ -279,6 +280,7 @@ def launch(cfg: DictConfig) -> int:
         "temporal_sidecar_ditfull-overfit5",
         "moe_sidecar_ditfrozen-overfit5",
         "moe_sidecar_ditlora-overfit5",
+        "moe_sidecar_ditfull-overfit5",
     }
     florence_report_path = None
     if cfg.name in florence_names:
