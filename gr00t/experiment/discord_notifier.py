@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Small, dependency-free Discord webhook client and connectivity test."""
+"""Deprecated non-Hydra Discord transport; Hydra notifications use trainctl."""
 
 from __future__ import annotations
 

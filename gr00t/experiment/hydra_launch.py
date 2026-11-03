@@ -14,6 +14,7 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 from gr00t.configs.hydra_config import build_gr00t_config, preflight
+from gr00t.experiment.trainctl_launch import LogRelay, check_trainctl, trainctl_run
 from gr00t.utils.sensor_dependency_preflight import check_sensor_dependencies
 
 
@@ -270,6 +271,10 @@ def launch(cfg: DictConfig) -> int:
         return 0
     if "RANK" in os.environ:
         raise ValueError("Run train_hydra.py once as the parent; it launches Torchrun itself")
+    if cfg.trainctl.enabled:
+        check_trainctl()
+        if os.environ.get("TRAINCTL_RUN_ID"):
+            raise ValueError("Launch Hydra directly, outside trainctl, to avoid nested supervisors")
     check_sensor_dependencies(config.model)
     validate_dataset_inputs(cfg)
     checkpoint = resolve_resume(cfg, config)
@@ -347,22 +352,19 @@ def launch(cfg: DictConfig) -> int:
         GR00T_TRAIN_LOG=str(output / "logs/train.log"),
     )
     command = worker_command(cfg, path)
-    # Reuse the notification supervisor for abrupt failures outside Trainer callbacks.
-    command = [
-        sys.executable,
-        "-m",
-        "gr00t.experiment.torchrun_supervisor",
-        "--marker",
-        str(output / ".gr00t-failure-notification-delivered"),
-        "--",
-        *command,
-    ]
-    if config.training.discord_on:
-        env["GR00T_SUPERVISOR_NOTIFY"] = "1"
     # A separate process group allows forwarding termination to supervisor, Torchrun and ranks.
-    with (output / "logs/train.log").open("a", buffering=1) as log:
+    with (
+        trainctl_run(cfg, output, command, env) as invocation,
+        (output / "logs/train.log").open("a", buffering=1) as log,
+    ):
+        command, env = invocation
+        relay = None
         master = slave = None
-        interactive = sys.stdout.isatty() and config.training.enable_training_dashboard is not False
+        interactive = (
+            not cfg.trainctl.enabled
+            and sys.stdout.isatty()
+            and config.training.enable_training_dashboard is not False
+        )
         if interactive:
             import pty
 
@@ -379,6 +381,10 @@ def launch(cfg: DictConfig) -> int:
             text=True,
             start_new_session=True,
         )
+
+        if cfg.trainctl.enabled:
+            relay = LogRelay(env["TRAINCTL_LOG_DIR"], log)
+            relay.start()
 
         if slave is not None:
             os.close(slave)
@@ -430,4 +436,6 @@ def launch(cfg: DictConfig) -> int:
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGTERM)
                 process.wait()
+            if relay is not None:
+                relay.close()
     return code if code >= 0 else 128 - code

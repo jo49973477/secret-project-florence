@@ -1,5 +1,6 @@
 # @package _global_
 defaults:
+- /trainctl: default
 - /model: gr00t_base
 - /data: univtac_rgb
 - /training: finetune

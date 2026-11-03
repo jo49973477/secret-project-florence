@@ -1,0 +1,3 @@
+enabled: true
+message_mode: koyori
+notify_checkpoints: true

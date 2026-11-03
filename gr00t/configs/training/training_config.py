@@ -130,7 +130,8 @@ class TrainingConfig:
     wandb_group: str | None = None
     wandb_name: str | None = None
 
-    # Telegram notifications. The bot token is intentionally never part of config.
+    # Deprecated legacy notifications (non-Hydra entrypoints only).
+    # Hydra uses the top-level trainctl configuration and ignores these flags.
     telegram_on: bool = False
     telegram_chat_id: str | None = None
     telegram_notify_start: bool = True

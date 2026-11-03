@@ -141,6 +141,8 @@ def main(argv: list[str] | None = None) -> int:
         code = 130
     if (
         code
+        and os.environ.get("GR00T_TRAINCTL_ACTIVE") != "1"
+        and not os.environ.get("TRAINCTL_RUN_ID")
         and os.environ.get("GR00T_SUPERVISOR_NOTIFY") == "1"
         and os.environ.get("DISCORD_WEBHOOK_URL")
     ):

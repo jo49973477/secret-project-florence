@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Provider-neutral training notification callback and message formatting."""
+"""Deprecated non-Hydra notifications; Hydra uses the trainctl SDK callback."""
 
 from __future__ import annotations
 

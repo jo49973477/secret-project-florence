@@ -77,6 +77,7 @@ def test_subset_assertion(tmp_path):
 
 def test_launcher_freezes_config_and_propagates_failure(tmp_path, monkeypatch):
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr(hydra_launch, "check_trainctl", lambda: None)
     cfg = config(tmp_path / "run")
     path = tmp_path / "dataset"
     dataset(path, [0, 1, 2, 3, 4])
@@ -152,3 +153,33 @@ def test_prepare_preserves_source_and_selects_five(tmp_path, monkeypatch):
     assert "--dataset-path" in calls[0]
     assert str(target) in calls[0]
     assert json.loads((target / "meta/info.json").read_text())["total_frames"] == 50
+
+
+def test_dry_run_skips_trainctl_and_worker_launch(tmp_path, monkeypatch):
+    cfg = config(tmp_path / "dry-run")
+    cfg.dry_run = True
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("dry run must not invoke supervisor or worker")
+
+    monkeypatch.setattr(hydra_launch, "check_trainctl", forbidden)
+    monkeypatch.setattr(hydra_launch.subprocess, "Popen", forbidden)
+    assert hydra_launch.launch(cfg) == 0
+    assert not (tmp_path / "dry-run").exists()
+
+
+def test_dependency_error_precedes_preflight_and_snapshot(tmp_path, monkeypatch):
+    cfg = config(tmp_path / "run")
+
+    def missing():
+        raise RuntimeError("trainctl missing; uv sync --locked")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("dependency error must occur before GPU/model preflight")
+
+    monkeypatch.setattr(hydra_launch, "check_trainctl", missing)
+    monkeypatch.setattr(hydra_launch, "check_sensor_dependencies", forbidden)
+    monkeypatch.setattr(hydra_launch, "write_snapshots", forbidden)
+    with pytest.raises(RuntimeError, match="uv sync --locked"):
+        hydra_launch.launch(cfg)
+    assert not (tmp_path / "run").exists()

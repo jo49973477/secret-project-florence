@@ -1,5 +1,6 @@
 # @package _global_
 defaults:
+- /trainctl: default
 - /model: gr00t_sidecar
 - /data: univtac_multimodal
 - /training: overfit_5eps

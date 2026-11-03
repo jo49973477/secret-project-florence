@@ -21,6 +21,8 @@ dependencies = [
     "peft==0.17.1",
     "termcolor==3.2.0",
     "rich>=13.9",
+    "trainctl[discord,nvml,telegram]==0.2.0",
+    "tomli-w>=1.2,<2",
     "torch==2.9.0",
     "torchvision==0.24.0",
     "transformers==4.57.3",
