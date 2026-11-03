@@ -14,10 +14,10 @@ LAUNCHER = ROOT / "scripts" / "train_florence_ablations.sh"
 @pytest.mark.parametrize(
     "mode,config",
     [
-        ("A", "temporal_sidecar_ditlora-overfit5"),
-        ("B", "moe_sidecar_ditlora-overfit5"),
-        ("C", "temporal_sidecar_ditfull-overfit5"),
-        ("D", "moe_sidecar_ditfull-overfit5"),
+        ("A", "temporal_sidecar_ditlora-full"),
+        ("B", "moe_sidecar_ditlora-full"),
+        ("C", "temporal_sidecar_ditfull-full"),
+        ("D", "moe_sidecar_ditfull-full"),
     ],
 )
 def test_launcher_selects_correct_config_without_training(tmp_path, mode, config):
