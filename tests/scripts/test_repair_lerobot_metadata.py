@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from scripts.repair_lerobot_metadata import repair_dataset
+from scripts.data.repair_lerobot_metadata import repair_dataset
 
 
 def _write_json(path: Path, payload: dict) -> None:

@@ -14,10 +14,10 @@ import hydra
 from omegaconf import DictConfig
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
-@hydra.main(version_base="1.3", config_path="../configs", config_name="experiment/univtac_full")
+@hydra.main(version_base="1.3", config_path="../../configs", config_name="experiment/univtac_full")
 def main(cfg: DictConfig):
     from gr00t.configs.hydra_config import build_gr00t_config, inherit_checkpoint_architecture
     from gr00t.experiment.experiment import _init_distributed_process_group

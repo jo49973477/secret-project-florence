@@ -137,7 +137,7 @@ Do not downgrade Torch to cu126, upgrade CUDA, or rebuild FlashAttention simply
 because this package suffix differs.
 
 Once imports pass, an authorized GPU validation should exercise the existing
-`scripts/diagnose_concerto_precision.py` and sensor smoke tests on the target GPU,
+`scripts/diagnostics/diagnose_concerto_precision.py` and sensor smoke tests on the target GPU,
 including backward propagation in the real training configuration. This remains
 necessary to validate FP16 sparse kernels and the deployed driver/runtime pair.
 The preflight deliberately does not run those GPU operations or load the 3B model.

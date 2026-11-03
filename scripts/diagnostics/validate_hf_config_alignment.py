@@ -17,10 +17,10 @@
 
 Usage:
     # Internal consistency checks only (no HF download required):
-    uv run python scripts/validate_hf_config_alignment.py
+    uv run python scripts/diagnostics/validate_hf_config_alignment.py
 
     # Full check with HF configs (requires auth + local dirs):
-    uv run python scripts/validate_hf_config_alignment.py --hf-config-dir /tmp/hf_configs
+    uv run python scripts/diagnostics/validate_hf_config_alignment.py --hf-config-dir /tmp/hf_configs
 """
 
 import argparse
@@ -32,7 +32,7 @@ import re
 import sys
 
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 PASS = "\033[92m✓ PASS\033[0m"
 FAIL = "\033[91m✗ FAIL\033[0m"
@@ -980,7 +980,7 @@ def main():
         print("  uv run huggingface-cli login")
         print("  # Then download configs for each model (see checklist)")
         print(
-            "  uv run python scripts/validate_hf_config_alignment.py --hf-config-dir /tmp/hf_configs"
+            "  uv run python scripts/diagnostics/validate_hf_config_alignment.py --hf-config-dir /tmp/hf_configs"
         )
         print("=" * 70)
 

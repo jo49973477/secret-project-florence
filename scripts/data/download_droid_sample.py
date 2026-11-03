@@ -27,8 +27,8 @@ Prerequisites:
     uv pip install jsonlines    # if not already installed
 
 Usage:
-    python scripts/download_droid_sample.py
-    python scripts/download_droid_sample.py --num-episodes 5 --output-dir demo_data/droid_sample
+    python scripts/data/download_droid_sample.py
+    python scripts/data/download_droid_sample.py --num-episodes 5 --output-dir demo_data/droid_sample
 
 After running, test with:
     uv run python scripts/deployment/standalone_inference_script.py \\

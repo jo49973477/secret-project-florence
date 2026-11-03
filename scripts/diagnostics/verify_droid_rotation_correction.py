@@ -21,8 +21,8 @@ DROID_EEF_ROTATION_CORRECT) and compares against the pretrained model's
 normalization statistics to determine which convention matches.
 
 Usage:
-  python scripts/verify_droid_rotation_correction.py
-  python scripts/verify_droid_rotation_correction.py --dataset-path demo_data/droid_sample
+  python scripts/diagnostics/verify_droid_rotation_correction.py
+  python scripts/diagnostics/verify_droid_rotation_correction.py --dataset-path demo_data/droid_sample
 """
 
 from __future__ import annotations
