@@ -1,0 +1,10 @@
+# @package _global_
+defaults:
+- florence_full_base
+- override /data: univtac_temporal5
+- _self_
+name: temporal_sidecar_ditlora-full
+temporal:
+  window_size: 5
+dit_training:
+  mode: lora

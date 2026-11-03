@@ -1,6 +1,6 @@
 # Florence Sidecar ablation suite
 
-All five experiments use `experiment/sidecar-ablation-suite`, the same UniVTAC five-episode subset, action normalization, action masks, and masked flow-matching objective. The Hydra configuration is saved under each run's `.hydra/config.yaml`; `output_dir` includes the run timestamp. No long jobs are launched by setup or preflight.
+Primary launcher modes **A-D use the full UniVTAC LeRobot dataset** selected by `FLORENCE_DATASET`, with no five-episode filtering. They use the same action normalization, masks, and masked flow-matching objective. The original six five-episode overfit presets remain available for diagnostics. Each run saves its Hydra configuration in `.hydra/config.yaml`; `output_dir` includes the run timestamp. Setup and `dry_run=true` do not launch long jobs.
 
 ## Architectures
 
@@ -36,15 +36,18 @@ flowchart LR
     D --> F[Masked action flow loss]
 ```
 
-The two injection sites are independent. MoE acts on action embeddings before the DiT. Point Sidecar acts between selected original transformer blocks. The legacy contact surprise predictor and its Smooth L1 loss are disabled in all five configurations. No unvalidated surprise expert is instantiated by the selected MoE mode.
+The two injection sites are independent. MoE acts on action embeddings before the DiT. Point Sidecar acts between selected original transformer blocks. The legacy contact surprise predictor and its Smooth L1 loss are disabled in all full-dataset and overfit configurations. No unvalidated surprise expert is instantiated by the selected MoE mode.
 
-| Hydra experiment | Launcher mode | Architecture | DiT mode |
+| Full-dataset experiment | Launcher | Architecture | DiT mode |
 |---|---|---|---|
-| `temporal_sidecar_ditfrozen-overfit5` | `temporal_frozen` | Temporal + Sidecar | frozen |
-| `temporal_sidecar_ditlora-overfit5` | `temporal_lora` | Temporal + Sidecar | LoRA |
-| `temporal_sidecar_ditfull-overfit5` | `temporal_full` | Temporal + Sidecar | full |
-| `moe_sidecar_ditfrozen-overfit5` | `sidecar_moe_frozen` | Input MoE + Sidecar | frozen |
-| `moe_sidecar_ditlora-overfit5` | `sidecar_moe_lora` | Input MoE + Sidecar | LoRA |
+| `temporal_sidecar_ditlora-full` | **A** | Temporal + Sidecar | LoRA |
+| `moe_sidecar_ditlora-full` | **B** | Input MoE + Sidecar | LoRA |
+| `temporal_sidecar_ditfull-full` | **C** | Temporal + Sidecar | full |
+| `moe_sidecar_ditfull-full` | **D** | Input MoE + Sidecar | full |
+
+The full-dataset base composes `/training: finetune` (10,000 steps by default, normal data augmentation, five-percent warmup, and `FLORENCE_DATASET`). It does **not** set `data.expected_episode_ids`. Temporal runs use five causal frames; MoE uses the current frame. Four modes share the same dataset root, batch, LR and checkpoint source, but temporal windows have different valid-sample counts near episode boundaries.
+
+The original five-episode controls remain separate: `temporal_frozen`, `sidecar_moe_frozen`, `overfit5_temporal_lora`, `overfit5_moe_lora`, `overfit5_temporal_full`, and `overfit5_moe_full`.
 
 Each architecture family shares one base configuration. Its variants change DiT trainability only. The full variant necessarily sets `tune_diffusion_model=true` and `freeze_pretrained_dit=false`; configuration validation rejects incompatible combinations. The VLM is frozen. Original DiT parameters use 1e-5 in full mode; new modules and LoRA use 1e-4. LoRA rank 16, alpha 32, dropout 0 is the default. Set `dit_training.rank=32` for a rank-32 run.
 
@@ -70,30 +73,41 @@ The hardware default is four RTX 3090 GPUs with DeepSpeed ZeRO-3 and BF16. The s
 
 GPU optimizer memory must be checked on the target server. For the observed frozen-mode 29,362,440 trainable action-head parameters, two FP32 Adam moments alone are about 224 MiB total, or about 56 MiB per GPU when evenly partitioned. Full tuning of the 1,091,722,240-parameter original DiT adds about 8.13 GiB of FP32 moments total, or about 2.03 GiB per GPU, before master parameters, gradients and activations. These are estimates, not a measured fit test. The full mode may need the explicit CPU-offload profile and a matching toolkit if it does not fit. Existing Rich terminal progress and noninteractive text/log-file fallback are retained. Detailed logs are saved under each output directory's `logs/`.
 
-W&B project is `Florence`, group is `sidecar-ablation-overfit5`, and visible run name is the experiment name plus a timestamp. The resolved Hydra configuration, commit, checkpoint revision, architecture settings, optimizer groups, trainable/frozen counts, and actual DiT verification result are recorded. `pretrained_dit_verified` is set only after the actual checkpoint check; the worker refreshes it after comparing the loaded training model. Available action, gradient, feature, temporal, MoE, throughput, and GPU-memory metrics are logged; absent modules do not get synthetic zero values.
+W&B project is `Florence`; group is `sidecar-ablation-full` for A-D and `sidecar-ablation-overfit5` for the legacy controls. The visible run name is the experiment name plus a timestamp. The resolved Hydra configuration, commit, checkpoint revision, architecture settings, optimizer groups, trainable/frozen counts, and actual DiT verification result are recorded. `pretrained_dit_verified` is set only after the actual checkpoint check; the worker refreshes it after comparing the loaded training model. Available action, gradient, feature, temporal, MoE, throughput, and GPU-memory metrics are logged; absent modules do not get synthetic zero values.
 
 Hydra stores the complete resolved config and overrides in `.hydra/`. Native Trainer and ZeRO checkpoint saving retain optimizer, scheduler, and RNG state. Change `training.save_steps=N` for save frequency. Resume with `resume.enabled=true resume.auto_find_latest=true output_dir=/path/to/existing/run`; the existing Hydra resume validator rejects architecture, learning-rate, and optimizer changes.
 
 ## Commands
 
 ```bash
-export FLORENCE_OVERFIT_DATASET=/absolute/path/to/UniVTAC_five_episode_subset
+export FLORENCE_DATASET=/absolute/path/to/full_UniVTAC_LeRobot_dataset
 # Optional for offline machines: exact official Concerto checkpoint.
 export FLORENCE_CONCERTO_CHECKPOINT=/absolute/path/to/concerto_small.pth
 
 # Safe configuration inspection; does not load weights or start a worker.
-bash scripts/train_florence_ablations.sh temporal_frozen dry_run=true
+bash scripts/train_florence_ablations.sh A dry_run=true
 
 # Actual checkpoint audit on a single CPU process.
 python scripts/verify_pretrained_dit.py --dit-type sidecar_conditioned_dit \
   --reference-checkpoint /absolute/path/to/GR00T-N1.7-3B --dtype bfloat16 --forward-parity
 
-# The following commands perform mandatory preflight, then start one training run each.
-bash scripts/train_florence_ablations.sh temporal_frozen hardware=quad_3090_zero3
-bash scripts/train_florence_ablations.sh temporal_lora hardware=quad_3090_zero3
-bash scripts/train_florence_ablations.sh temporal_full hardware=quad_3090_zero3
-bash scripts/train_florence_ablations.sh sidecar_moe_frozen hardware=quad_3090_zero3
-bash scripts/train_florence_ablations.sh sidecar_moe_lora hardware=quad_3090_zero3
+# A-D use the FULL dataset; run ONE experiment at a time.
+# All modes perform mandatory pretrained-DiT preflight before starting Torchrun.
+bash scripts/train_florence_ablations.sh A hardware=quad_3090_zero3  # Temporal + LoRA
+bash scripts/train_florence_ablations.sh B hardware=quad_3090_zero3  # MoE + LoRA
+bash scripts/train_florence_ablations.sh C hardware=quad_3090_zero3  # Temporal + Full
+bash scripts/train_florence_ablations.sh D hardware=quad_3090_zero3  # MoE + Full
+
+# Safe Hydra composition/validation only (does not load weights or start GPUs).
+bash scripts/train_florence_ablations.sh A dry_run=true
+bash scripts/train_florence_ablations.sh D dry_run=true
+
+# Optional five-episode debugging (requires a separately prepared subset).
+export FLORENCE_OVERFIT_DATASET=/absolute/path/to/UniVTAC_five_episode_subset
+bash scripts/train_florence_ablations.sh overfit5_temporal_lora
+bash scripts/train_florence_ablations.sh overfit5_moe_full
+bash scripts/train_florence_ablations.sh temporal_frozen
+bash scripts/train_florence_ablations.sh sidecar_moe_frozen
 
 # Ten-frame temporal variant (both the window and synchronized data offsets).
 bash scripts/train_florence_ablations.sh temporal_frozen \
@@ -106,4 +120,4 @@ python -m pytest tests/gr00t/model/test_florence_ablations.py \
 
 ## Known limits
 
-The real Action-DiT checkpoint and initial output checks do not establish that four-GPU ZeRO-3 training, resuming, or saving works. The runtime training-model comparison and optimizer audit have not yet been exercised on four GPUs. The 5-episode study can establish memorization behavior, not generalization. The streaming ring buffer needs explicit environment IDs, validity masks, and episode reset wiring from a deployment environment. The reference MoE branch includes an optional surprise predictor, but this suite disables it because no validated predictor bundle is available. No performance advantage is claimed before measured training and held-out evaluation.
+The real Action-DiT checkpoint and initial output checks do not establish that four-GPU ZeRO-3 training, resuming, or saving works. The runtime training-model comparison and optimizer audit have not yet been exercised on four GPUs. The optional 5-episode study can establish memorization behavior, not generalization; full-dataset training still needs held-out evaluation. The streaming ring buffer needs explicit environment IDs, validity masks, and episode reset wiring from a deployment environment. The reference MoE branch includes an optional surprise predictor, but this suite disables it because no validated predictor bundle is available. No performance advantage is claimed before measured training and held-out evaluation.
