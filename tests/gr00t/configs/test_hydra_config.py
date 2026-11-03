@@ -87,6 +87,7 @@ def test_overrides_hardware_and_rates(monkeypatch):
         "temporal_sidecar_ditfull-overfit5",
         "moe_sidecar_ditfrozen-overfit5",
         "moe_sidecar_ditlora-overfit5",
+        "moe_sidecar_ditfull-overfit5",
     ],
 )
 def test_florence_default_optimizer_uses_existing_zero3_profile(name, monkeypatch):
@@ -106,6 +107,39 @@ def test_florence_default_optimizer_uses_existing_zero3_profile(name, monkeypatc
         "pin_memory": False,
     }
     assert offloaded.training.accumulated_batch_size == default.training.accumulated_batch_size
+
+
+@pytest.mark.parametrize(
+    'name,family,dit_mode',
+    [
+        ("temporal_sidecar_ditlora-overfit5", "temporal", "lora"),
+        ("moe_sidecar_ditlora-overfit5", "moe", "lora"),
+        ("temporal_sidecar_ditfull-overfit5", "temporal", "full"),
+        ("moe_sidecar_ditfull-overfit5", "moe", "full"),
+    ],
+)
+def test_florence_2x2_experiment_modes(name, family, dit_mode):
+    cfg = composed(name)
+    result = build_gr00t_config(cfg)
+    assert cfg.name == name
+    assert result.model.dit_type == 'sidecar_conditioned_dit'
+    assert result.model.dit_training_mode == dit_mode
+    assert result.model.freeze_pretrained_dit == (dit_mode == 'lora')
+    assert result.model.tune_diffusion_model == (dit_mode == 'full')
+    assert result.model.tactile_fusion_mode == 'none'
+    assert result.model.contact_prediction_loss_weight == 0.0
+    assert result.model.use_point_conditioning
+    assert result.model.use_tactile_conditioning
+    if family == 'temporal':
+        assert result.model.temporal_window_size == 5
+        assert result.model.contact_input_mode == 'none'
+        assert result.data.modality_configs['new_embodiment']['pointcloud'].delta_indices == [
+            -4, -3, -2, -1, 0
+        ]
+    else:
+        assert result.model.temporal_window_size == 0
+        assert result.model.contact_input_mode == 'moe_soft'
+        assert result.data.modality_configs['new_embodiment']['pointcloud'].delta_indices == [0]
 
 
 @pytest.mark.parametrize(
