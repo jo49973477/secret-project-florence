@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Run one Florence experiment at a time. Hydra overrides pass through unchanged.
-# The four primary modes share the same overfit5 base and hardware defaults.
+# A-D use the full UniVTAC dataset (FLORENCE_DATASET); overfit5 remains opt-in.
 usage() {
   cat <<'EOF'
 Usage: bash scripts/train_florence_ablations.sh MODE [Hydra overrides...]
@@ -12,7 +12,9 @@ Usage: bash scripts/train_florence_ablations.sh MODE [Hydra overrides...]
   C / temporal_full      Temporal + DiT Full
   D / sidecar_moe_full   Contact MoE + DiT Full
 
-Additional frozen-DiT controls: temporal_frozen, sidecar_moe_frozen
+Five-episode debug modes: overfit5_temporal_lora, overfit5_moe_lora,
+  overfit5_temporal_full, overfit5_moe_full
+Frozen-DiT debug controls: temporal_frozen, sidecar_moe_frozen
 
 Examples:
   bash scripts/train_florence_ablations.sh A dry_run=true
@@ -20,7 +22,8 @@ Examples:
   bash scripts/train_florence_ablations.sh C hardware=dual_3090_zero3
   bash scripts/train_florence_ablations.sh D training.max_steps=10000
 
-Set FLORENCE_OVERFIT_DATASET to the prepared five-episode LeRobot subset.
+Set FLORENCE_DATASET to the full UniVTAC LeRobot dataset for A-D.
+For overfit5_* modes, set FLORENCE_OVERFIT_DATASET instead.
 Set FLORENCE_CONCERTO_CHECKPOINT if the point encoder needs a local checkpoint.
 EOF
 }
@@ -28,10 +31,14 @@ EOF
 mode="${1:-}"
 case "$mode" in
   -h|--help|help) usage; exit 0 ;;
-  A|a|temporal_lora) config=temporal_sidecar_ditlora-overfit5 ;;
-  B|b|sidecar_moe_lora) config=moe_sidecar_ditlora-overfit5 ;;
-  C|c|temporal_full) config=temporal_sidecar_ditfull-overfit5 ;;
-  D|d|sidecar_moe_full) config=moe_sidecar_ditfull-overfit5 ;;
+  A|a|temporal_lora) config=temporal_sidecar_ditlora-full ;;
+  B|b|sidecar_moe_lora) config=moe_sidecar_ditlora-full ;;
+  C|c|temporal_full) config=temporal_sidecar_ditfull-full ;;
+  D|d|sidecar_moe_full) config=moe_sidecar_ditfull-full ;;
+  overfit5_temporal_lora) config=temporal_sidecar_ditlora-overfit5 ;;
+  overfit5_moe_lora) config=moe_sidecar_ditlora-overfit5 ;;
+  overfit5_temporal_full) config=temporal_sidecar_ditfull-overfit5 ;;
+  overfit5_moe_full) config=moe_sidecar_ditfull-overfit5 ;;
   temporal_frozen) config=temporal_sidecar_ditfrozen-overfit5 ;;
   sidecar_moe_frozen) config=moe_sidecar_ditfrozen-overfit5 ;;
   *)
