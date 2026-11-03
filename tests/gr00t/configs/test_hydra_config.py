@@ -88,6 +88,10 @@ def test_overrides_hardware_and_rates(monkeypatch):
         "moe_sidecar_ditfrozen-overfit5",
         "moe_sidecar_ditlora-overfit5",
         "moe_sidecar_ditfull-overfit5",
+        "temporal_sidecar_ditlora-full",
+        "moe_sidecar_ditlora-full",
+        "temporal_sidecar_ditfull-full",
+        "moe_sidecar_ditfull-full",
     ],
 )
 def test_florence_default_optimizer_uses_existing_zero3_profile(name, monkeypatch):
@@ -110,37 +114,41 @@ def test_florence_default_optimizer_uses_existing_zero3_profile(name, monkeypatc
 
 
 @pytest.mark.parametrize(
-    'name,family,dit_mode',
+    "name,family,dit_mode",
     [
-        ("temporal_sidecar_ditlora-overfit5", "temporal", "lora"),
-        ("moe_sidecar_ditlora-overfit5", "moe", "lora"),
-        ("temporal_sidecar_ditfull-overfit5", "temporal", "full"),
-        ("moe_sidecar_ditfull-overfit5", "moe", "full"),
+        ("temporal_sidecar_ditlora-full", "temporal", "lora"),
+        ("moe_sidecar_ditlora-full", "moe", "lora"),
+        ("temporal_sidecar_ditfull-full", "temporal", "full"),
+        ("moe_sidecar_ditfull-full", "moe", "full"),
     ],
 )
-def test_florence_2x2_experiment_modes(name, family, dit_mode):
+def test_florence_2x2_full_dataset_experiment_modes(name, family, dit_mode, monkeypatch):
+    monkeypatch.setenv("FLORENCE_DATASET", "/test/full_univtac")
     cfg = composed(name)
     result = build_gr00t_config(cfg)
     assert cfg.name == name
-    assert result.model.dit_type == 'sidecar_conditioned_dit'
+    assert cfg.data.get("expected_episode_ids") is None
+    assert result.data.datasets[0].dataset_paths == ["/test/full_univtac"]
+    assert result.training.max_steps == 10000
+    assert result.training.warmup_ratio == 0.05
+    assert result.model.dit_type == "sidecar_conditioned_dit"
     assert result.model.dit_training_mode == dit_mode
-    assert result.model.freeze_pretrained_dit == (dit_mode == 'lora')
-    assert result.model.tune_diffusion_model == (dit_mode == 'full')
-    assert result.model.tactile_fusion_mode == 'none'
+    assert result.model.freeze_pretrained_dit == (dit_mode == "lora")
+    assert result.model.tune_diffusion_model == (dit_mode == "full")
+    assert result.model.tactile_fusion_mode == "none"
     assert result.model.contact_prediction_loss_weight == 0.0
     assert result.model.use_point_conditioning
     assert result.model.use_tactile_conditioning
-    if family == 'temporal':
+    if family == "temporal":
         assert result.model.temporal_window_size == 5
-        assert result.model.contact_input_mode == 'none'
-        assert result.data.modality_configs['new_embodiment']['pointcloud'].delta_indices == [
+        assert result.model.contact_input_mode == "none"
+        assert result.data.modality_configs["new_embodiment"]["pointcloud"].delta_indices == [
             -4, -3, -2, -1, 0
         ]
     else:
         assert result.model.temporal_window_size == 0
-        assert result.model.contact_input_mode == 'moe_soft'
-        assert result.data.modality_configs['new_embodiment']['pointcloud'].delta_indices == [0]
-
+        assert result.model.contact_input_mode == "moe_soft"
+        assert result.data.modality_configs["new_embodiment"]["pointcloud"].delta_indices == [0]
 
 @pytest.mark.parametrize(
     "key,value,message",
