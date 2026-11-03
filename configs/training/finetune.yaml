@@ -21,7 +21,7 @@ eval_strategy: 'no'
 eval_steps: 500
 eval_batch_size: 2
 use_wandb: true
-wandb_project: "florence-univtac"
+wandb_project: "wah-univtac"
 telegram_on: false
 telegram_chat_id: null
 telegram_notify_start: true
