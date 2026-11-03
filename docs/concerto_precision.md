@@ -76,17 +76,17 @@ The CUDA tests use real `spconv.SubMConv3d` with BF16 parameter storage and chec
 kernel feature/weight/fused-bias/output types in both trainable and frozen modes.
 Scoped test/diagnostic spies observe kernel calls; they never alter dtype maps.
 
-`scripts/diagnose_concerto_precision.py` prints installed mappings without
+`scripts/diagnostics/diagnose_concerto_precision.py` prints installed mappings without
 loading a model when called without point data. With a local official Concerto
 Small checkpoint and a real `[N, 6]` UniVTAC XYZRGB `.npy` scene, it can run two
 steps with BF16 storage and finite output/gradient checks:
 
 ```bash
-GROOT_DEBUG_CONCERTO_PRECISION=1 .venv/bin/python scripts/diagnose_concerto_precision.py \
+GROOT_DEBUG_CONCERTO_PRECISION=1 .venv/bin/python scripts/diagnostics/diagnose_concerto_precision.py \
   --points-npy /path/to/scene.npy --checkpoint-path /path/to/concerto_small.pth --steps 2
 
 GROOT_DEBUG_CONCERTO_PRECISION=1 .venv/bin/python -m torch.distributed.run \
-  --standalone --nproc-per-node=2 scripts/diagnose_concerto_precision.py \
+  --standalone --nproc-per-node=2 scripts/diagnostics/diagnose_concerto_precision.py \
   --points-npy /path/to/scene.npy --checkpoint-path /path/to/concerto_small.pth \
   --steps 2 --zero3
 ```

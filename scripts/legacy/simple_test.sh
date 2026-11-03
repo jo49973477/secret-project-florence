@@ -2,8 +2,10 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+cd "${REPO_ROOT}"
 # shellcheck source=scripts/lib/checkpoint_resume.sh
-source "${SCRIPT_DIR}/lib/checkpoint_resume.sh"
+source "${REPO_ROOT}/scripts/lib/checkpoint_resume.sh"
 
 BASE_MODEL="${BASE_MODEL:-nvidia/GR00T-N1.7-3B}"
 DATASET_PATH="${DATASET_PATH:-/home/yeongyoo/03_Dataset/07_UnivTac/univtac_gr00t}"

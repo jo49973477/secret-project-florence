@@ -29,8 +29,8 @@ Prerequisites:
     pip install huggingface_hub jsonlines pyarrow
 
 Usage:
-    python scripts/download_simplerenv_sample.py
-    python scripts/download_simplerenv_sample.py --num-episodes 3
+    python scripts/data/download_simplerenv_sample.py
+    python scripts/data/download_simplerenv_sample.py --num-episodes 3
 """
 
 from __future__ import annotations
@@ -256,7 +256,7 @@ def main():
     )
     args = parser.parse_args()
 
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parents[2]
 
     for dataset_key in args.datasets:
         download_sample(dataset_key, args.num_episodes, repo_root)

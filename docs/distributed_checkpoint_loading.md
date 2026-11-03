@@ -215,7 +215,7 @@ to deliberately reproduce a watchdog timeout. Do not set
 that also reenables the earlier external VLM load. Compare traces with:
 
 ```bash
-.venv/bin/python scripts/summarize_model_load.py /tmp/gr00t-load-candidate \
+.venv/bin/python scripts/diagnostics/summarize_model_load.py /tmp/gr00t-load-candidate \
   --baseline /tmp/gr00t-load-baseline
 ```
 
@@ -242,7 +242,7 @@ NO_ALBUMENTATIONS_UPDATE=1 PYTHONPATH=. .venv/bin/python -m pytest \
   tests/gr00t/utils/test_run_or_wait_on_rank0.py -q
 
 NO_ALBUMENTATIONS_UPDATE=1 PYTHONPATH=. .venv/bin/python \
-  scripts/benchmark_checkpoint_io.py --size-mib 32
+  scripts/diagnostics/benchmark_checkpoint_io.py --size-mib 32
 ```
 
 The four-rank test uses **CPU/Gloo**, real serialized tiny checkpoint reads,
@@ -276,7 +276,7 @@ model factory without creating datasets, Trainer, an optimizer, or an engine:
 GROOT_DEBUG_MODEL_LOAD_IO=1 GROOT_MODEL_LOAD_TRACE_DIR=/tmp/load-smoke-trace \
 GROOT_SMOKE_VERIFY_DIT=1 GROOT_PATCH_MISTRAL=1 GROOT_SKIP_HF_MODEL_WEIGHTS=0 \
 NO_ALBUMENTATIONS_UPDATE=1 PYTHONPATH=. .venv/bin/python -m torch.distributed.run \
-  --standalone --nproc-per-node=4 scripts/smoke_distributed_model_loading.py \
+  --standalone --nproc-per-node=4 scripts/diagnostics/smoke_distributed_model_loading.py \
   model=gr00t_sidecar hardware=quad_3090_zero3 \
   model.base_model_path=/path/to/GR00T-N1.7-3B \
   model.point_encoder_checkpoint_path=/path/to/concerto_small.pth \
@@ -392,6 +392,6 @@ an actual NCCL timeout reproduction.
 - `gr00t/model/extension/point_encoder.py`: mapped official checkpoint read, preserving construction/precision.
 - `gr00t/model/extension/tactile_encoder.py`: mapped Torch checkpoint read; Safetensors unchanged.
 - `gr00t/experiment/experiment.py`: one diagnostic marker before the existing TrainingArguments call.
-- `scripts/benchmark_checkpoint_io.py`, `scripts/summarize_model_load.py`, `scripts/smoke_distributed_model_loading.py`.
+- `scripts/diagnostics/benchmark_checkpoint_io.py`, `scripts/diagnostics/summarize_model_load.py`, `scripts/diagnostics/smoke_distributed_model_loading.py`.
 - Focused tests: `test_checkpoint_io.py`, `test_serialized_loading.py`, and mapped/shard-trace regressions in the existing Concerto, SPARSH, and pretrained-loading tests.
 - This report and its bounded measurement JSON. Earlier unrelated working-tree changes were preserved.

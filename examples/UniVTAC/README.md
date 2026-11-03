@@ -493,7 +493,7 @@ Run a one-batch real-checkpoint CUDA test before fine-tuning:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
-uv run python scripts/smoke_test_concerto_point_encoder.py \
+uv run python scripts/diagnostics/smoke_test_concerto_point_encoder.py \
   --model concerto_small \
   --device cuda:0 \
   --batch-size 1 \
@@ -551,7 +551,7 @@ cross-attention remain trainable with `--tune-multimodal-adapter`. `pointnet2` a
 One-batch real-checkpoint CUDA smoke test:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 uv run python scripts/smoke_test_sparsh_tactile.py \
+CUDA_VISIBLE_DEVICES=0 uv run python scripts/diagnostics/smoke_test_sparsh_tactile.py \
   --pretrained-model checkpoints/sparsh-dino-base \
   --batch-size 1 \
   --dit-dim 1536
@@ -571,11 +571,11 @@ Run one experiment at a time, using the same dataset, base model, and overrides.
 
 ```bash
 EXPERIMENT=A TRAIN_GPUS=0,1 NUM_GPUS=2 DATASET_PATH=/path/to/univtac \
-  bash scripts/launch_univtac_controlled_experiment.sh
+  bash scripts/legacy/launch_univtac_controlled_experiment.sh
 EXPERIMENT=B TRAIN_GPUS=0,1 NUM_GPUS=2 DATASET_PATH=/path/to/univtac \
-  bash scripts/launch_univtac_controlled_experiment.sh
+  bash scripts/legacy/launch_univtac_controlled_experiment.sh
 EXPERIMENT=C TRAIN_GPUS=0,1 NUM_GPUS=2 DATASET_PATH=/path/to/univtac_multimodal \
-  bash scripts/launch_univtac_controlled_experiment.sh
+  bash scripts/legacy/launch_univtac_controlled_experiment.sh
 ```
 
 A is the RGB `AlternateVLDiT` baseline; B swaps in the multimodal DiT with both sensor branches disabled; C enables point and tactile conditioning. Compare A vs B for architecture parity, then B vs C for sensor contribution. These are short diagnostics, not evidence that a 10,000-step plateau is fixed.

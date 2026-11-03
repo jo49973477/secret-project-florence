@@ -57,17 +57,17 @@ Both existing UniVTAC launch scripts now forward additional CLI arguments:
 export DATASET_PATH=/path/to/univtac_lerobot
 export BASE_MODEL=/path/to/GR00T-N1.7-3B
 
-EXPERIMENT=C uv run bash scripts/launch_univtac_controlled_experiment.sh \
+EXPERIMENT=C uv run bash scripts/legacy/launch_univtac_controlled_experiment.sh \
   --enable-multimodal-diagnostics \
   --multimodal-diagnostics-interval 50 \
   --multimodal-diagnostics-level basic
 
-EXPERIMENT=C uv run bash scripts/launch_univtac_controlled_experiment.sh \
+EXPERIMENT=C uv run bash scripts/legacy/launch_univtac_controlled_experiment.sh \
   --enable-multimodal-diagnostics \
   --multimodal-diagnostics-interval 50 \
   --multimodal-diagnostics-level per_layer
 
-EXPERIMENT=C uv run bash scripts/launch_univtac_controlled_experiment.sh \
+EXPERIMENT=C uv run bash scripts/legacy/launch_univtac_controlled_experiment.sh \
   --no-enable-multimodal-diagnostics --enable-training-dashboard False
 ```
 
@@ -78,7 +78,7 @@ command directly in a terminal without that pipe. The full multimodal launcher
 also accepts these additional options:
 
 ```bash
-uv run bash scripts/finetune_univtac_full_multimodal.sh \
+uv run bash scripts/legacy/finetune_univtac_full_multimodal.sh \
   --enable-multimodal-diagnostics --multimodal-diagnostics-level per_layer
 ```
 
