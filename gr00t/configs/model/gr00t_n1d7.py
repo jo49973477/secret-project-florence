@@ -36,6 +36,8 @@ class Gr00tN1d7Config(PretrainedConfig):
     model_type: str = "Gr00tN1d7"
     model_dtype: str = "bfloat16"  # Use bfloat16 for Flash Attention compatibility
 
+    optimize_pretrained_loading: bool = True
+
     # Backbone configuration
     model_name: str = "nvidia/Cosmos-Reason2-2B"
     backbone_model_type: str = "qwen"
@@ -100,6 +102,25 @@ class Gr00tN1d7Config(PretrainedConfig):
     dit_type: str = (
         "alternate_vl_dit"  # candidates : ["alternate_vl_dit", "multimodal_conditioned_dit", "dit"]
     )
+    sidecar_num_stages: int = 4
+    sidecar_stage_indices: list[int] | None = None
+    sidecar_hidden_dim: int = 256
+    sidecar_num_heads: int = 4
+    sidecar_num_point_tokens: int = 32
+    tactile_fusion_mode: str = "surprise"
+    contact_num_tokens: int = 4
+    contact_hidden_dim: int = 256
+    contact_prediction_loss_weight: float = 0.1
+    freeze_pretrained_dit: bool = True
+    freeze_contact_teacher: bool = True
+    contact_injection_enabled: bool = True
+    contact_predictor_warmup: bool = False
+    dit_training_mode: str = "frozen"
+    dit_lora_rank: int = 16
+    dit_lora_alpha: float = 32.0
+    dit_lora_dropout: float = 0.0
+    temporal_window_size: int = 0
+    contact_input_mode: str = "none"
     use_point_conditioning: bool = True
     use_tactile_conditioning: bool = True
     point_input_dim: int = 3

@@ -90,9 +90,12 @@ repo/
 │   └── deployment/                         # inference/deployment helpers
 ├── scripts/
 │   ├── deployment/                         # ONNX/TRT export, benchmark, platform install
+│   ├── diagnostics/                        # model and configuration verification
+│   ├── data/                               # dataset utilities
+│   ├── legacy/                             # historical training launchers
 │   ├── lerobot_conversion/                 # 외부 dataset→LeRobot schema 변환
 │   ├── eval/                               # evaluation launch helpers
-│   └── validate_hf_config_alignment.py     # source config와 HF artifact 검증
+│   └── train_florence_ablations.sh         # full-dataset Florence A–D launcher
 ├── demo_data/                              # 작은 LeRobot-format examples
 ├── getting_started/                        # 사용 설명서; core 구현은 아님
 ├── tests/                                  # CPU/GPU, dataset, model, deployment tests

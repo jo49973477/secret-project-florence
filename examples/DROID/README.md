@@ -26,7 +26,7 @@ The full DROID dataset ([lerobot/droid_1.0.1](https://huggingface.co/datasets/le
 
 ```bash
 uv pip install jsonlines   # one-time dependency
-python scripts/download_droid_sample.py
+python scripts/data/download_droid_sample.py
 ```
 
 This downloads the first data/video chunk (~170 MB) and extracts 3 episodes into `demo_data/droid_sample/` in GR00T LeRobot v2.0 format.

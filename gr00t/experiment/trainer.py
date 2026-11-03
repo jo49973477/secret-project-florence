@@ -29,10 +29,12 @@ pipeline is bottlenecked by data loading or by the model's computation.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
 import queue
+import sys
 import threading
 from typing import Any, Optional
 
@@ -41,6 +43,59 @@ from transformers.trainer import TRAINER_STATE_NAME, Trainer, TrainerState, get_
 from transformers.trainer_callback import TrainerCallback
 
 from gr00t.experiment.checkpoint_memory import monitor_checkpoint_memory
+from gr00t.experiment.sample_exposure import SampleExposure
+from gr00t.experiment.training_memory import log_deepspeed_engine_state, log_memory_snapshot
+
+
+MEMORY_LOGGER = logging.getLogger("gr00t.first_step_memory")
+MEMORY_LOGGER.setLevel(logging.INFO)
+
+
+class FirstStepMemoryCallback(TrainerCallback):
+    """Capture rank-local memory around DeepSpeed init and the first optimizer step."""
+
+    def __init__(
+        self,
+        deepspeed_enabled: bool,
+        *,
+        zero3_offload_optimizer: bool = False,
+        zero3_offload_param: bool = False,
+        zero3_sub_group_size: int | None = None,
+    ):
+        self.deepspeed_enabled = deepspeed_enabled
+        self.zero3_offload_optimizer = zero3_offload_optimizer
+        self.zero3_offload_param = zero3_offload_param
+        self.zero3_sub_group_size = zero3_sub_group_size
+        self._before_optimizer_step = False
+        self._after_optimizer_step = False
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        phase = (
+            "after_deepspeed_initialization"
+            if self.deepspeed_enabled
+            else "after_trainer_initialization"
+        )
+        log_memory_snapshot(phase)
+        if self.deepspeed_enabled:
+            log_deepspeed_engine_state(
+                kwargs.get("optimizer"),
+                expected_optimizer_offload=self.zero3_offload_optimizer,
+                expected_param_offload=self.zero3_offload_param,
+                expected_sub_group_size=self.zero3_sub_group_size,
+            )
+        return control
+
+    def on_pre_optimizer_step(self, args, state, control, **kwargs):
+        if not self.deepspeed_enabled and not self._before_optimizer_step:
+            log_memory_snapshot("before_first_optimizer_step")
+            self._before_optimizer_step = True
+        return control
+
+    def on_optimizer_step(self, args, state, control, **kwargs):
+        if not self.deepspeed_enabled and not self._after_optimizer_step:
+            log_memory_snapshot("after_first_optimizer_step")
+            self._after_optimizer_step = True
+        return control
 
 
 class ProfCallback(TrainerCallback):
@@ -169,9 +224,55 @@ class Gr00tTrainer(Trainer):
         self.multiprocessing_context = kwargs.pop("multiprocessing_context", "fork")
         self.vlm_learning_rate = kwargs.pop("vlm_learning_rate", None)
         self.action_head_learning_rate = kwargs.pop("action_head_learning_rate", None)
+        self.dit_learning_rate = kwargs.pop("dit_learning_rate", None)
         self.point_encoder_learning_rate = kwargs.pop("point_encoder_learning_rate", None)
         self.tactile_encoder_learning_rate = kwargs.pop("tactile_encoder_learning_rate", None)
+        dashboard_enabled = kwargs.pop("enable_training_dashboard", None)
+        dashboard_refresh_seconds = kwargs.pop("dashboard_refresh_seconds", 1.0)
+        self.enable_multimodal_diagnostics = kwargs.pop("enable_multimodal_diagnostics", False)
+        diagnostics_level = kwargs.pop("multimodal_diagnostics_level", "basic")
+        self.multimodal_diagnostics_interval = kwargs.pop("multimodal_diagnostics_interval", 50)
         super().__init__(*args, **kwargs)
+        self.sample_exposure = SampleExposure(self.train_dataset, self.args)
+        if self.is_deepspeed_enabled:
+            # Transformers leaves Accelerator's plugin at its default 1 while its
+            # TrainingArguments and the finalized DeepSpeed config use the requested
+            # accumulation count. Align the plugin before Accelerator.prepare().
+            self.accelerator.gradient_accumulation_steps = self.args.gradient_accumulation_steps
+        # HF's PrinterCallback prints a raw dict for every Trainer.log call. Replace
+        # both default renderers so rank zero owns one coordinated display.
+        from transformers.trainer_callback import PrinterCallback, ProgressCallback
+
+        from gr00t.experiment.training_dashboard import (
+            QuietProgressCallback,
+            TrainingDashboardCallback,
+        )
+
+        self.callback_handler.remove_callback(PrinterCallback)
+        self.callback_handler.remove_callback(ProgressCallback)
+        if dashboard_enabled is False and sys.stdout.isatty():
+            self.add_callback(QuietProgressCallback())
+        self.add_callback(
+            TrainingDashboardCallback(
+                dashboard_enabled,
+                dashboard_refresh_seconds,
+                diagnostics_enabled=self.enable_multimodal_diagnostics
+                and diagnostics_level != "off",
+            )
+        )
+        self._forward_diagnostics: dict[str, torch.Tensor] = {}
+        self._forward_diagnostics_count = 0
+        self._forward_diagnostics_step = None
+        self._gradient_diagnostics: dict[str, torch.Tensor] = {}
+        self._clip_observations = []
+        self.multimodal_monitor = None
+        if self.enable_multimodal_diagnostics and diagnostics_level != "off":
+            from gr00t.experiment.multimodal_diagnostics import MultimodalDiagnostics
+
+            self.multimodal_monitor = MultimodalDiagnostics(
+                self, self.multimodal_diagnostics_interval, diagnostics_level
+            )
+            self.add_callback(self.multimodal_monitor)
 
     def _save_checkpoint(self, *args: Any, **kwargs: Any) -> None:
         """Capture memory across the complete native Trainer checkpoint operation."""
@@ -322,6 +423,18 @@ class Gr00tTrainer(Trainer):
                     "Tactile encoder backbone is frozen; no tactile-backbone LR group created"
                 )
         action_head_standard_parameter_ids -= tactile_backbone_parameter_ids
+        dit_parameter_ids: set[int] = set()
+        if self.dit_learning_rate is not None and hasattr(action_head, "model"):
+            dit = action_head.model
+            if hasattr(dit, "dit_training_mode"):
+                from gr00t.model.extension.dit_lora import original_dit_parameters
+
+                dit_parameter_ids = {
+                    id(parameter)
+                    for _, parameter in original_dit_parameters(dit)
+                    if parameter.requires_grad
+                }
+                action_head_standard_parameter_ids -= dit_parameter_ids
 
         duplicate_parameter_ids = vlm_parameter_ids & action_head_parameter_ids
         classified_parameter_ids = vlm_parameter_ids | action_head_parameter_ids
@@ -384,6 +497,8 @@ class Gr00tTrainer(Trainer):
                 False,
                 self.action_head_learning_rate,
             ),
+            ("Pretrained DiT decay", dit_parameter_ids, True, self.dit_learning_rate),
+            ("Pretrained DiT no_decay", dit_parameter_ids, False, self.dit_learning_rate),
             (
                 "Point Encoder Backbone decay",
                 point_backbone_parameter_ids,
@@ -456,7 +571,7 @@ class Gr00tTrainer(Trainer):
             for _name, parameter in named_parameters
             if id(parameter) in action_head_parameter_ids
         )
-        logging.info(
+        MEMORY_LOGGER.info(
             "Optimizer ownership: VLM=%s parameters/%d tensors, Action Head=%s parameters/%d tensors",
             f"{vlm_parameter_count:,}",
             len(vlm_parameter_ids),
@@ -464,14 +579,19 @@ class Gr00tTrainer(Trainer):
             len(action_head_parameter_ids),
         )
         for group in optimizer_groups:
-            logging.info(
-                "Optimizer group %r: lr=%g, weight_decay=%g, tensors=%d, trainable_parameters=%s",
+            MEMORY_LOGGER.info(
+                "Optimizer group rank=%s name=%r: lr=%g, weight_decay=%g, tensors=%d, "
+                "trainable_parameters=%s",
+                os.environ.get("RANK", "0"),
                 group["name"],
                 group["lr"],
                 group["weight_decay"],
                 len(group["params"]),
                 f"{sum(parameter.numel() for parameter in group['params']):,}",
             )
+        from gr00t.experiment.optimizer_artifacts import describe_groups
+
+        self.optimizer_group_manifest = describe_groups(optimizer_groups)
         return optimizer_groups
 
     @staticmethod
@@ -495,12 +615,101 @@ class Gr00tTrainer(Trainer):
                 manager.register_module_override(module, "weight", {"optim_bits": 32})
         logging.info("bitsandbytes optimizer keeps %s embedding parameters in fp32", f"{skipped:,}")
 
+    def _maybe_log_save_evaluate(self, tr_loss, grad_norm, *args, **kwargs):
+        # Trainer calls this at optimizer boundaries and epoch end; count each step once.
+        if getattr(self, "_clip_step", None) != self.state.global_step and grad_norm is not None:
+            import math
+
+            norm = float(grad_norm)
+            if math.isfinite(norm) and self.args.max_grad_norm > 0:
+                self._clip_observations.append(float(norm > self.args.max_grad_norm))
+            self._clip_step = self.state.global_step
+        return super()._maybe_log_save_evaluate(tr_loss, grad_norm, *args, **kwargs)
+
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
+        logs = dict(logs)
+        if self.is_in_train:
+            # Plain keys are namespaced once by HF's existing W&B callback.
+            # TrainerState.global_step is restored before resumed logging.
+            logs.update(self.sample_exposure.metrics(self.state.global_step))
+        if "loss" in logs and self._forward_diagnostics_count:
+            from gr00t.experiment.action_diagnostics import loss_ratios
+
+            names = sorted(self._forward_diagnostics)
+            # Sum microbatch observations and counts together; all ranks use the same schema.
+            values = torch.stack([self._forward_diagnostics[n].detach().float() for n in names])
+            packed = torch.cat((values, values.new_tensor([self._forward_diagnostics_count])))
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(packed)
+            logs.update(zip(names, (packed[:-1] / packed[-1]).cpu().tolist()))
+            loss_ratios(logs)
+            self._forward_diagnostics = {}
+            self._forward_diagnostics_count = 0
+        for source, target in (
+            ("loss/action", "train/action_loss"),
+            ("loss/total", "train/total_loss"),
+            ("loss/zero_prediction_mse", "train/zero_prediction_mse"),
+            ("loss/action_to_zero_ratio", "train/action_to_zero_ratio"),
+            ("grad_norm/dit", "train/grad_norm_dit"),
+            ("grad_norm/lora", "train/grad_norm_lora"),
+            ("grad_norm/sidecar", "train/grad_norm_sidecar"),
+            ("grad_norm/temporal", "train/grad_norm_temporal"),
+            ("grad_norm/moe", "train/grad_norm_moe"),
+        ):
+            if source in logs and logs[source] is not None:
+                logs[target] = logs[source]
+        if logs.get("grad_norm") is not None:
+            logs["train/grad_norm_global"] = logs["grad_norm"]
+        import time
+
+        now = time.monotonic()
+        last_time = getattr(self, "_last_system_log_time", None)
+        last_step = getattr(self, "_last_system_log_step", None)
+        if last_time is not None and last_step is not None and self.state.global_step > last_step:
+            seconds = now - last_time
+            if seconds > 0:
+                logs["system/step_time"] = seconds / (self.state.global_step - last_step)
+                logs["system/steps_per_second"] = (self.state.global_step - last_step) / seconds
+        self._last_system_log_time = now
+        self._last_system_log_step = self.state.global_step
+        if torch.cuda.is_available():
+            logs["system/gpu_memory_allocated"] = torch.cuda.memory_allocated() / (1024**3)
+        if logs.get("grad_norm") is not None:
+            import math
+
+            norm = float(logs["grad_norm"])
+            logs["grad_norm/pre_clip"] = norm
+            logs["grad_norm/is_finite"] = float(math.isfinite(norm))
+            # This is the configured coefficient, not an observed post-clip norm.
+            if math.isfinite(norm) and self.args.max_grad_norm > 0:
+                coefficient = min(1.0, self.args.max_grad_norm / (norm + 1e-6))
+                logs["grad_norm/clip_coefficient"] = coefficient
+                observations = self._clip_observations
+                logs["grad_norm/clip_fraction"] = (
+                    sum(observations) / len(observations)
+                    if observations
+                    else float(coefficient < 1)
+                )
+                self._clip_observations = []
         # Hide epoch from logged metrics as it's misleading for Iterable datasets.
         epoch = self.state.epoch
         self.state.epoch = None
-        super().log(logs, start_time=start_time)
-        self.state.epoch = epoch
+        try:
+            super().log(logs, start_time=start_time)
+            # HF rewrites every custom name as train/<name>. Retain those and expose
+            # the canonical diagnostic namespaces in the same W&B optimizer-step axis.
+            if self.is_world_process_zero() and "wandb" in self.args.report_to:
+                import wandb
+
+                scalars = {
+                    k: v for k, v in logs.items() if "/" in k and isinstance(v, (int, float))
+                }
+                if wandb.run is not None and scalars:
+                    wandb.log(
+                        {**scalars, "train/global_step": self.state.global_step}, commit=False
+                    )
+        finally:
+            self.state.epoch = epoch
 
     def get_train_dataloader(self):  # noqa: D401
         """Return a iterable dataloader without skipping the data during resume, but reseed the dataset instead."""
@@ -575,7 +784,44 @@ class Gr00tTrainer(Trainer):
                 os.path.join(latest_checkpoint, TRAINER_STATE_NAME)
             )
 
-        return super().train(resume_from_checkpoint=latest_checkpoint, **kwargs)
+        self.sample_exposure.prepare(
+            self.args.output_dir,
+            latest_checkpoint,
+            rank_zero=self.is_world_process_zero(),
+        )
+
+        try:
+            return super().train(resume_from_checkpoint=latest_checkpoint, **kwargs)
+        finally:
+            if self.multimodal_monitor is not None:
+                self.multimodal_monitor.close()
+            self._close_training_display()
+
+    def _close_training_display(self):
+        from gr00t.experiment.training_dashboard import (
+            QuietProgressCallback,
+            TrainingDashboardCallback,
+        )
+
+        for callback in self.callback_handler.callbacks:
+            if isinstance(callback, TrainingDashboardCallback):
+                callback._stop_live()
+            elif isinstance(callback, QuietProgressCallback):
+                callback.close()
+
+    def evaluate(self, *args, **kwargs):
+        try:
+            return super().evaluate(*args, **kwargs)
+        except BaseException:
+            self._close_training_display()
+            raise
+
+    def predict(self, *args, **kwargs):
+        try:
+            return super().predict(*args, **kwargs)
+        except BaseException:
+            self._close_training_display()
+            raise
 
     @staticmethod
     def _validate_resumable_checkpoint(checkpoint: str | os.PathLike[str]) -> None:
@@ -630,12 +876,33 @@ class Gr00tTrainer(Trainer):
         """
 
         # Use parent implementation to preserve built-in functionality.
-        loss, outputs = super().compute_loss(
-            model,
-            inputs,
-            return_outputs=True,
-            num_items_in_batch=num_items_in_batch,
-        )
+        monitor = getattr(self, "multimodal_monitor", None)
+        if monitor is not None and monitor.dit is not None:
+            monitor.dit._diagnostic_observer = (
+                monitor.observe if model.training and monitor.sampled() else None
+            )
+        try:
+            loss, outputs = super().compute_loss(
+                model,
+                inputs,
+                return_outputs=True,
+                num_items_in_batch=num_items_in_batch,
+            )
+        finally:
+            if monitor is not None and monitor.dit is not None:
+                monitor.dit._diagnostic_observer = None
+        output_dict = outputs if isinstance(outputs, dict) else getattr(outputs, "__dict__", {})
+        diagnostics = output_dict.get("diagnostics", {}) if model.training else {}
+        for name, value in diagnostics.items():
+            if torch.is_tensor(value):
+                detached = value.detach()
+                self._forward_diagnostics[name] = (
+                    detached
+                    if name not in self._forward_diagnostics
+                    else self._forward_diagnostics[name] + detached
+                )
+        if diagnostics:
+            self._forward_diagnostics_count += 1
         # import ipdb; ipdb.set_trace()
         # # save the model's embedding for the first step
         # input_embeddings = model.get_input_embeddings().weight.data.cpu()
@@ -665,9 +932,8 @@ class Gr00tTrainer(Trainer):
             acc_tensor = torch.tensor(acc_local.item(), device=loss.device)
             acc_mean = self._nested_gather(acc_tensor).mean().item()
 
+            self.log({"train_accuracy": acc_mean})
             if self.args.local_rank in (-1, 0):
-                self.log({"train_accuracy": acc_mean})
-
                 # Log a sample of ground-truth vs predicted action tokens from
                 # the first batch element so users can verify the model is
                 # learning the right behaviors.
@@ -688,3 +954,53 @@ class Gr00tTrainer(Trainer):
                 )
 
         return (loss, outputs) if return_outputs else loss
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        if not getattr(self, "_first_forward_memory_logged", False):
+            log_memory_snapshot("before_first_forward")
+            self._first_forward_memory_logged = True
+        if self.multimodal_monitor is not None and self.is_deepspeed_enabled:
+            self.multimodal_monitor.install_deepspeed(model)
+        if self.is_deepspeed_enabled:
+            self._install_first_deepspeed_optimizer_step_diagnostics(model)
+        loss = super().training_step(model, inputs, num_items_in_batch)
+        if not self.is_deepspeed_enabled and not getattr(
+            self, "_first_backward_memory_logged", False
+        ):
+            log_memory_snapshot("after_first_backward")
+            self._first_backward_memory_logged = True
+        return loss
+
+    def _install_first_deepspeed_optimizer_step_diagnostics(self, model) -> None:
+        """Wrap exactly one real ZeRO optimizer step with rank-local snapshots.
+
+        Accelerate invokes ``DeepSpeedEngine.step()`` from inside
+        ``accelerator.backward``. Consequently, Trainer's nominal
+        ``on_pre_optimizer_step`` event occurs *after* the real ZeRO step. A
+        one-shot wrapper on the initialized ZeRO optimizer is the only point
+        that accurately brackets the first optimizer step and still disappears
+        before subsequent steps.
+        """
+        if getattr(self, "_first_deepspeed_step_diagnostics_installed", False):
+            return
+        zero_optimizer = getattr(model, "optimizer", None)
+        original_step = getattr(zero_optimizer, "step", None)
+        if not callable(original_step):
+            raise RuntimeError(
+                "DeepSpeed is enabled but the initialized engine has no callable optimizer.step"
+            )
+
+        self._first_deepspeed_step_diagnostics_installed = True
+
+        def first_step(*args, **kwargs):
+            # Restore the original bound method before entering it so an
+            # exception cannot leave diagnostics on later retries.
+            zero_optimizer.step = original_step
+            log_memory_snapshot("after_first_backward")
+            self._first_backward_memory_logged = True
+            log_memory_snapshot("before_first_optimizer_step")
+            result = original_step(*args, **kwargs)
+            log_memory_snapshot("after_first_optimizer_step")
+            return result
+
+        zero_optimizer.step = first_step

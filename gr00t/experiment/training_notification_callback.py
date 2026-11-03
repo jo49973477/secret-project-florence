@@ -9,6 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import logging
 import math
+import os
 from pathlib import Path
 import re
 import socket
@@ -17,6 +18,9 @@ from typing import Any, Protocol
 
 from transformers import TrainerCallback
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR, get_last_checkpoint
+
+from gr00t.experiment.discord_notifier import format_training_event
+from gr00t.experiment.sample_exposure import SampleExposure
 
 
 logger = logging.getLogger(__name__)
@@ -43,6 +47,7 @@ class TrainingNotificationContext:
     learning_rate: float | None = None
     deepspeed_stage: int | None = None
     hostname: str = ""
+    sample_exposure: SampleExposure | None = None
 
     def __post_init__(self) -> None:
         if not self.hostname:
@@ -80,11 +85,21 @@ def _format_duration(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
-def _sanitize_exception(exc: BaseException) -> str:
+def _sanitize_exception_text(exc: BaseException) -> str:
     message = re.sub(r"[\x00-\x1f\x7f]+", " ", str(exc))
     message = re.sub(r"\s+", " ", message).strip() or "No exception message"
+    message = re.sub(
+        r"https://(?:discord(?:app)?\.com)/api/webhooks/\S+", "[webhook redacted]", message
+    )
+    message = re.sub(r"(?i)(token|password|secret)(\s*[=:]\s*)\S+", r"\1\2[redacted]", message)
+    message = re.sub(r"(?i)(bearer\s+)\S+", r"\1[redacted]", message)
     if len(message) > _MAX_EXCEPTION_MESSAGE_LENGTH:
         message = message[: _MAX_EXCEPTION_MESSAGE_LENGTH - 1].rstrip() + "…"
+    return message
+
+
+def _sanitize_exception(exc: BaseException) -> str:
+    message = _sanitize_exception_text(exc)
     return f"{type(exc).__name__}: {message}"
 
 
@@ -101,6 +116,8 @@ class TrainingNotificationCallback(TrainerCallback):
         notify_finish: bool = True,
         notify_error: bool = True,
         defer_finish_until_final_save: bool = False,
+        failure_delivery_marker: str | None = None,
+        provider: str = "telegram",
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.notifier = notifier
@@ -110,6 +127,8 @@ class TrainingNotificationCallback(TrainerCallback):
         self.notify_finish_enabled = notify_finish
         self.notify_error_enabled = notify_error
         self.defer_finish_until_final_save = defer_finish_until_final_save
+        self.failure_delivery_marker = failure_delivery_marker
+        self.provider = provider
         self._monotonic = monotonic
         self._created_at = monotonic()
         self._started_at: float | None = None
@@ -122,19 +141,29 @@ class TrainingNotificationCallback(TrainerCallback):
     def _is_world_process_zero(state: Any) -> bool:
         return bool(getattr(state, "is_world_process_zero", False))
 
-    def _send(self, message: str) -> None:
+    def _send(self, message: str) -> bool:
         try:
-            self.notifier.send(message)
+            return bool(self.notifier.send(message))
         except Exception as exc:
             # Third-party/custom transports must not be able to interrupt training.
             logger.warning(
                 "Training notification callback failed (%s); training will continue.",
                 type(exc).__name__,
             )
+            return False
 
     def _elapsed(self) -> str:
         start = self._started_at if self._started_at is not None else self._created_at
         return _format_duration(self._monotonic() - start)
+
+    def _exposure_fields(self, state: Any) -> list[tuple[str, object]]:
+        exposure = self.context.sample_exposure
+        values = exposure.values(getattr(state, "global_step", 0)) if exposure else None
+        return (
+            [("Samples Seen", f"{values[0]:,}"), ("Effective Epoch", f"{values[1]:.4f}")]
+            if values is not None
+            else []
+        )
 
     @staticmethod
     def _max_steps(args: Any, state: Any) -> int | None:
@@ -161,6 +190,46 @@ class TrainingNotificationCallback(TrainerCallback):
         self._started_at = self._monotonic()
         self._start_sent = True
         if not self.notify_start_enabled:
+            return
+
+        if self.provider == "discord":
+            exposure = self.context.sample_exposure
+            max_steps = self._max_steps(args, state)
+            estimated = exposure.values(max_steps) if exposure and max_steps is not None else None
+            self._send(
+                format_training_event(
+                    "start",
+                    [
+                        ("Experiment", self.context.experiment_name),
+                        ("Model", self.context.model_path),
+                        ("Dataset", self.context.dataset_path),
+                        ("Host", self.context.hostname),
+                        ("GPUs", getattr(args, "world_size", self.context.num_gpus)),
+                        ("Max Steps", max_steps),
+                        (
+                            "Effective Global Batch Size",
+                            exposure.effective_global_batch_size if exposure else None,
+                        ),
+                        (
+                            "Gradient Accumulation Steps",
+                            exposure.gradient_accumulation_steps if exposure else None,
+                        ),
+                        (
+                            "Total Training Samples",
+                            exposure.total_training_samples
+                            if exposure and exposure.enabled
+                            else None,
+                        ),
+                        (
+                            "Estimated Effective Epochs at Max Steps",
+                            f"{estimated[1]:.4f}" if estimated else None,
+                        ),
+                        ("Learning Rate", self.context.learning_rate),
+                        ("DeepSpeed Stage", self.context.deepspeed_stage),
+                        ("Output Directory", self.context.output_dir),
+                    ],
+                )
+            )
             return
 
         lines = [
@@ -197,9 +266,33 @@ class TrainingNotificationCallback(TrainerCallback):
         step = int(getattr(state, "global_step", 0))
         if step in self._saved_steps:
             return
-        self._saved_steps.add(step)
 
         checkpoint = Path(args.output_dir) / f"{PREFIX_CHECKPOINT_DIR}-{step}"
+        if not checkpoint.is_dir():
+            return
+        self._saved_steps.add(step)
+        history = getattr(state, "log_history", []) or []
+        loss = _latest_metric(history, "loss")
+        learning_rate = _latest_metric(history, "learning_rate")
+        if self.provider == "discord":
+            self._send(
+                format_training_event(
+                    "save",
+                    [
+                        ("Experiment", self.context.experiment_name),
+                        ("Global Step", step),
+                        *self._exposure_fields(state),
+                        ("Training Loss", f"{loss:.4f}" if loss is not None else None),
+                        (
+                            "Learning Rate",
+                            f"{learning_rate:.4g}" if learning_rate is not None else None,
+                        ),
+                        ("Checkpoint Path", checkpoint),
+                        ("Elapsed Time", self._elapsed()),
+                    ],
+                )
+            )
+            return
         lines = [
             "💾 GR00T Checkpoint Saved",
             "",
@@ -207,9 +300,6 @@ class TrainingNotificationCallback(TrainerCallback):
             "",
             *self._step_lines(args, state),
         ]
-        history = getattr(state, "log_history", []) or []
-        loss = _latest_metric(history, "loss")
-        learning_rate = _latest_metric(history, "learning_rate")
         if loss is not None or learning_rate is not None:
             lines.append("")
         if loss is not None:
@@ -223,7 +313,7 @@ class TrainingNotificationCallback(TrainerCallback):
         if not self.defer_finish_until_final_save:
             self.notify_finish(args=args, state=state)
 
-    def notify_finish(self, *, args: Any, state: Any) -> None:
+    def notify_finish(self, *, args: Any, state: Any, final_checkpoint: str | None = None) -> None:
         """Send success after the caller's final model save has completed."""
         if (
             not self._is_world_process_zero(state)
@@ -237,6 +327,26 @@ class TrainingNotificationCallback(TrainerCallback):
         history = getattr(state, "log_history", []) or []
         final_loss = _latest_metric(history, "loss", "train_loss")
         best_loss = _best_loss(history)
+        if self.provider == "discord":
+            self._send(
+                format_training_event(
+                    "finish",
+                    [
+                        ("Experiment", self.context.experiment_name),
+                        ("Final Global Step", getattr(state, "global_step", None)),
+                        *self._exposure_fields(state),
+                        ("Final Loss", f"{final_loss:.4f}" if final_loss is not None else None),
+                        (
+                            "Best Observed Loss",
+                            f"{best_loss:.4f}" if best_loss is not None else None,
+                        ),
+                        ("Training Duration", self._elapsed()),
+                        ("Final Checkpoint", final_checkpoint),
+                        ("Output Directory", self.context.output_dir),
+                    ],
+                )
+            )
+            return
         lines = [
             "✅ GR00T Training Finished",
             "",
@@ -260,13 +370,30 @@ class TrainingNotificationCallback(TrainerCallback):
             or self._finish_sent
         ):
             return
-        self._failure_sent = True
-
         output_dir = str(getattr(args, "output_dir", self.context.output_dir))
         try:
             last_checkpoint = get_last_checkpoint(output_dir) or "none"
         except Exception:
             last_checkpoint = "none"
+        if self.provider == "discord":
+            message = format_training_event(
+                "error",
+                [
+                    ("Experiment", self.context.experiment_name),
+                    ("Host", self.context.hostname),
+                    ("Failed Global Step", getattr(state, "global_step", None)),
+                    *self._exposure_fields(state),
+                    ("Last Checkpoint", last_checkpoint if last_checkpoint != "none" else None),
+                    ("Exception Type", type(exc).__name__),
+                    ("Error Message", _sanitize_exception_text(exc)),
+                    ("Training Duration", self._elapsed()),
+                    ("Log Location", os.environ.get("GR00T_TRAIN_LOG")),
+                ],
+            )
+            delivered = self._send(message)
+            if delivered:
+                self._record_failure_delivery()
+            return
         lines = [
             "🚨 GR00T Training Failed",
             "",
@@ -282,4 +409,20 @@ class TrainingNotificationCallback(TrainerCallback):
             "",
             f"Duration: {self._elapsed()}",
         ]
-        self._send("\n".join(lines))
+        if self._send("\n".join(lines)):
+            self._record_failure_delivery()
+
+    def _record_failure_delivery(self) -> None:
+        self._failure_sent = True
+        marker = self.failure_delivery_marker
+        if marker:
+            try:
+                marker_path = Path(marker)
+                marker_path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = marker_path.with_name(f"{marker_path.name}.{time.time_ns()}.tmp")
+                temporary.write_text("delivered\n", encoding="utf-8")
+                os.replace(temporary, marker_path)
+            except OSError as exc:
+                logger.warning(
+                    "Could not record failure notification delivery (%s).", type(exc).__name__
+                )

@@ -101,16 +101,15 @@ def normalize_values_minmax(values, params):
     """
     min_vals = params["min"]
     max_vals = params["max"]
-    normalized = np.zeros_like(values)
-
-    mask = ~np.isclose(max_vals, min_vals)
-
-    normalized[..., mask] = (values[..., mask] - min_vals[..., mask]) / (
-        max_vals[..., mask] - min_vals[..., mask]
+    denominator = max_vals - min_vals
+    varying = ~np.isclose(max_vals, min_vals)
+    fraction = np.divide(
+        np.asarray(values) - min_vals,
+        denominator,
+        out=np.zeros_like(values, dtype=np.result_type(values, np.float32)),
+        where=varying,
     )
-    normalized[..., mask] = 2 * normalized[..., mask] - 1
-
-    return normalized
+    return np.where(varying, 2 * fraction - 1, 0)
 
 
 def unnormalize_values_minmax(normalized_values, params):
@@ -184,18 +183,13 @@ def normalize_values_meanstd(values, params):
     mean_vals = params["mean"]
     std_vals = params["std"]
 
-    # Create mask for non-zero standard deviations
     mask = std_vals != 0
-
-    # Initialize normalized array
-    normalized = np.zeros_like(values)
-
-    # Normalize only features with non-zero std
-    normalized[..., mask] = (values[..., mask] - mean_vals[..., mask]) / std_vals[..., mask]
-
-    # Keep original values for zero-std features
-    normalized[..., ~mask] = values[..., ~mask]
-
+    normalized = np.divide(
+        np.asarray(values) - mean_vals,
+        std_vals,
+        out=np.asarray(values, dtype=np.result_type(values, np.float32)).copy(),
+        where=mask,
+    )
     return normalized
 
 
@@ -231,21 +225,9 @@ def unnormalize_values_meanstd(normalized_values, params):
     mean_vals = params["mean"]
     std_vals = params["std"]
 
-    # Create mask for non-zero standard deviations
     mask = std_vals != 0
-
-    # Initialize unnormalized array
-    unnormalized = np.zeros_like(normalized_values)
-
-    # Unnormalize only features with non-zero std
-    unnormalized[..., mask] = (
-        normalized_values[..., mask] * std_vals[..., mask] + mean_vals[..., mask]
-    )
-
-    # Keep normalized values for zero-std features
-    unnormalized[..., ~mask] = normalized_values[..., ~mask]
-
-    return unnormalized
+    restored = np.asarray(normalized_values) * std_vals + mean_vals
+    return np.where(mask, restored, normalized_values)
 
 
 def to_json_serializable(obj: Any) -> Any:

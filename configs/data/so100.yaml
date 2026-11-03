@@ -1,0 +1,64 @@
+datasets:
+- dataset_paths:
+  - demo_data/cube_to_bowl_5
+  embodiment_tag: new_embodiment
+  mix_ratio: 1.0
+modalities:
+  video:
+    delta_indices:
+    - 0
+    modality_keys:
+    - front
+    - wrist
+  state:
+    delta_indices:
+    - 0
+    modality_keys:
+    - single_arm
+    - gripper
+  action:
+    horizon: 16
+    modality_keys:
+    - single_arm
+    - gripper
+    action_configs:
+    - rep: RELATIVE
+      type: NON_EEF
+      format: DEFAULT
+    - rep: ABSOLUTE
+      type: NON_EEF
+      format: DEFAULT
+  language:
+    delta_indices:
+    - 0
+    modality_keys:
+    - annotation.human.task_description
+preprocessing:
+  random_rotation_angle: null
+  color_jitter_params:
+    brightness: 0.3
+    contrast: 0.4
+    saturation: 0.5
+    hue: 0.08
+  shortest_image_edge: 256
+  crop_fraction: 0.95
+  image_crop_size: null
+  image_target_size: null
+  extra_augmentation_config: null
+  use_percentiles: true
+  use_relative_action: true
+  use_mean_std: false
+  exclude_state: false
+  letter_box_transform: false
+  formalize_language: true
+  apply_sincos_state_encoding: false
+  use_albumentations_transforms: true
+shard_size: 1024
+episode_sampling_rate: 1.0
+num_shards_per_epoch: 100000
+ds_weights_alpha: null
+override_pretraining_statistics: true
+mode: single_turn
+seed: 42
+multiprocessing_context: fork
+allow_padding: false

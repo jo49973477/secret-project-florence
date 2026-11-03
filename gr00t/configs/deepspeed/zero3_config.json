@@ -17,13 +17,14 @@
     },
     "zero_optimization": {
       "stage": 3,
+      "sub_group_size": 50000000,
       "overlap_comm": false,
       "contiguous_gradients": true,
-      "reduce_bucket_size": 20000000,
-      "stage3_prefetch_bucket_size": 10000000,
+      "reduce_bucket_size": 10000000,
+      "stage3_prefetch_bucket_size": 5000000,
       "stage3_param_persistence_threshold": 10000,
-      "stage3_max_live_parameters": 100000000,
-      "stage3_max_reuse_distance": 100000000,
+      "stage3_max_live_parameters": 50000000,
+      "stage3_max_reuse_distance": 50000000,
       "stage3_gather_16bit_weights_on_model_save": false
     }
   }

@@ -69,7 +69,7 @@ def mock_calculate(monkeypatch):
     """Replace the heavy parquet-driven computation with a counter-stub."""
     calls = []
 
-    def fake(dataset_path, embodiment_tag, group_key, max_episodes=-1):
+    def fake(dataset_path, embodiment_tag, group_key, max_episodes=-1, *, modality_configs=None):
         calls.append((str(dataset_path), embodiment_tag.value, group_key))
         return _stub_stats()
 

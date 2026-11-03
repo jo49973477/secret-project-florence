@@ -15,7 +15,9 @@
 
 # Make training work w/ and w/o distributed training.
 from contextlib import contextmanager
+import os
 
+from gr00t.utils.model_load_diagnostics import model_load_phase
 import torch
 
 
@@ -85,10 +87,13 @@ def run_or_wait_on_rank0(label: str | None = None):
             # propagate locally — we only broadcast rank-0 failures.
             raise
     finally:
-        torch.distributed.all_reduce(status, op=torch.distributed.ReduceOp.MAX)
+        with model_load_phase("rank0.all_reduce", operation=label):
+            torch.distributed.all_reduce(status, op=torch.distributed.ReduceOp.MAX)
         if status.item() != 0:
-            torch.distributed.broadcast_object_list(error_summary, src=0)
-        torch.distributed.barrier()
+            with model_load_phase("rank0.broadcast_error", operation=label):
+                torch.distributed.broadcast_object_list(error_summary, src=0)
+        with model_load_phase("rank0.barrier", operation=label):
+            torch.distributed.barrier()
 
     if status.item() == 0:
         return
@@ -115,6 +120,31 @@ def run_on_rank0(fn, *args, label: str | None = None, **kwargs):
     return result
 
 
+_loading_control_group = None
+
+
+def _serialized_loading_group():
+    """Use CPU control collectives for disk waits, preserving the NCCL training group.
+
+    Called collectively, at the same point on every rank. Cache against WORLD's
+    identity so a later process-group reinitialization cannot reuse a dead group.
+    """
+    global _loading_control_group
+    backend = os.environ.get("GROOT_SERIALIZED_LOAD_CONTROL_BACKEND", "gloo").lower()
+    if backend not in {"gloo", "default"}:
+        raise ValueError("GROOT_SERIALIZED_LOAD_CONTROL_BACKEND must be gloo or default")
+    world = torch.distributed.group.WORLD
+    if backend == "default" or torch.distributed.get_backend() != "nccl":
+        return world
+    if not torch.distributed.is_gloo_available():
+        raise RuntimeError("Serialized checkpoint loading needs Gloo for CPU control collectives")
+    if _loading_control_group is None or _loading_control_group[0] is not world:
+        with model_load_phase("serialized.control_group.create", backend="gloo"):
+            group = torch.distributed.new_group(backend="gloo")
+        _loading_control_group = (world, group)
+    return _loading_control_group[1]
+
+
 def run_serialized_across_ranks(fn, *args, label: str | None = None, **kwargs):
     """Run the same memory-heavy callable one rank at a time.
 
@@ -127,7 +157,12 @@ def run_serialized_across_ranks(fn, *args, label: str | None = None, **kwargs):
 
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
-    device = _collective_device()
+    group = _serialized_loading_group()
+    device = (
+        torch.device("cpu")
+        if torch.distributed.get_backend(group) == "gloo"
+        else _collective_device()
+    )
     result = None
     for active_rank in range(world_size):
         status = torch.zeros(1, dtype=torch.int, device=device)
@@ -135,16 +170,27 @@ def run_serialized_across_ranks(fn, *args, label: str | None = None, **kwargs):
         error_summary: list[str | None] = [None]
         if rank == active_rank:
             try:
-                result = fn(*args, **kwargs)
+                with model_load_phase("serialized.body", operation=label, active_rank=active_rank):
+                    result = fn(*args, **kwargs)
             except BaseException as exc:
                 status += 1
                 local_error = exc
                 error_summary[0] = f"{type(exc).__name__}: {exc}"
 
-        torch.distributed.all_reduce(status, op=torch.distributed.ReduceOp.MAX)
+        with model_load_phase(
+            "serialized.all_reduce",
+            operation=label,
+            active_rank=active_rank,
+            backend=str(torch.distributed.get_backend(group)),
+        ):
+            torch.distributed.all_reduce(status, op=torch.distributed.ReduceOp.MAX, group=group)
         if status.item() != 0:
-            torch.distributed.broadcast_object_list(error_summary, src=active_rank)
-        torch.distributed.barrier()
+            with model_load_phase(
+                "serialized.broadcast_error", operation=label, active_rank=active_rank
+            ):
+                torch.distributed.broadcast_object_list(error_summary, src=active_rank, group=group)
+        with model_load_phase("serialized.barrier", operation=label, active_rank=active_rank):
+            torch.distributed.barrier(group=group)
         if status.item() != 0:
             if local_error is not None:
                 raise local_error

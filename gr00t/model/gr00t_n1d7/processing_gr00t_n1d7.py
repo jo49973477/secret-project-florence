@@ -18,7 +18,6 @@ import json
 import logging
 import os
 from pathlib import Path
-import random
 import re
 from typing import Any, Dict
 import warnings
@@ -246,9 +245,9 @@ class Gr00tN1d7Processor(BaseProcessor):
             raise ValueError("Training point clouds must have shape [T, N, D]")
         if any(array.shape[:2] != point_arrays[0].shape[:2] for array in point_arrays[1:]):
             raise ValueError("Configured point-cloud fields must share temporal and point axes")
-        if point_arrays[0].shape[0] != 1:
-            raise ValueError("The current point encoder expects one point-cloud timestep")
-        points = np.concatenate(point_arrays, axis=-1)[0]
+        points = np.concatenate(point_arrays, axis=-1)
+        if points.shape[0] == 1:
+            points = points[0]
         if pointcloud_config.modality_keys == ["scene"] and points.shape[-1] != 6:
             raise ValueError(f"pointcloud.scene must contain XYZRGB [N,6], got {points.shape}")
         return torch.from_numpy(np.ascontiguousarray(points))
@@ -537,6 +536,9 @@ class Gr00tN1d7Processor(BaseProcessor):
         )
         normalized_states = torch.cat([normalized_states, torch.zeros(padding_shape)], dim=-1)
         transformed_observation["state"] = normalized_states
+        if normalized_states.shape[1] > 1:
+            transformed_observation["temporal_state"] = normalized_states
+            transformed_observation["state"] = normalized_states[:, -1:]
 
         if "pointcloud" in modality_config:
             pointcloud_keys = modality_config["pointcloud"].modality_keys
@@ -558,14 +560,24 @@ class Gr00tN1d7Processor(BaseProcessor):
                 raise ValueError(
                     "Configured point-cloud fields must share batch, time, and point axes"
                 )
-            if point_arrays[0].shape[1] != 1:
-                raise ValueError("The current point encoder expects one point-cloud timestep")
-            points = np.concatenate(point_arrays, axis=-1)[:, 0]
+            points = np.concatenate(point_arrays, axis=-1)
+            if points.shape[1] == 1:
+                points = points[:, 0]
             if pointcloud_keys == ["scene"] and points.shape[-1] != 6:
                 raise ValueError(
                     f"pointcloud.scene must contain XYZRGB [B,N,6], got {points.shape}"
                 )
             transformed_observation["points"] = torch.from_numpy(np.ascontiguousarray(points))
+            if points.ndim == 4:
+                raw_valid = observation.get("temporal_valid")
+                if raw_valid is None:
+                    raise ValueError(
+                        "Temporal inference requires temporal_valid [B,T] to distinguish padding"
+                    )
+                temporal_valid = torch.as_tensor(raw_valid, dtype=torch.bool)
+                if tuple(temporal_valid.shape) != tuple(points.shape[:2]):
+                    raise ValueError("temporal_valid must match point history [B,T]")
+                transformed_observation["temporal_valid"] = temporal_valid
 
         if "tactile" in modality_config:
             tactile_keys = modality_config["tactile"].modality_keys
@@ -766,11 +778,10 @@ class Gr00tN1d7Processor(BaseProcessor):
         exclude_state = self.exclude_state or getattr(
             self.modality_configs[embodiment_tag.value]["state"], "exclude_state", False
         )
-        if exclude_state or (
-            self.state_dropout_prob > 0
-            and random.random() < self.state_dropout_prob
-            and self.training
-        ):
+        # State dropout is applied once, after the action-head state encoder.
+        # Keep state_dropout_prob in the processor config for old serialized
+        # processors, but never perform a second sample-level dropout here.
+        if exclude_state:
             normalized_states = torch.cat(
                 [torch.from_numpy(np.zeros_like(state_data[key])) for key in state_keys], dim=-1
             )
@@ -811,8 +822,16 @@ class Gr00tN1d7Processor(BaseProcessor):
         )
 
         transformed_inputs = {
-            "state": normalized_states.to(torch.get_default_dtype()),
+            "state": normalized_states[-1:].to(torch.get_default_dtype())
+            if normalized_states.shape[0] > 1
+            else normalized_states.to(torch.get_default_dtype()),
         }
+        if normalized_states.shape[0] > 1:
+            transformed_inputs["temporal_state"] = normalized_states.to(torch.get_default_dtype())
+            transformed_inputs["temporal_valid"] = torch.tensor(
+                content.metadata.get("temporal_valid", [True] * normalized_states.shape[0]),
+                dtype=torch.bool,
+            )
         if "pointcloud" in self.modality_configs[embodiment_tag.value]:
             if content.pointclouds is None:
                 raise ValueError("Point-cloud modality is configured but VLAStepData has no data")

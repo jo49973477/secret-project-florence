@@ -164,6 +164,29 @@ class Config:
         else:
             raise ValueError(f"Invalid DeepSpeed stage: {stage}")
 
+        # The JSON files remain the canonical defaults. This per-run overlay is
+        # applied to the newly loaded dict so callers never mutate global config.
+        if self.training.zero3_offload_optimizer:
+            if stage != 3:
+                raise ValueError("zero3_offload_optimizer requires deepspeed_stage=3")
+            config["zero_optimization"]["offload_optimizer"] = {
+                "device": "cpu",
+                "pin_memory": False,
+            }
+
+        if self.training.zero3_offload_param:
+            if stage != 3:
+                raise ValueError("zero3_offload_param requires deepspeed_stage=3")
+            config["zero_optimization"]["offload_param"] = {
+                "device": "cpu",
+                "pin_memory": False,
+            }
+
+        if self.training.zero3_sub_group_size is not None:
+            if stage != 3:
+                raise ValueError("zero3_sub_group_size requires deepspeed_stage=3")
+            config["zero_optimization"]["sub_group_size"] = self.training.zero3_sub_group_size
+
         return config
 
     def validate(self):
@@ -212,6 +235,18 @@ class Config:
         # Validate precision settings
         if self.training.fp16 and self.training.bf16:
             raise ValueError("Cannot use both fp16 and bf16")
+        if (
+            self.training.zero3_offload_optimizer
+            or self.training.zero3_offload_param
+            or self.training.zero3_sub_group_size is not None
+        ):
+            if self.training.deepspeed_stage != 3:
+                raise ValueError("ZeRO-3 memory options require deepspeed_stage=3")
+            if self.training.num_gpus < 2 or self.training.use_ddp:
+                raise ValueError(
+                    "ZeRO-3 memory options require the DeepSpeed training path "
+                    "(num_gpus >= 2 and use_ddp=False)"
+                )
 
 
 def get_default_config() -> Config:

@@ -45,6 +45,7 @@ class TrainingConfig:
     learning_rate: float = 1e-4
     vlm_learning_rate: float | None = None
     action_head_learning_rate: float | None = None
+    dit_learning_rate: float | None = None
     point_encoder_learning_rate: float | None = None
     tactile_encoder_learning_rate: float | None = None
     lr_scheduler_type: str = "cosine"
@@ -69,6 +70,12 @@ class TrainingConfig:
 
     # Logging and saving
     logging_steps: int = 10
+    enable_training_dashboard: bool | None = None
+    """Render an in-place terminal dashboard; None enables it only on a TTY."""
+    dashboard_refresh_seconds: float = 1.0
+    enable_multimodal_diagnostics: bool = False
+    multimodal_diagnostics_interval: int = 50
+    multimodal_diagnostics_level: str = "basic"
     save_steps: int = 100
     save_total_limit: int = 5
 
@@ -95,6 +102,9 @@ class TrainingConfig:
 
     # DeepSpeed (default)
     deepspeed_stage: int = 3  # ZeRO stage (2 or 3)
+    zero3_offload_optimizer: bool = False
+    zero3_offload_param: bool = False
+    zero3_sub_group_size: int | None = None
     gradient_checkpointing: bool = False
 
     # Transformers loading parameters
@@ -117,6 +127,8 @@ class TrainingConfig:
     # Experiment tracking
     use_wandb: bool = False
     wandb_project: str = "finetune-gr00t-n1d7"
+    wandb_group: str | None = None
+    wandb_name: str | None = None
 
     # Telegram notifications. The bot token is intentionally never part of config.
     telegram_on: bool = False
@@ -190,6 +202,14 @@ class TrainingConfig:
         )
 
     @property
+    def resolved_dit_learning_rate(self) -> float:
+        return (
+            self.resolved_action_head_learning_rate
+            if self.dit_learning_rate is None
+            else self.dit_learning_rate
+        )
+
+    @property
     def resolved_tactile_encoder_learning_rate(self) -> float:
         return (
             self.resolved_action_head_learning_rate
@@ -198,6 +218,25 @@ class TrainingConfig:
         )
 
     def __post_init__(self) -> None:
+        if self.dashboard_refresh_seconds <= 0:
+            raise ValueError("dashboard_refresh_seconds must be positive")
+        if self.multimodal_diagnostics_interval < 1:
+            raise ValueError("multimodal_diagnostics_interval must be positive")
+        if self.multimodal_diagnostics_level not in {"off", "basic", "per_layer"}:
+            raise ValueError("multimodal_diagnostics_level must be off, basic, or per_layer")
+        if self.deepspeed_stage not in (2, 3):
+            raise ValueError(f"deepspeed_stage must be 2 or 3, got {self.deepspeed_stage}")
+        if self.zero3_sub_group_size is not None and self.zero3_sub_group_size <= 0:
+            raise ValueError(
+                "zero3_sub_group_size must be positive when provided, got "
+                f"{self.zero3_sub_group_size}"
+            )
+        if self.deepspeed_stage != 3 and (
+            self.zero3_offload_optimizer
+            or self.zero3_offload_param
+            or self.zero3_sub_group_size is not None
+        ):
+            raise ValueError("ZeRO-3 memory options require deepspeed_stage=3")
         if self.learning_rate <= 0:
             raise ValueError(f"learning_rate must be positive, got {self.learning_rate}")
         if self.resolved_vlm_learning_rate <= 0:
@@ -210,6 +249,8 @@ class TrainingConfig:
                 "resolved action_head_learning_rate must be positive, got "
                 f"{self.resolved_action_head_learning_rate}"
             )
+        if self.resolved_dit_learning_rate <= 0:
+            raise ValueError("resolved dit_learning_rate must be positive")
         if self.resolved_point_encoder_learning_rate <= 0:
             raise ValueError(
                 "resolved point_encoder_learning_rate must be positive, got "

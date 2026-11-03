@@ -28,7 +28,7 @@ UniVTAC HDF5                     GR00T LeRobot v2
 ``observation/head/rgb[t]``      ``observation.images.head`` video frame
 ``observation/wrist/rgb[t]``     ``observation.images.wrist`` video frame
 selected tactile RGB ``[t]``     ``observation.tactile.rgb`` video frame
-selected depth stream ``[t]``    ``observation.pointcloud.xyz`` NPZ array
+selected tactile depth ``[t]``   legacy ``observation.pointcloud.xyz`` NPZ array
 calibrated head+wrist RGB-D      ``observation.pointcloud.scene`` XYZRGB NPZ
 task directory / ``--task``      task and annotation indices
 ===============================  ==============================================
@@ -798,6 +798,12 @@ def _resolve_scene_camera(
             raise ConversionError(
                 f"{transform_key!r} must have shape [4,4] or [T,4,4], got "
                 f"{transform_dataset.shape}."
+            )
+        if camera_name == "wrist" and transform_dataset.shape == (4, 4):
+            raise ConversionError(
+                f"{transform_key!r} is a single static wrist-camera transform. The UniVTAC "
+                "wrist camera moves with the robot, so scene conversion requires a per-frame "
+                "[T,4,4] T_base_camera dataset or calibrated T_ee_camera plus embodiment/ee."
             )
         return ResolvedSceneCamera(
             name=camera_name,

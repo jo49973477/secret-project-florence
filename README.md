@@ -336,7 +336,7 @@ The `modality.json` maps how the concatenated state/action arrays split into nam
 | `demo_data/cube_to_bowl_5` | SO100 arm (5 episodes) | `NEW_EMBODIMENT` | Fine-tuning custom embodiment example |
 | `demo_data/cube_to_bowl_5_with_mask` | SO100 arm + per-frame masks | `NEW_EMBODIMENT` | [Mask-guided background suppression](examples/mask-guided-background-suppression/README.md) example |
 
-> To generate more DROID episodes: `python scripts/download_droid_sample.py --num-episodes 10`
+> To generate more DROID episodes: `python scripts/data/download_droid_sample.py --num-episodes 10`
 
 **Using your own data:** Convert your demonstrations to the format above. If coming from LeRobot v3, use the conversion helper in its own environment:
 ```bash

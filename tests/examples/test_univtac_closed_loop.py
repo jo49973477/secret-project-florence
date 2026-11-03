@@ -4,6 +4,7 @@
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import msgpack
 import numpy as np
@@ -13,6 +14,15 @@ import pytest
 UNIVTAC_EXAMPLE_ROOT = Path(__file__).parents[2] / "examples" / "UniVTAC"
 sys.path.insert(0, str(UNIVTAC_EXAMPLE_ROOT))
 
+import run_closed_loop_eval as closed_loop_eval  # noqa: E402
+from run_closed_loop_eval import _load_worker_result, _worker_failure_result  # noqa: E402
+from run_closed_loop_worker import (  # noqa: E402
+    _apply_task_config,
+    _config_profile,
+    _isaac_lab_release_matches,
+    _validate_mp4,
+    _write_worker_results,
+)
 from univtac_rollout.client import CompatibleMsgSerializer  # noqa: E402
 from univtac_rollout.core import (  # noqa: E402
     CANONICAL_TASKS,
@@ -162,6 +172,7 @@ def test_task_resolution_and_result_classification() -> None:
     assert classify_result(True, "success") == "success"
     assert classify_result(False, "early_stop") == "failure"
     assert classify_result(None, "invalid_action") == "error"
+    assert classify_result(None, "worker_failure") == "error"
 
 
 def test_video_output_path_separates_success_failure_and_error(tmp_path: Path) -> None:
@@ -240,3 +251,166 @@ def test_result_files_contain_episode_rows_and_macro_summary(tmp_path: Path) -> 
     payload = json.loads((tmp_path / "summary.json").read_text())
     assert payload["summary"]["tasks"][0]["successes"] == 1
     assert payload["episodes"][1]["termination_reason"] == "early_stop"
+
+
+def test_worker_result_requires_explicit_completion_marker(tmp_path: Path) -> None:
+    path = tmp_path / "worker.json"
+    episode = _episode("lift_can", 0, False, "step_limit")
+    _write_worker_results(
+        path,
+        [episode],
+        {"version": "test"},
+        completed=False,
+        phase="task_construction",
+        fatal_error="boom",
+    )
+    episodes, metadata, completed, phase, fatal_error = _load_worker_result(path)
+    assert episodes == [episode]
+    assert metadata == {"version": "test"}
+    assert completed is False
+    assert phase == "task_construction"
+    assert fatal_error == "boom"
+
+
+def test_missing_worker_episode_is_an_explicit_error() -> None:
+    args = SimpleNamespace(
+        seed_start=1_000_000,
+        execution_horizon=1,
+        checkpoint="checkpoint-10000",
+    )
+    result = _worker_failure_result(
+        args,
+        task="lift_can",
+        episode_index=0,
+        error="worker exited without a result",
+    )
+    assert result.success is None
+    assert result.termination_reason == "worker_failure"
+    assert result.video_path == ""
+
+
+def test_main_and_isaac51_config_schemas_are_distinguished(tmp_path: Path) -> None:
+    main_config = {"observations": {"camera": ["rgb"]}}
+    assert _config_profile(main_config) == ("main", "4.5", "2.1.1")
+
+    isaac51_config = {
+        "env_settings": {
+            "frequencies": {
+                "physical": 120,
+                "collect": 120,
+                "save": 60,
+                "video": 60,
+                "eval": 60,
+                "render": 0,
+            },
+            "random_texture": False,
+            "sensor_type": "gsmini",
+            "optical_backend": "taxim",
+        },
+        "observation_settings": {
+            "camera": ["rgb"],
+            "tactile": ["rgb_marker"],
+            "embodiment": ["joint"],
+        },
+        "task_overrides": {},
+    }
+    assert _config_profile(isaac51_config) == ("isaac51", "5.1", "2.3.0")
+    env_cfg = SimpleNamespace(
+        save_dir=None,
+        tactile_sensor_type=None,
+        tactile_optical_backend=None,
+        random_texture=None,
+        obs_data_type=None,
+        decimation=None,
+        save_frequency=None,
+        video_frequency=None,
+        render_frequency=None,
+        sim=SimpleNamespace(dt=None, render_interval=None),
+        uipc_sim=SimpleNamespace(dt=None),
+        cameras=[SimpleNamespace(update_period=None)],
+    )
+    profile, observations = _apply_task_config(
+        env_cfg,
+        isaac51_config,
+        task_name="lift_can",
+        output_dir=tmp_path,
+    )
+    assert profile == "isaac51"
+    assert observations == isaac51_config["observation_settings"]
+    assert env_cfg.decimation == 2
+    assert env_cfg.video_frequency == 1
+    assert env_cfg.render_frequency == 0
+    assert env_cfg.sim.dt == pytest.approx(1 / 120)
+    assert env_cfg.uipc_sim.dt == pytest.approx(1 / 120)
+
+
+def test_official_isaac_lab_release_identities_are_recognized() -> None:
+    assert _isaac_lab_release_matches("main", "0.41.3", "v2.1.1")
+    assert _isaac_lab_release_matches("main", "0.41.3", None)
+    assert _isaac_lab_release_matches("isaac51", "2.3.0", None)
+    assert not _isaac_lab_release_matches(
+        "main", "12.0.0", "perf-2026-07-06-127-g04c2f318b6"
+    )
+
+
+def test_mp4_validation_rejects_empty_artifact(tmp_path: Path) -> None:
+    path = tmp_path / "empty.mp4"
+    path.touch()
+    with pytest.raises(RuntimeError, match="missing or empty"):
+        _validate_mp4(path)
+
+
+def test_zero_episode_worker_is_reported_as_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    univtac_root = tmp_path / "UniVTAC"
+    (univtac_root / "envs").mkdir(parents=True)
+    (univtac_root / "envs/_base_task.py").touch()
+    (univtac_root / "task_config").mkdir()
+    (univtac_root / "instructions").mkdir()
+    output_dir = tmp_path / "output"
+
+    class FakePolicy:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    monkeypatch.setattr(closed_loop_eval, "Gr00tUniVTACPolicy", FakePolicy)
+    monkeypatch.setattr(
+        closed_loop_eval,
+        "_stream_process",
+        lambda *args, **kwargs: closed_loop_eval.ProcessOutcome(0, None, 0.1),
+    )
+    args = SimpleNamespace(
+        univtac_root=univtac_root,
+        checkpoint="checkpoint-10000",
+        server_host="127.0.0.1",
+        server_port=5555,
+        mode="smoke",
+        episodes_per_task=1,
+        tasks=["lift_can"],
+        execution_horizon=1,
+        seed_start=1_000_000,
+        task_config="clean",
+        instruction_type="seen",
+        step_limit=None,
+        request_timeout_seconds=1.0,
+        output_dir=output_dir,
+        python_command=sys.executable,
+        expected_python=Path(sys.executable),
+        device="cpu",
+        headless=True,
+        debug_first_rollout=True,
+    )
+    with pytest.raises(RuntimeError, match="did not complete a valid rollout"):
+        closed_loop_eval.run(args)
+
+    payload = json.loads((output_dir / "summary.json").read_text())
+    assert payload["metadata"]["evaluation_status"] == "incomplete"
+    assert payload["summary"]["total_errors"] == 1
+    assert payload["episodes"][0]["termination_reason"] == "worker_failure"

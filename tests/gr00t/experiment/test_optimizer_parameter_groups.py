@@ -5,9 +5,11 @@
 
 from types import SimpleNamespace
 
+from gr00t.configs.base_config import Config
 from gr00t.configs.finetune_config import FinetuneConfig
 from gr00t.configs.training.training_config import TrainingConfig
 from gr00t.experiment.trainer import Gr00tTrainer
+from gr00t.model.extension.dit_lora import DiTLoRALinear
 import pytest
 import torch
 from torch import nn
@@ -28,6 +30,19 @@ class _ToyActionHead(nn.Module):
         super().__init__()
         self.projection = nn.Linear(3, 3)
         self.norm = nn.LayerNorm(3)
+
+
+class _ToyDiT(nn.Module):
+    def __init__(self, mode):
+        super().__init__()
+        self.dit_training_mode = mode
+        linear = nn.Linear(3, 3)
+        self.transformer_blocks = nn.ModuleList(
+            [DiTLoRALinear(linear, 2, 4, 0.0) if mode == "lora" else linear]
+        )
+        self.sidecar_stages = nn.ModuleList([nn.Linear(3, 3)])
+        if mode == "frozen":
+            self.transformer_blocks.requires_grad_(False)
 
 
 class _ToyConcertoEncoder(nn.Module):
@@ -127,6 +142,28 @@ def test_resolved_rates_reach_optimizer_groups(tmp_path):
         for parameter in trainer.model.backbone.parameters()
         if parameter.requires_grad
     )
+
+
+@pytest.mark.parametrize("mode", ["frozen", "lora", "full"])
+def test_dit_mode_optimizer_rates_and_ownership(tmp_path, mode):
+    model = _ToySplitModel()
+    model.config.use_lora = False
+    model.action_head.model = _ToyDiT(mode)
+    trainer = _make_trainer(tmp_path, model=model)
+    trainer.dit_learning_rate = 1e-5
+    optimizer = trainer.create_optimizer()
+    rates = _learning_rate_by_parameter_id(optimizer)
+    base = model.action_head.model.transformer_blocks[0]
+    sidecar = model.action_head.model.sidecar_stages[0]
+    assert all(rates[id(p)] == pytest.approx(1e-3) for p in sidecar.parameters())
+    if mode == "full":
+        assert all(rates[id(p)] == pytest.approx(1e-5) for p in base.parameters())
+    elif mode == "lora":
+        assert id(base.weight) not in rates
+        assert rates[id(base.lora_A.weight)] == pytest.approx(1e-3)
+        assert rates[id(base.lora_B.weight)] == pytest.approx(1e-3)
+    else:
+        assert all(id(p) not in rates for p in base.parameters())
 
 
 def test_concerto_backbone_gets_independent_learning_rate(tmp_path):
@@ -296,3 +333,25 @@ def test_split_optimizer_rejects_duplicate_module_ownership(tmp_path):
 
     with pytest.raises(RuntimeError, match="duplicate="):
         trainer.create_optimizer()
+
+
+def test_deepspeed_accumulation_plugin_matches_trainer_before_prepare(tmp_path):
+    args = TrainingArguments(
+        output_dir=str(tmp_path),
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=8,
+        optim="adamw_torch_fused",
+        deepspeed=Config().get_deepspeed_config(),
+        report_to="none",
+    )
+    trainer = Gr00tTrainer(model=_ToySplitModel(), args=args)
+
+    assert trainer.args.gradient_accumulation_steps == 8
+    assert trainer.accelerator.gradient_accumulation_steps == 8
+    assert trainer.accelerator.state.deepspeed_plugin.get_value("gradient_accumulation_steps") == 8
+    optimizer = trainer.create_optimizer()
+    assert type(optimizer).__name__ == "AdamW"
+    before = trainer.model.action_head.projection.weight.detach().clone()
+    trainer.model()["loss"].backward()
+    optimizer.step()
+    assert not torch.equal(trainer.model.action_head.projection.weight.detach(), before)

@@ -20,6 +20,7 @@ import os
 from huggingface_hub.errors import GatedRepoError
 from peft import LoraConfig, inject_adapter_in_model
 import torch
+from transformers import AutoConfig
 from transformers.feature_extraction_utils import BatchFeature
 
 
@@ -264,6 +265,7 @@ class Qwen3Backbone(torch.nn.Module):
         lora_dropout: float = 0.0,
         lora_bias: str = "none",
         transformers_loading_kwargs: dict = {},
+        checkpoint_backbone_shapes: dict | None = None,
     ):
         """
         Qwen3Backbone is to generate n_queries to represent the future action hidden states.
@@ -298,12 +300,34 @@ class Qwen3Backbone(torch.nn.Module):
         if load_bf16:
             extra_kwargs["torch_dtype"] = torch.bfloat16
 
+        structure = None
+        if checkpoint_backbone_shapes is not None:
+            from gr00t.model.gr00t_n1d7.pretrained_loading import backbone_is_covered
+
+            vlm_config = AutoConfig.from_pretrained(model_name, **transformers_loading_kwargs)
+            # Inherit the enclosing HF meta / ZeRO-3 construction context. Never
+            # apply init_empty_weights across the newly initialized action head.
+            structure = Qwen3VLForConditionalGeneration._from_config(vlm_config, **extra_kwargs)
+            while len(structure.language_model.layers) > select_layer:
+                structure.language_model.layers.pop(-1)
+            if not backbone_is_covered(structure, checkpoint_backbone_shapes):
+                logger.warning("Incomplete GR00T VLM coverage; using external pretrained backbone")
+                structure = None
+            else:
+                logger.info("Complete GR00T VLM coverage verified; skipping external VLM weights")
+
         try:
-            self.model = Qwen3VLForConditionalGeneration.from_pretrained(
-                model_name,
-                **extra_kwargs,
-                **transformers_loading_kwargs,
-            ).eval()
+            self.model = (
+                structure
+                if structure is not None
+                else Qwen3VLForConditionalGeneration.from_pretrained(
+                    model_name,
+                    low_cpu_mem_usage=True,
+                    **extra_kwargs,
+                    **transformers_loading_kwargs,
+                )
+            )
+            self.model.eval()
         except Exception as exc:
             if _is_gated_repo_error(exc):
                 raise RuntimeError(_GATED_BACKBONE_HINT.format(model_name=model_name)) from exc
@@ -332,10 +356,12 @@ class Qwen3Backbone(torch.nn.Module):
 
         # Repair Qwen3-VL's non-persistent RoPE buffers once, after weights are
         # loaded and trainable dtypes are finalized. See _reset_rotary_inv_freq.
-        self._reset_rotary_inv_freq()
+        if structure is None:
+            self._reset_rotary_inv_freq()
 
         # Restore the fast vision patch-embed kernel on torch>=2.9. See method docstring.
-        self._apply_vision_patch_embed_channels_last()
+        if structure is None:
+            self._apply_vision_patch_embed_channels_last()
 
     def _apply_vision_patch_embed_channels_last(self) -> None:
         """Force the Qwen3-VL vision patch-embed ``Conv3d`` to ``channels_last_3d``.
@@ -364,7 +390,9 @@ class Qwen3Backbone(torch.nn.Module):
         for module in visual.modules():
             if isinstance(module, torch.nn.Conv3d):
                 module.to(memory_format=torch.channels_last_3d)
-                module.register_forward_pre_hook(_to_channels_last_3d)
+                if not getattr(module, "_gr00t_channels_last_hook", False):
+                    module.register_forward_pre_hook(_to_channels_last_3d)
+                    module._gr00t_channels_last_hook = True
                 patched += 1
         if patched:
             logger.debug(

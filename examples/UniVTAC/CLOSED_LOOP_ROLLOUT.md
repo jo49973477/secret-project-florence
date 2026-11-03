@@ -1,167 +1,102 @@
 # GR00T + UniVTAC closed-loop rollout guide
 
-This guide uses two terminals and two Python environments:
+The GR00T server and UniVTAC simulator intentionally run in separate Python environments:
 
-- Terminal 1 runs the GR00T inference server from the GR00T repository.
-- Terminal 2 launches UniVTAC/Isaac Sim through Isaac Lab.
+- The SPL server runs `gr00t/eval/run_gr00t_server.py` and owns the checkpoint.
+- The local machine runs UniVTAC and Isaac Sim and reaches the server through the SSH tunnel.
+- The rollout is a real observation → inference → qpos action → simulator step → new observation loop.
 
-The rollout wrapper itself lives in the GR00T repository, so both commands below start from `GR00T_ROOT`. The worker automatically changes its working directory to `UNIVTAC_ROOT` before importing UniVTAC. Do not copy GR00T into the UniVTAC environment or install both projects into one Python environment.
+## Supported simulator combinations
 
-## 0. Set and verify paths
+Use the environment that matches the checked-out UniVTAC code and task YAML. The worker validates this before starting Kit.
 
-Open a clean shell. Deactivate incompatible Conda environments before invoking Isaac Lab; Isaac Sim 6.0 uses its own Python 3.12 runtime.
+| UniVTAC code/config | Isaac Sim | Isaac Lab | Python |
+|---|---:|---:|---:|
+| `main` (flat `observations` config) | 4.5.x | release v2.1.1 (package 0.41.3) | 3.10 |
+| `isaac51` (nested `env_settings` config) | 5.1.x | 2.3.0 | 3.11 |
 
-```bash
-GR00T_ROOT=/home/yeongyoo/07_Remote/splserver/secret-project-florence
-UNIVTAC_ROOT=/absolute/path/to/UniVTAC
-ISAACLAB_ROOT=/home/yeongyoo/IsaacLab
-CHECKPOINT=/home/yeongyoo/07_Remote/splserver/outputs/univtac_clean_stats/checkpoint-3500
+Isaac Sim 6.0 / Isaac Lab 3.0 is not supported by either official UniVTAC branch. UniVTAC also requires its vendored `tacex`, `tacex_assets`, `tacex_uipc`, `uipc`, and pinned cuRobo modules. Keep any compatible UniVTAC environment isolated; do not downgrade or overwrite an existing Isaac Sim 6.0 installation.
 
-test -f "$GR00T_ROOT/gr00t/eval/run_gr00t_server.py"
-test -f "$UNIVTAC_ROOT/envs/_base_task.py"
-test -f "$UNIVTAC_ROOT/scripts/eval_policy.py"
-test -x "$ISAACLAB_ROOT/isaaclab.sh"
-test -d "$CHECKPOINT"
-```
+The current public UniVTAC policy checkpoints and Isaac 4.5 demonstrations are associated with `main`. When evaluating a GR00T checkpoint trained from that data, prefer an isolated `main` + Isaac Sim 4.5 + Isaac Lab 2.1.1 environment unless the training data was explicitly produced by `isaac51`.
 
-Replace only `UNIVTAC_ROOT` if your UniVTAC checkout is elsewhere. The inspected local checkpoints are `checkpoint-2500`, `checkpoint-3000`, and `checkpoint-3500` under `outputs/univtac_clean_stats/`.
-
-Install the lightweight client dependencies into the Isaac environment once:
+## 1. SPL server: start GR00T (Bash)
 
 ```bash
-"$ISAACLAB_ROOT/isaaclab.sh" -p -m pip install msgpack pyzmq
-```
-
-## 1. Terminal 1: start the GR00T server
-
-Use the GR00T environment and run from the GR00T repository root:
-
-```bash
-cd "$GR00T_ROOT"
+cd /home/yeongyoo/07_Remote/splserver/secret-project-florence
 
 CUDA_VISIBLE_DEVICES=0 \
 bash scripts/run_gr00t_univtac_server.sh \
-  --checkpoint "$CHECKPOINT" \
+  --checkpoint /ssdg/spl_yeongyoo/outputs/univtac_clean_stats/checkpoint-10000 \
   --embodiment-tag NEW_EMBODIMENT \
   --device cuda:0 \
   --host 127.0.0.1 \
   --port 5555
 ```
 
-Wait for this message and leave the terminal running:
+Leave the server running. Establish the existing SSH forward so local `127.0.0.1:5555` reaches SPL `127.0.0.1:5555`.
 
-```text
-Server ready — listening on 127.0.0.1:5555
+## 2. Local machine: one-episode smoke rollout (Fish)
+
+The official `main` installer creates the Conda environment `UniVTAC` and clones its pinned Isaac Lab below the UniVTAC checkout. The commands below resolve that environment without activating it. They deliberately fail before launch if the isolated environment has not been installed; they never fall back to Isaac Sim 6.0.
+
+```fish
+set -gx GR00T_ROOT /home/yeongyoo/07_Remote/splserver/secret-project-florence
+set -gx UNIVTAC_ROOT /home/yeongyoo/03_Dataset/07_UnivTac/UniVTAC
+set -gx ISAACLAB_ROOT $UNIVTAC_ROOT/third_party/IsaacLab
+set -gx CONDA_BASE (conda info --base)
+set -gx ISAAC_PYTHON $CONDA_BASE/envs/UniVTAC/bin/python
+set -gx ISAAC_LAUNCHER $ISAAC_PYTHON
+set -gx CHECKPOINT /ssdg/spl_yeongyoo/outputs/univtac_clean_stats/checkpoint-10000
+set -gx OUT /home/yeongyoo/univtac_rollout_10000_smoke_(date +%Y%m%d_%H%M%S)
+
+cd $GR00T_ROOT
+
+env -u CONDA_PREFIX -u CONDA_DEFAULT_ENV -u VIRTUAL_ENV -u VIRTUAL_ENV_PROMPT \
+  UNIVTAC_ROOT=$UNIVTAC_ROOT \
+  UNIVTAC_EXPECTED_PYTHON=$ISAAC_PYTHON \
+  UNIVTAC_DRIVER_PYTHON_COMMAND=$ISAAC_LAUNCHER \
+  UNIVTAC_PYTHON_COMMAND=$ISAAC_LAUNCHER \
+  CUDA_VISIBLE_DEVICES=0 \
+  bash scripts/run_gr00t_univtac_rollout.sh \
+    --checkpoint $CHECKPOINT \
+    --server-host 127.0.0.1 \
+    --server-port 5555 \
+    --mode smoke \
+    --episodes-per-task 1 \
+    --tasks lift_can \
+    --execution-horizon 1 \
+    --device cuda:0 \
+    --output-dir $OUT
 ```
 
-`CUDA_VISIBLE_DEVICES=0` selects physical GPU 0. Inside the process that GPU is addressed as `cuda:0`.
+The exact-interpreter check prevents an active Conda environment, virtualenv, or system Python from being selected accidentally.
 
-## 2. Terminal 2: run the one-episode smoke test
+## 3. Verify the result (Fish)
 
-Open another clean shell, set the same variables again, and run the wrapper from `GR00T_ROOT`:
-
-```bash
-GR00T_ROOT=/home/yeongyoo/07_Remote/splserver/secret-project-florence
-UNIVTAC_ROOT=/absolute/path/to/UniVTAC
-ISAACLAB_ROOT=/home/yeongyoo/IsaacLab
-CHECKPOINT=/home/yeongyoo/07_Remote/splserver/outputs/univtac_clean_stats/checkpoint-3500
-
-cd "$GR00T_ROOT"
-
-UNIVTAC_ROOT="$UNIVTAC_ROOT" \
-UNIVTAC_DRIVER_PYTHON_COMMAND="$ISAACLAB_ROOT/isaaclab.sh -p" \
-UNIVTAC_PYTHON_COMMAND="$ISAACLAB_ROOT/isaaclab.sh -p" \
-CUDA_VISIBLE_DEVICES=7 \
-bash scripts/run_gr00t_univtac_rollout.sh \
-  --checkpoint "$CHECKPOINT" \
-  --server-host 127.0.0.1 \
-  --server-port 5555 \
-  --mode smoke \
-  --episodes-per-task 1 \
-  --tasks lift_can \
-  --execution-horizon 1 \
-  --device cuda:0 \
-  --output-dir "$GR00T_ROOT/outputs/univtac_rollout_eval_smoke"
+```fish
+cat $OUT/summary.txt
+cat $OUT/episodes.csv
+find $OUT/videos -type f -name '*.mp4' -print
+ffprobe -v error -select_streams v:0 \
+  -show_entries stream=codec_name,width,height,duration \
+  -of default=noprint_wrappers=1 (find $OUT/videos -type f -name '*.mp4' | head -n 1)
 ```
 
-`CUDA_VISIBLE_DEVICES=7` selects physical GPU 7 for Isaac Sim. The worker sees that remapped GPU as `cuda:0`, which is why `--device cuda:0` is correct.
+A valid one-step smoke run logs all of the following:
 
-The smoke test should show:
+1. GR00T ping and checkpoint modality validation.
+2. Task construction and reset completion.
+3. Head/wrist RGB shapes, the 8-dimensional joint state, and predicted `[horizon, 8]` action.
+4. The exact 8-dimensional qpos command passed to `task.take_action`.
+5. A finite post-action joint observation.
+6. FFmpeg PID, frame count, exit code, finalized path, and readable H.264 MP4 validation.
 
-1. GR00T server connectivity and checkpoint-modality validation.
-2. `head` and `wrist` arrays shaped `[1, 1, H, W, 3]` with `uint8` dtype.
-3. Joint state shaped `[1, 1, 8]` with `float32` dtype.
-4. A finite predicted action chunk shaped `[horizon, 8]`.
-5. At least one qpos action executed by UniVTAC.
-6. A subsequent simulator observation, normal termination, a finalized video, and result files.
+## Failure semantics
 
-## 3. Inspect the smoke result
+Worker output is unbuffered and each lifecycle phase is flushed to `logs/<task>.log`. The log footer records the worker PID, return code, signal (when the OS exposes one), and elapsed time.
 
-Run from `GR00T_ROOT`:
+`logs/worker_results/<task>.json` records `phase`, `completed`, `fatal_error`, episode rows, and runtime metadata. The orchestrator requires the worker to explicitly report completion and return exactly the requested episode indices. A crash, missing result file, malformed result, nonzero exit, or zero-episode return creates explicit `worker_failure` rows and an `incomplete` summary before the command exits nonzero. Such rows never claim a video or successful evaluation.
 
-```bash
-cd "$GR00T_ROOT"
+Every completed success/failure episode must finalize an actual MP4. The worker checks that FFmpeg started, received frames, exited successfully, produced a nonempty file, and that `ffprobe` (or OpenCV fallback) can read its video stream. A video failure converts the episode to an error rather than reporting a successful or failed rollout without an artifact.
 
-cat outputs/univtac_rollout_eval_smoke/summary.txt
-column -s, -t outputs/univtac_rollout_eval_smoke/episodes.csv | less -S
-find outputs/univtac_rollout_eval_smoke/videos -type f -name '*.mp4' -print
-```
-
-The output directory contains:
-
-```text
-outputs/univtac_rollout_eval_smoke/
-├── episodes.csv
-├── summary.csv
-├── summary.json
-├── summary.md
-├── summary.txt
-├── logs/
-└── videos/
-    ├── success/<task>/
-    ├── failure/<task>/
-    └── error/<task>/
-```
-
-Use a new output directory for every run. The evaluator intentionally refuses to mix new results with an existing `episodes.csv` or `summary.json`.
-
-## 4. Run all eight tasks
-
-After the smoke test succeeds, run the full evaluation from `GR00T_ROOT`:
-
-```bash
-cd "$GR00T_ROOT"
-
-UNIVTAC_ROOT="$UNIVTAC_ROOT" \
-UNIVTAC_DRIVER_PYTHON_COMMAND="$ISAACLAB_ROOT/isaaclab.sh -p" \
-UNIVTAC_PYTHON_COMMAND="$ISAACLAB_ROOT/isaaclab.sh -p" \
-CUDA_VISIBLE_DEVICES=7 \
-bash scripts/run_gr00t_univtac_rollout.sh \
-  --checkpoint "$CHECKPOINT" \
-  --server-host 127.0.0.1 \
-  --server-port 5555 \
-  --mode full \
-  --tasks all \
-  --execution-horizon 1 \
-  --device cuda:0 \
-  --output-dir "$GR00T_ROOT/outputs/univtac_rollout_eval_checkpoint-3500"
-```
-
-Evaluation modes are:
-
-| Mode | Episodes per task |
-|---|---:|
-| `smoke` | 5 |
-| `quick` | 20 |
-| `full` | 100 |
-
-Use `--episodes-per-task N` to override the selected mode. Use one or more canonical task names after `--tasks` to evaluate a subset.
-
-## Important checkpoint rule
-
-The server's `--checkpoint` selects the model weights. The rollout evaluator's `--checkpoint` records the checkpoint in `episodes.csv`, summaries, and logs. Pass the same path to both terminals so the report accurately identifies the model that produced the actions.
-
-## Open-loop versus closed-loop
-
-- Open-loop diagnostics compare predicted actions with dataset ground-truth actions without changing the next observation.
-- Closed-loop rollout evaluation executes model actions in UniVTAC, observes the resulting simulator state, and reports UniVTAC task Success Rate.
+Use a new output directory for each run; the evaluator refuses to mix results from different runs.

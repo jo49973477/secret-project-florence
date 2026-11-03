@@ -28,7 +28,7 @@ MASTER_PORT="${MASTER_PORT:-29631}"
 
 BASE_MODEL="${BASE_MODEL:-nvidia/GR00T-N1.7-3B}"
 
-# RGB UniVTAC dataset currently used by finetune_univtac_lora.sh
+# RGB UniVTAC dataset used by the historical legacy/finetune_univtac_lora.sh launcher.
 SOURCE_DATASET="${SOURCE_DATASET:-/ssdg/spl_yeongyoo/univtac_gr00t}"
 
 # Tiny 5-episode subset created with symlinks.

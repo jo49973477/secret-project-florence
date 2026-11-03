@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "${REPO_ROOT}"
+# shellcheck source=scripts/lib/checkpoint_resume.sh
+source "${REPO_ROOT}/scripts/lib/checkpoint_resume.sh"
+
+# ============================================================
+# GPU
+# ============================================================
+
+TRAIN_GPUS="${TRAIN_GPUS:-6,7}"
+NUM_GPUS="${NUM_GPUS:-2}"
+DEEPSPEED_STAGE="${DEEPSPEED_STAGE:-3}"
+ZERO3_OFFLOAD_OPTIMIZER="${ZERO3_OFFLOAD_OPTIMIZER:-0}"
+MASTER_PORT="${MASTER_PORT:-29627}"
+
+# ============================================================
+# Model / Dataset
+# ============================================================
+
+BASE_MODEL="${BASE_MODEL:-nvidia/GR00T-N1.7-3B}"
+
+DATASET_PATH="${DATASET_PATH:-/ssdg/spl_yeongyoo/univtac_full}"
+
+MODALITY_CONFIG="${MODALITY_CONFIG:-examples/UniVTAC/univtac_multimodal_config.py}"
+
+# ============================================================
+# Training
+# ============================================================
+
+MAX_STEPS="${MAX_STEPS:-5000}"
+SAVE_STEPS="${SAVE_STEPS:-100}"
+
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-2}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-16}"
+
+LR_VLM="${LR_VLM:-1e-4}"
+LR_ACTION_HEAD="${LR_ACTION_HEAD:-1e-4}"
+LR_CONCERTO="${LR_CONCERTO:-${LR_ACTION_HEAD}}"
+LR_SPARSH="${LR_SPARSH:-${LR_ACTION_HEAD}}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-1e-5}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.05}"
+
+DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-0}"
+
+EPISODE_SAMPLING_RATE="${EPISODE_SAMPLING_RATE:-1.0}"
+DISCORD_ON="${DISCORD_ON:-0}"
+
+RUN_NAME="${RUN_NAME:-univtac_full_multimodal_$(date +%Y%m%d_%H%M%S)}"
+OUTPUT_DIR="${OUTPUT_DIR:-outputs/${RUN_NAME}}"
+checkpoint_resume_configure "${OUTPUT_DIR}" 5
+
+# ============================================================
+# Environment
+# ============================================================
+
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export CUDA_VISIBLE_DEVICES="${TRAIN_GPUS}"
+
+# ============================================================
+# Sanity checks
+# ============================================================
+
+if [[ ! -d "${DATASET_PATH}" ]]; then
+    echo "[ERROR] Dataset does not exist:"
+    echo "        ${DATASET_PATH}"
+    exit 1
+fi
+
+if [[ ! -f "${DATASET_PATH}/meta/info.json" ]]; then
+    echo "[ERROR] Missing meta/info.json"
+    exit 1
+fi
+
+if [[ ! -f "${DATASET_PATH}/meta/modality.json" ]]; then
+    echo "[ERROR] Missing meta/modality.json"
+    exit 1
+fi
+
+if [[ ! -d "${DATASET_PATH}/pointclouds" ]]; then
+    echo "[ERROR] Missing pointclouds/"
+    exit 1
+fi
+
+if [[ ! -f "${MODALITY_CONFIG}" ]]; then
+    echo "[ERROR] Missing modality config:"
+    echo "        ${MODALITY_CONFIG}"
+    exit 1
+fi
+
+mkdir -p "${OUTPUT_DIR}/logs"
+
+EFFECTIVE_BATCH=$((GLOBAL_BATCH_SIZE * GRAD_ACCUM_STEPS))
+if (( NUM_GPUS <= 0 || GLOBAL_BATCH_SIZE % NUM_GPUS != 0 )); then
+    echo "[ERROR] GLOBAL_BATCH_SIZE must be divisible by NUM_GPUS" >&2
+    exit 1
+fi
+MICRO_BATCH_PER_DEVICE=$((GLOBAL_BATCH_SIZE / NUM_GPUS))
+WARMUP_STEPS=$(awk -v steps="${MAX_STEPS}" -v ratio="${WARMUP_RATIO}" \
+    'BEGIN { printf "%d", int(steps * ratio + 0.999999) }')
+
+echo "============================================================"
+echo "UniVTAC FULL Multimodal Fine-tuning"
+echo "============================================================"
+echo "GPUs                : ${TRAIN_GPUS}"
+echo "Number of GPUs      : ${NUM_GPUS}"
+echo "Dataset             : ${DATASET_PATH}"
+echo "Config              : ${MODALITY_CONFIG}"
+echo "Output              : ${OUTPUT_DIR}"
+echo "Max steps           : ${MAX_STEPS}"
+echo "Global batch        : ${GLOBAL_BATCH_SIZE}"
+echo "Per-device microbatch: ${MICRO_BATCH_PER_DEVICE}"
+echo "Grad accumulation   : ${GRAD_ACCUM_STEPS}"
+echo "Effective batch     : ${EFFECTIVE_BATCH}"
+echo "Warmup ratio        : ${WARMUP_RATIO}"
+echo "Calculated warmup   : ${WARMUP_STEPS} steps"
+echo "VLM LR              : ${LR_VLM}"
+echo "Action Head LR      : ${LR_ACTION_HEAD}"
+echo "Concerto LR         : ${LR_CONCERTO}"
+echo "Sparsh LR           : ${LR_SPARSH}"
+echo "Episode sampling    : ${EPISODE_SAMPLING_RATE}"
+echo "DeepSpeed stage : ${DEEPSPEED_STAGE}"
+echo "ZeRO-3 CPU optimizer offload: ${ZERO3_OFFLOAD_OPTIMIZER}"
+checkpoint_resume_print_status "${OUTPUT_DIR}"
+echo
+echo "Modalities:"
+echo "  RGB          : ON"
+echo "  Joint        : ON"
+echo "  Tactile      : ON"
+echo "  Point cloud  : ON"
+echo
+echo "Training:"
+echo "  Qwen/VLM backbone : FROZEN"
+echo "  Action head       : TRAIN"
+echo "  Point encoder     : TRAIN"
+echo "  Tactile encoder   : TRAIN"
+echo "  MM adapter        : TRAIN"
+echo "============================================================"
+
+# ============================================================
+# Train
+# ============================================================
+
+TRAIN_ARGS=(
+    --base-model-path "${BASE_MODEL}"
+    --dataset-path "${DATASET_PATH}"
+    --embodiment-tag NEW_EMBODIMENT
+    --modality-config-path "${MODALITY_CONFIG}"
+
+    --output-dir "${OUTPUT_DIR}"
+
+    --num-gpus "${NUM_GPUS}"
+    --deepspeed-stage "${DEEPSPEED_STAGE}"
+
+    --max-steps "${MAX_STEPS}"
+    --save-steps "${SAVE_STEPS}"
+    --save-total-limit "${SAVE_TOTAL_LIMIT}"
+
+    --global-batch-size "${GLOBAL_BATCH_SIZE}"
+    --gradient-accumulation-steps "${GRAD_ACCUM_STEPS}"
+
+    --vlm-learning-rate "${LR_VLM}"
+    --action-head-learning-rate "${LR_ACTION_HEAD}"
+    --point-encoder-learning-rate "${LR_CONCERTO}"
+    --tactile-encoder-learning-rate "${LR_SPARSH}"
+    --weight-decay "${WEIGHT_DECAY}"
+    --warmup-ratio "${WARMUP_RATIO}"
+
+    --dataloader-num-workers "${DATALOADER_NUM_WORKERS}"
+    --episode-sampling-rate "${EPISODE_SAMPLING_RATE}"
+
+    --dit-type multimodal_conditioned_dit
+
+    --use-point-conditioning
+    --use-tactile-conditioning
+
+    --point-input-dim 6
+
+    --no-tune-llm
+    --no-tune-visual
+
+    --tune-projector
+    --tune-vlln
+    --tune-diffusion-model
+
+    --tune-point-encoder
+    --tune-tactile-encoder
+    --tune-multimodal-adapter
+
+    "${CHECKPOINT_SAVE_ARGS[@]}"
+    "${CHECKPOINT_RESUME_ARGS[@]}"
+)
+if [[ "${ZERO3_OFFLOAD_OPTIMIZER}" == "1" ]]; then
+    TRAIN_ARGS+=(--zero3-offload-optimizer)
+elif [[ "${ZERO3_OFFLOAD_OPTIMIZER}" != "0" ]]; then
+    echo "[ERROR] ZERO3_OFFLOAD_OPTIMIZER must be 0 or 1" >&2
+    exit 1
+fi
+if [[ "${DISCORD_ON}" == "1" ]]; then
+    TRAIN_ARGS+=(--discord-on)
+    export GR00T_SUPERVISOR_NOTIFY=1
+fi
+export GR00T_EXPERIMENT_NAME="${RUN_NAME}"
+export GR00T_OUTPUT_DIR="${OUTPUT_DIR}"
+export GR00T_TRAIN_LOG="${OUTPUT_DIR}/logs/train.log"
+
+CUDA_VISIBLE_DEVICES="${TRAIN_GPUS}" \
+uv run python -m gr00t.experiment.torchrun_supervisor \
+    --marker "${OUTPUT_DIR}/.gr00t-failure-notification-delivered" \
+    -- uv run torchrun \
+    --nproc-per-node="${NUM_GPUS}" \
+    --master-port="${MASTER_PORT}" \
+    gr00t/experiment/launch_finetune.py \
+    "${TRAIN_ARGS[@]}" \
+    "$@" \
+    2>&1 | tee "${OUTPUT_DIR}/logs/train.log"

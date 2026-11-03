@@ -1,0 +1,9 @@
+# @package _global_
+defaults:
+- florence_full_base
+- _self_
+name: moe_sidecar_ditlora-full
+model:
+  contact_input_mode: moe_soft
+dit_training:
+  mode: lora

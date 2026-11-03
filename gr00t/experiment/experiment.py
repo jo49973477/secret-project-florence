@@ -26,6 +26,7 @@ import torch
 import torch.distributed as dist
 from transformers import TrainingArguments, set_seed
 import wandb
+import yaml
 
 from gr00t.configs.base_config import Config
 from gr00t.configs.training.training_config import check_resume_compatibility
@@ -33,7 +34,8 @@ from gr00t.experiment.discord_notifier import DiscordNotifier
 from gr00t.experiment.telegram_notifier import TelegramNotifier
 
 # Use custom trainer that profiles data loading & forward times
-from gr00t.experiment.trainer import Gr00tTrainer, ProfCallback
+from gr00t.experiment.trainer import FirstStepMemoryCallback, Gr00tTrainer, ProfCallback
+from gr00t.experiment.training_memory import log_memory_snapshot, log_trainable_parameter_summary
 from gr00t.experiment.training_notification_callback import (
     TrainingNotificationCallback,
     TrainingNotificationContext,
@@ -235,6 +237,60 @@ def save_initial_actions_artifact(train_dataset, save_cfg_dir: Path):
     logging.info(f"Saved {len(initial_actions)} initial actions to {initial_actions_path}")
 
 
+def _validate_resume_action_config(config: Config, output_dir: Path) -> None:
+    """Reject a resume when its saved action semantics differ from this run."""
+    resume = config.training.resume_from_checkpoint
+    if not resume:
+        return
+    checkpoint = Path(resume) if isinstance(resume, str) else output_dir
+    candidates = (
+        checkpoint / "experiment_cfg" / "config.yaml",
+        checkpoint.parent / "experiment_cfg" / "config.yaml",
+        output_dir / "experiment_cfg" / "config.yaml",
+    )
+    saved_config_path = next((path for path in candidates if path.is_file()), None)
+    if saved_config_path is None:
+        raise ValueError(
+            "Cannot verify action configuration for requested checkpoint resume. "
+            "Start a fresh output directory or resume from a checkpoint that contains "
+            "experiment_cfg/config.yaml."
+        )
+    with saved_config_path.open() as config_file:
+        saved_config = yaml.safe_load(config_file)
+    embodiment = config.data.datasets[0].embodiment_tag
+    saved_action = (
+        saved_config.get("data", {}).get("modality_configs", {}).get(embodiment, {}).get("action")
+    )
+    requested_action = config.data.modality_configs[embodiment]["action"]
+    if saved_action is None:
+        raise ValueError(
+            f"Cannot verify action configuration in {saved_config_path}; refusing resume."
+        )
+    requested = {
+        "delta_indices": list(requested_action.delta_indices),
+        "modality_keys": list(requested_action.modality_keys),
+        "action_configs": [
+            {
+                "rep": action.rep.value,
+                "type": action.type.value,
+                "format": action.format.value,
+                "state_key": action.state_key,
+            }
+            for action in (requested_action.action_configs or [])
+        ],
+    }
+    saved = {
+        "delta_indices": saved_action.get("delta_indices"),
+        "modality_keys": saved_action.get("modality_keys"),
+        "action_configs": saved_action.get("action_configs") or [],
+    }
+    if saved != requested:
+        raise ValueError(
+            "Refusing checkpoint resume with incompatible action semantics: "
+            f"saved={saved}, requested={requested}. Use a fresh output directory."
+        )
+
+
 def _notification_dataset_path(config: Config) -> str | None:
     paths = [
         str(path)
@@ -285,6 +341,7 @@ def run(config: Config):
 
     save_cfg_dir = output_dir / "experiment_cfg"
     processor_dir = output_dir / "processor"
+    _validate_resume_action_config(config, output_dir)
 
     # Rank-0-only write; wrapped so a rank-0 failure surfaces on every rank
     # instead of stranding peers at the next NCCL collective.
@@ -305,9 +362,40 @@ def run(config: Config):
                     "git_commit_hash": os.environ.get("GROOT_COMMIT_HASH", "unknown"),
                 }
 
+                hydra_path = os.environ.get("GR00T_HYDRA_CONFIG")
+                if hydra_path:
+                    config_dict["hydra_resolved"] = OmegaConf.to_container(
+                        OmegaConf.load(hydra_path), resolve=True
+                    )
+                florence_preflight = os.environ.get("GR00T_FLORENCE_PREFLIGHT")
+                if florence_preflight:
+                    report = json.loads(Path(florence_preflight).read_text())
+                    config_dict["experiment_architecture"] = (
+                        "temporal_sidecar" if config.model.temporal_window_size else "moe_sidecar"
+                    )
+                    config_dict["dit_training_mode"] = config.model.dit_training_mode
+                    config_dict["temporal_window_size"] = config.model.temporal_window_size
+                    config_dict["dit_lora_rank"] = config.model.dit_lora_rank
+                    config_dict["dit_lora_alpha"] = config.model.dit_lora_alpha
+                    config_dict["pretrained_dit_verified"] = False
+                    config_dict["pretrained_dit_action_audit_passed"] = (
+                        report.get("checks", {}).get("actual_pretrained_dit") == "PASSED"
+                    )
+                    config_dict["pretrained_model_checkpoint_revision"] = report.get(
+                        "actual_pretrained_checkpoint", {}
+                    ).get("revision")
+                    config_dict["dit_lora_parameter_count"] = report.get(
+                        "actual_pretrained_checkpoint", {}
+                    ).get("lora_parameter_count")
+
                 wandb.init(
                     project=config.training.wandb_project,
-                    name=experiment_name,
+                    name=config.training.wandb_name or experiment_name,
+                    **(
+                        {"group": config.training.wandb_group}
+                        if config.training.wandb_group
+                        else {}
+                    ),
                     config=config_dict,
                     tags=[config.data.mode],
                 )
@@ -316,6 +404,53 @@ def run(config: Config):
     pipeline = MODEL_REGISTRY.get(type(config.model))(config, save_cfg_dir)
     pipeline.setup()
     model = pipeline.return_model()
+    if os.environ.get("GR00T_FLORENCE_PREFLIGHT"):
+        from gr00t.model.gr00t_n1d7.dit_integrity import compare_shared_tensors
+
+        with run_or_wait_on_rank0(label="runtime pretrained DiT verification") as is_rank0:
+            if is_rank0:
+                from scripts.verify_pretrained_dit import CheckpointTensors
+
+                parent_report = json.loads(Path(os.environ["GR00T_FLORENCE_PREFLIGHT"]).read_text())
+                checkpoint = parent_report["actual_pretrained_checkpoint"]["checkpoint"]
+                dit = model.action_head.model
+                if any(hasattr(parameter, "ds_id") for parameter in dit.parameters()):
+                    raise RuntimeError(
+                        "Runtime DiT tensors are already ZeRO partitioned; cannot prove every value without a coordinated per-layer gather"
+                    )
+                prefix = "action_head.model."
+                candidate = {prefix + name: tensor for name, tensor in dit.state_dict().items()}
+                original_names = [
+                    row["name"]
+                    for row in parent_report["actual_pretrained_checkpoint"]["weights"]["tensors"]
+                ]
+                runtime = compare_shared_tensors(
+                    CheckpointTensors(checkpoint), candidate, expected_keys=original_names
+                )
+                preflight_dir = output_dir / "preflight"
+                preflight_dir.mkdir(parents=True, exist_ok=True)
+                (preflight_dir / "runtime_dit_verification.json").write_text(
+                    json.dumps(runtime, indent=2) + "\n"
+                )
+                if runtime["status"] != "PASS":
+                    raise RuntimeError(
+                        "Actual training model DiT differs from pretrained checkpoint"
+                    )
+                metadata_path = output_dir / "metadata.json"
+                metadata = json.loads(metadata_path.read_text())
+                metadata["pretrained_dit_verified"] = True
+                metadata["runtime_dit_matched_tensors"] = runtime["matched_tensors"]
+                metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
+                if wandb.run is not None:
+                    wandb.config.update(
+                        {
+                            "pretrained_dit_verified": True,
+                            "runtime_dit_matched_tensors": runtime["matched_tensors"],
+                        },
+                        allow_val_change=True,
+                    )
+    log_memory_snapshot("after_model_loading")
+    log_trainable_parameter_summary(model)
     train_dataset, eval_dataset = pipeline.return_dataset()
     data_collator = pipeline.return_collator()
     processor = pipeline.return_processor()
@@ -326,6 +461,9 @@ def run(config: Config):
     # deepspeed config
     if config.training.num_gpus > 1 and not config.training.use_ddp:
         deepspeed_config = config.get_deepspeed_config()
+        logging.info(
+            "Runtime DeepSpeed configuration: %s", json.dumps(deepspeed_config, sort_keys=True)
+        )
     else:
         deepspeed_config = None
 
@@ -350,6 +488,9 @@ def run(config: Config):
         resolved_tactile_encoder_lr,
         config.training.learning_rate,
     )
+    from gr00t.utils.model_load_diagnostics import log_model_load_memory
+
+    log_model_load_memory("before TrainingArguments / ZeRO-3 setup")
     training_args = TrainingArguments(
         output_dir=str(output_dir),
         max_steps=config.training.max_steps,
@@ -370,6 +511,12 @@ def run(config: Config):
         bf16=config.training.bf16,
         tf32=config.training.tf32,
         gradient_checkpointing=config.training.gradient_checkpointing,
+        gradient_checkpointing_kwargs=(
+            {"use_reentrant": False} if config.training.gradient_checkpointing else None
+        ),
+        # With ZeRO CPU optimizer offload, Accelerate maps torch AdamW (including
+        # fused AdamW) to DeepSpeedCPUAdam while retaining these parameter groups
+        # and AdamW mode. The initialized engine is checked and logged below.
         optim=config.training.optim,
         dataloader_num_workers=config.training.dataloader_num_workers,
         report_to="wandb" if config.training.use_wandb else "none",
@@ -394,8 +541,71 @@ def run(config: Config):
         multiprocessing_context=config.data.multiprocessing_context,
         vlm_learning_rate=resolved_vlm_lr,
         action_head_learning_rate=resolved_action_head_lr,
+        dit_learning_rate=config.training.resolved_dit_learning_rate,
         point_encoder_learning_rate=resolved_point_encoder_lr,
         tactile_encoder_learning_rate=resolved_tactile_encoder_lr,
+        enable_training_dashboard=config.training.enable_training_dashboard,
+        dashboard_refresh_seconds=config.training.dashboard_refresh_seconds,
+        enable_multimodal_diagnostics=config.training.enable_multimodal_diagnostics,
+        multimodal_diagnostics_interval=config.training.multimodal_diagnostics_interval,
+        multimodal_diagnostics_level=config.training.multimodal_diagnostics_level,
+    )
+    if os.environ.get("GR00T_FLORENCE_PREFLIGHT"):
+        groups = trainer._create_split_optimizer_groups(model)
+        action_head = model.action_head
+        dit = action_head.model
+        from gr00t.model.extension.dit_lora import original_dit_parameters
+
+        base = list(original_dit_parameters(dit))
+        lora = [(name, p) for name, p in dit.named_parameters() if ".lora_" in name]
+        mode = config.model.dit_training_mode
+        if any(p.requires_grad != (mode == "full") for _, p in base):
+            raise RuntimeError("Original DiT requires_grad disagrees with training mode")
+        if any(p.requires_grad != (mode == "lora") for _, p in lora):
+            raise RuntimeError("DiT LoRA requires_grad disagrees with training mode")
+        if mode == "lora" and not lora:
+            raise RuntimeError("LoRA mode has no trainable DiT adapters")
+        owned = {id(p) for group in groups for p in group["params"]}
+        if any(
+            id(p) not in owned
+            for _, p in (lora if mode == "lora" else base if mode == "full" else [])
+        ):
+            raise RuntimeError("Intended DiT parameters missing from optimizer groups")
+        if global_rank == 0:
+            counts = {
+                "mode": mode,
+                "original_dit_parameters": sum(p.numel() for _, p in base),
+                "lora_parameters": sum(p.numel() for _, p in lora),
+                "trainable_parameters": sum(
+                    p.numel() for p in model.parameters() if p.requires_grad
+                ),
+                "frozen_parameters": sum(
+                    p.numel() for p in model.parameters() if not p.requires_grad
+                ),
+                "optimizer_groups": [
+                    {
+                        "name": g["name"],
+                        "learning_rate": g["lr"],
+                        "parameters": sum(p.numel() for p in g["params"]),
+                    }
+                    for g in groups
+                ],
+            }
+            (output_dir / "preflight" / "parameter_ownership.json").write_text(
+                json.dumps(counts, indent=2) + "\n"
+            )
+            if wandb.run is not None:
+                wandb.config.update(counts, allow_val_change=True)
+    from gr00t.experiment.optimizer_artifacts import EffectiveOptimizerCallback
+
+    trainer.add_callback(EffectiveOptimizerCallback(trainer))
+    trainer.add_callback(
+        FirstStepMemoryCallback(
+            deepspeed_enabled=deepspeed_config is not None,
+            zero3_offload_optimizer=config.training.zero3_offload_optimizer,
+            zero3_offload_param=config.training.zero3_offload_param,
+            zero3_sub_group_size=config.training.zero3_sub_group_size,
+        )
     )
 
     trainer.add_callback(
@@ -415,6 +625,7 @@ def run(config: Config):
         global_batch_size=config.training.global_batch_size,
         learning_rate=config.training.learning_rate,
         deepspeed_stage=config.training.deepspeed_stage if deepspeed_config is not None else None,
+        sample_exposure=trainer.sample_exposure,
     )
     notification_callbacks: list[TrainingNotificationCallback] = []
     if telegram_notifier is not None:
@@ -441,6 +652,8 @@ def run(config: Config):
                 notify_error=config.training.discord_notify_error,
                 # HF fires on_train_end before the explicit final save below.
                 defer_finish_until_final_save=True,
+                failure_delivery_marker=os.environ.get("GR00T_FAILURE_NOTIFICATION_MARKER"),
+                provider="discord",
             )
         )
     for notification_callback in notification_callbacks:
@@ -521,9 +734,12 @@ def run(config: Config):
                 "scripts/export_zero3_checkpoint.py for an inference model.",
                 final_checkpoint,
             )
+            final_artifact = final_checkpoint
         else:
             trainer.save_model()
             logging.info(f"Model saved to {output_dir}")
+            final_step_checkpoint = output_dir / f"checkpoint-{trainer.state.global_step}"
+            final_artifact = final_step_checkpoint if final_step_checkpoint.is_dir() else None
 
         if config.training.assert_loss_less_than is not None:
             final_loss = trainer.loss
@@ -538,7 +754,11 @@ def run(config: Config):
             eval_dataset.close()
 
         for notification_callback in notification_callbacks:
-            notification_callback.notify_finish(args=trainer.args, state=trainer.state)
+            notification_callback.notify_finish(
+                args=trainer.args,
+                state=trainer.state,
+                final_checkpoint=str(final_artifact) if final_artifact is not None else None,
+            )
     except Exception as exc:
         if zero3_debug:
             try:

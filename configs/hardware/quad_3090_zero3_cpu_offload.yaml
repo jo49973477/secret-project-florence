@@ -1,0 +1,4 @@
+defaults:
+- quad_3090_zero3
+- _self_
+zero3_offload_optimizer: true

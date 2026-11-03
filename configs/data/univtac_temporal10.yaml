@@ -1,0 +1,10 @@
+defaults:
+- univtac_multimodal
+- _self_
+modalities:
+  state:
+    delta_indices: [-9, -8, -7, -6, -5, -4, -3, -2, -1, 0]
+  pointcloud:
+    delta_indices: [-9, -8, -7, -6, -5, -4, -3, -2, -1, 0]
+  tactile:
+    delta_indices: [-10, -9, -8, -7, -6, -5, -4, -3, -2, -1, 0]

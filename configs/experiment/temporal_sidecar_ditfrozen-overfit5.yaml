@@ -1,0 +1,8 @@
+# @package _global_
+defaults:
+- florence_ablation_base
+- override /data: univtac_temporal5
+- _self_
+name: temporal_sidecar_ditfrozen-overfit5
+temporal:
+  window_size: 5

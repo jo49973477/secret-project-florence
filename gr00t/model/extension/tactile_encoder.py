@@ -155,10 +155,12 @@ class SparshDinoTactileEncoder(nn.Module):
         background_path: str | None = None,
         load_pretrained: bool = True,
         backbone_trainable: bool = True,
+        memory_map_checkpoint: bool = True,
     ) -> None:
         super().__init__()
         self.pretrained_model = pretrained_model
         self.checkpoint_filename = checkpoint_filename
+        self.memory_map_checkpoint = memory_map_checkpoint
         log_model_load_memory("before Sparsh architecture construction")
         self.backbone = SparshVisionTransformer()
         log_model_load_memory("after Sparsh architecture construction")
@@ -280,7 +282,9 @@ class SparshDinoTactileEncoder(nn.Module):
             ) from exc
 
     @staticmethod
-    def _read_checkpoint(checkpoint_path: Path) -> dict[str, torch.Tensor]:
+    def _read_checkpoint(
+        checkpoint_path: Path, *, memory_map: bool = True
+    ) -> dict[str, torch.Tensor]:
         suffix = checkpoint_path.suffix.lower()
         if suffix == ".safetensors":
             try:
@@ -296,7 +300,11 @@ class SparshDinoTactileEncoder(nn.Module):
                 f"Unsupported Sparsh checkpoint extension {suffix!r}; expected .safetensors, "
                 ".ckpt, .pt, or .pth."
             )
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        from gr00t.utils.checkpoint_io import load_torch_checkpoint
+
+        checkpoint = load_torch_checkpoint(
+            checkpoint_path, weights_only=False, memory_map=memory_map
+        )
         if isinstance(checkpoint, dict) and "model" in checkpoint:
             checkpoint = checkpoint["model"]
         if not isinstance(checkpoint, dict):
@@ -314,7 +322,12 @@ class SparshDinoTactileEncoder(nn.Module):
         return matching or checkpoint
 
     def _load_pretrained_weights(self, checkpoint_path: Path) -> None:
-        state_dict = self._read_checkpoint(checkpoint_path)
+        from gr00t.utils.model_load_diagnostics import model_load_phase
+
+        with model_load_phase("SPARSH.read", checkpoint=checkpoint_path):
+            state_dict = self._read_checkpoint(
+                checkpoint_path, memory_map=self.memory_map_checkpoint
+            )
         try:
             incompatible = self.backbone.load_state_dict(state_dict, strict=True, assign=True)
         except Exception as exc:
@@ -487,6 +500,7 @@ def build_tactile_encoder(
     background_path: str | None = None,
     load_pretrained: bool = True,
     backbone_trainable: bool = True,
+    memory_map_checkpoint: bool = True,
 ) -> nn.Module:
     normalized = encoder_cfg.lower().replace("-", "_")
     if normalized == "resnet18":
@@ -501,6 +515,7 @@ def build_tactile_encoder(
             background_path=background_path,
             load_pretrained=load_pretrained,
             backbone_trainable=backbone_trainable,
+            memory_map_checkpoint=memory_map_checkpoint,
         )
     raise ValueError(
         f"Unsupported tactile encoder {encoder_cfg!r}; expected 'resnet18' or 'sparsh_dino_base'."

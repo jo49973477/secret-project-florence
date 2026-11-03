@@ -55,7 +55,7 @@ uv run hf download nvidia/PhysicalAI-Robotics-GR00T-X-Embodiment-Sim \
   --local-dir /root/.cache/g00t/datasets/PhysicalAI-Robotics-GR00T-X-Embodiment-Sim
 
 DATASET_PATH=/root/.cache/g00t/datasets/PhysicalAI-Robotics-GR00T-X-Embodiment-Sim/single_panda_gripper.OpenDrawer
-uv run python scripts/repair_lerobot_metadata.py "$DATASET_PATH" \
+uv run python scripts/data/repair_lerobot_metadata.py "$DATASET_PATH" \
   --embodiment-tag ROBOCASA_PANDA_OMRON
 ```
 
@@ -69,7 +69,7 @@ uv run hf download nvidia/PhysicalAI-Robotics-GR00T-X-Embodiment-Sim \
 
 DATASET_PATH=$(find /root/.cache/g00t/datasets/PhysicalAI-Robotics-GR00T-X-Embodiment-Sim \
   -maxdepth 1 -type d -name "single_panda_gripper.*" | sort | paste -sd: -)
-uv run python scripts/repair_lerobot_metadata.py "$DATASET_PATH" \
+uv run python scripts/data/repair_lerobot_metadata.py "$DATASET_PATH" \
   --embodiment-tag ROBOCASA_PANDA_OMRON
 ```
 
