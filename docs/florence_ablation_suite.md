@@ -1,6 +1,6 @@
 # Florence Sidecar ablation suite
 
-All five experiments use `experiment/sidecar-ablation-suite`, the same UniVTAC five-episode subset, action normalization, action masks, and masked flow-matching objective. The Hydra configuration is saved under each run's `.hydra/config.yaml`; `output_dir` includes the run timestamp. No long jobs are launched by setup or preflight.
+All six experiments use `experiment/sidecar-ablation-suite`, the same UniVTAC five-episode subset, action normalization, action masks, and masked flow-matching objective. The Hydra configuration is saved under each run's `.hydra/config.yaml`; `output_dir` includes the run timestamp. No long jobs are launched by setup or preflight.
 
 ## Architectures
 
@@ -36,15 +36,16 @@ flowchart LR
     D --> F[Masked action flow loss]
 ```
 
-The two injection sites are independent. MoE acts on action embeddings before the DiT. Point Sidecar acts between selected original transformer blocks. The legacy contact surprise predictor and its Smooth L1 loss are disabled in all five configurations. No unvalidated surprise expert is instantiated by the selected MoE mode.
+The two injection sites are independent. MoE acts on action embeddings before the DiT. Point Sidecar acts between selected original transformer blocks. The legacy contact surprise predictor and its Smooth L1 loss are disabled in all six configurations. No unvalidated surprise expert is instantiated by the selected MoE mode.
 
 | Hydra experiment | Launcher mode | Architecture | DiT mode |
 |---|---|---|---|
 | `temporal_sidecar_ditfrozen-overfit5` | `temporal_frozen` | Temporal + Sidecar | frozen |
-| `temporal_sidecar_ditlora-overfit5` | `temporal_lora` | Temporal + Sidecar | LoRA |
-| `temporal_sidecar_ditfull-overfit5` | `temporal_full` | Temporal + Sidecar | full |
+| `temporal_sidecar_ditlora-overfit5` | `A` (or `temporal_lora`) | Temporal + Sidecar | LoRA |
+| `temporal_sidecar_ditfull-overfit5` | `C` (or `temporal_full`) | Temporal + Sidecar | full |
 | `moe_sidecar_ditfrozen-overfit5` | `sidecar_moe_frozen` | Input MoE + Sidecar | frozen |
-| `moe_sidecar_ditlora-overfit5` | `sidecar_moe_lora` | Input MoE + Sidecar | LoRA |
+| `moe_sidecar_ditlora-overfit5` | `B` (or `sidecar_moe_lora`) | Input MoE + Sidecar | LoRA |
+| `moe_sidecar_ditfull-overfit5` | `D` (or `sidecar_moe_full`) | Input MoE + Sidecar | full |
 
 Each architecture family shares one base configuration. Its variants change DiT trainability only. The full variant necessarily sets `tune_diffusion_model=true` and `freeze_pretrained_dit=false`; configuration validation rejects incompatible combinations. The VLM is frozen. Original DiT parameters use 1e-5 in full mode; new modules and LoRA use 1e-4. LoRA rank 16, alpha 32, dropout 0 is the default. Set `dit_training.rank=32` for a rank-32 run.
 
@@ -88,12 +89,20 @@ bash scripts/train_florence_ablations.sh temporal_frozen dry_run=true
 python scripts/verify_pretrained_dit.py --dit-type sidecar_conditioned_dit \
   --reference-checkpoint /absolute/path/to/GR00T-N1.7-3B --dtype bfloat16 --forward-parity
 
-# The following commands perform mandatory preflight, then start one training run each.
+# A-D form the 2 x 2 experiment matrix. Run ONE experiment at a time.
+# All modes perform mandatory pretrained-DiT preflight before starting Torchrun.
+bash scripts/train_florence_ablations.sh A hardware=quad_3090_zero3  # Temporal + LoRA
+bash scripts/train_florence_ablations.sh B hardware=quad_3090_zero3  # MoE + LoRA
+bash scripts/train_florence_ablations.sh C hardware=quad_3090_zero3  # Temporal + Full
+bash scripts/train_florence_ablations.sh D hardware=quad_3090_zero3  # MoE + Full
+
+# Safe Hydra composition/validation only (does not load weights or start GPUs).
+bash scripts/train_florence_ablations.sh A dry_run=true
+bash scripts/train_florence_ablations.sh D dry_run=true
+
+# Optional frozen-DiT control experiments (still supported).
 bash scripts/train_florence_ablations.sh temporal_frozen hardware=quad_3090_zero3
-bash scripts/train_florence_ablations.sh temporal_lora hardware=quad_3090_zero3
-bash scripts/train_florence_ablations.sh temporal_full hardware=quad_3090_zero3
 bash scripts/train_florence_ablations.sh sidecar_moe_frozen hardware=quad_3090_zero3
-bash scripts/train_florence_ablations.sh sidecar_moe_lora hardware=quad_3090_zero3
 
 # Ten-frame temporal variant (both the window and synchronized data offsets).
 bash scripts/train_florence_ablations.sh temporal_frozen \
