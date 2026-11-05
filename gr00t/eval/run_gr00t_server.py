@@ -164,11 +164,14 @@ def main(config: ServerConfig):
 
         policy = Gr00tSimPolicyWrapper(policy)
 
-    with PolicyServer(
+    server = PolicyServer(
         policy=policy,
         host=config.host,
         port=config.port,
-    ) as server:
+    )
+    if hasattr(policy, "get_model_info"):
+        server.register_endpoint("get_model_info", policy.get_model_info, requires_input=False)
+    with server:
         try:
             server.run()
         except KeyboardInterrupt:

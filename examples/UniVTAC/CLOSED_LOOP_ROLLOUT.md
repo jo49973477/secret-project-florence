@@ -1,5 +1,153 @@
 # GR00T + UniVTAC closed-loop rollout guide
 
+## Unified split and local launchers
+
+Both launchers call `scripts/run_gr00t_univtac_rollout.sh`, which retains the
+existing task loop, worker isolation, MP4 recording, and CSV/JSON summaries.
+`--policy auto` reads the loaded checkpoint's processor modalities through the
+server. It never chooses a policy from a checkpoint directory name. The server's
+`get_model_info` endpoint reports the loaded checkpoint identity, DiT mode,
+Sidecar type, LoRA state, modality windows, and action horizon. The runner hashes
+the local checkpoint's model weights, config, and processor config and compares
+the hash with the server. In split mode, keep a byte-identical local copy of the
+inference checkpoint, or pass its server-generated `--checkpoint-identity` when
+the weights are remote-only. The local and remote paths may differ.
+
+Prerequisites on the simulator workstation: a compatible UniVTAC checkout,
+`UNIVTAC_ROOT`, `UNIVTAC_EXPECTED_PYTHON`, and
+`UNIVTAC_PYTHON_COMMAND` (the Isaac-compatible Python launcher). The Isaac
+environment needs `numpy`, `pyzmq`, and `msgpack`. Local mode additionally
+needs the repository's separate `.venv/bin/python` with GR00T installed, or
+`--model-python /path/to/model/python`. Do not use the same Python executable
+for the two processes. The supported UniVTAC branches and Isaac versions are
+in the table below; Isaac Sim 6.0.1 is not supported by this checkout.
+
+### Split mode: externally managed remote server
+
+On the GPU server:
+
+```bash
+bash scripts/run_gr00t_univtac_server.sh \
+  --checkpoint "$REMOTE_CHECKPOINT" --embodiment-tag NEW_EMBODIMENT \
+  --device cuda:0 --host 127.0.0.1 --port 5555
+```
+
+If using SSH forwarding, run this separately on the simulator workstation:
+
+```bash
+ssh -N -L 5555:127.0.0.1:5555 user@gpu-server
+```
+
+RGB baseline smoke rollout, with `CHECKPOINT` pointing to the local copy:
+
+```bash
+bash scripts/run_gr00t_univtac_split.sh \
+  --checkpoint "$CHECKPOINT" --policy auto \
+  --server-host 127.0.0.1 --server-port 5555 \
+  --mode smoke --episodes-per-task 1 --tasks lift_can \
+  --execution-horizon 1 --sim-device cuda:0 --output-dir "$OUT"
+```
+
+The split launcher retries readiness until `--startup-timeout` expires. It
+never starts or stops the remote server. A disconnected server or checkpoint
+mismatch stops the run with an explicit error.
+
+For a remote-only checkpoint, obtain its content identity on the GPU server:
+
+```bash
+CHECKPOINT_ID=$(.venv/bin/python -c \
+  'from examples.UniVTAC.univtac_rollout.checkpoint import checkpoint_identity; import sys; print(checkpoint_identity(sys.argv[1]))' \
+  "$REMOTE_CHECKPOINT")
+```
+
+Pass `--checkpoint "$REMOTE_CHECKPOINT" --checkpoint-identity "$CHECKPOINT_ID"`
+to the split launcher. The local path then acts as a result label; verification
+uses the exact server-generated SHA-256 identity. Keep the identity with the
+checkpoint artifact so an incorrect server cannot be accepted by path alone.
+
+### Local mode: two isolated processes
+
+The local launcher checks the port, starts only its own GR00T server, waits for
+readiness and checkpoint verification, runs the shared evaluator, then stops
+its server on completion, failure, SIGINT, or SIGTERM. It never kills a service
+that was already bound to the requested port.
+
+```bash
+bash scripts/run_gr00t_univtac_local.sh \
+  --checkpoint "$CHECKPOINT" --policy auto \
+  --model-python .venv/bin/python --model-device cuda:0 --sim-device cuda:0 \
+  --server-port 5555 --mode smoke --episodes-per-task 1 --tasks lift_can \
+  --execution-horizon 1 --output-dir "$OUT"
+```
+
+Use `--model-visible-devices 1 --sim-visible-devices 0` to isolate physical
+GPUs. Each process then sees its own `cuda:0`; record both visibility masks and
+device arguments when comparing runs. The launcher's `nvidia-smi` diagnostic
+records GPU model, total and free VRAM before launch, after model loading,
+after simulator initialization when observed, and peak used VRAM during the
+rollout. These observations are warnings, not a guarantee that a 24 GB card
+can fit both processes. CUDA OOM and process crashes preserve logs and exit
+nonzero. `--startup-timeout` and `--retry-interval` control readiness waiting.
+
+### WAH Temporal and MoE smoke rollouts
+
+For either launcher, choose a complete checkpoint for the desired Temporal or
+MoE Sidecar and DiT LoRA or full fine-tuning run. The server reads those choices
+from model config and verifies that Sidecar and LoRA weights were restored.
+Temporal windows come from the checkpoint processor's `delta_indices`.
+For example, the current Temporal configuration uses state and scene point
+cloud `[-4,-3,-2,-1,0]` and tactile `[-5,-4,-3,-2,-1,0]`.
+
+```bash
+# Temporal Sidecar + DiT LoRA
+CHECKPOINT=/path/to/temporal-lora-checkpoint
+bash scripts/run_gr00t_univtac_local.sh \
+  --checkpoint "$CHECKPOINT" --policy wah \
+  --sensor-contract /path/to/training-dataset/meta/modality.json \
+  --scene-calibration /path/to/scene-calibration.json \
+  --model-device cuda:0 --sim-device cuda:0 \
+  --mode smoke --episodes-per-task 1 --tasks lift_can --execution-horizon 1 \
+  --output-dir "$OUT"
+
+# MoE Sidecar + DiT LoRA; remote server already running
+CHECKPOINT=/path/to/local-copy-of-moe-lora-checkpoint
+bash scripts/run_gr00t_univtac_split.sh \
+  --checkpoint "$CHECKPOINT" --policy wah \
+  --sensor-contract /path/to/training-dataset/meta/modality.json \
+  --scene-calibration /path/to/scene-calibration.json \
+  --server-host 127.0.0.1 --server-port 5555 \
+  --mode smoke --episodes-per-task 1 --tasks lift_can --execution-horizon 1 \
+  --sim-device cuda:0 --output-dir "$OUT"
+```
+
+The sensor contract is the exact `meta/modality.json` produced alongside the
+training dataset. It supplies scene point count, voxel size, workspace crop,
+sampling seed, coordinate frame, and the tactile training source key. The
+optional scene calibration JSON follows the converter's `cameras.head` and
+`cameras.wrist` schema: pinhole `intrinsics`, `depth_scale` to metres, static
+head `T_base_camera`, and wrist `T_ee_camera`. The wrist transform is composed
+with the current `embodiment.ee` pose. A per-frame `T_base_camera` supplied by
+UniVTAC overrides calibration. The simulator must provide actual aligned head
+and wrist depth; the adapter will not invent point clouds. If the training
+source is `tactile/.../rgb`, the simulator must expose actual `tactile.rgb`.
+If it exposes only `rgb_marker`, use a checkpoint trained from that stream or
+collect the required raw tactile stream. Camera RGB cannot replace tactile.
+
+To run all canonical tasks, replace `--mode smoke --episodes-per-task 1 --tasks
+lift_can` with `--mode full --tasks all`. `--seed-start`, `--step-limit`, and
+`--execution-horizon` retain their existing meanings. Every run writes
+`summary.json`, `summary.csv`, `episodes.csv`, `videos/`, `logs/`, and
+`runtime_metadata.json` under its output directory. By default the launchers
+use `outputs/rollouts/<checkpoint-name>/<timestamp>/`. Supply a fresh
+`--output-dir` for each run.
+
+Native ZeRO-3 directories are not inference checkpoints. Export one with
+`python scripts/export_zero3_checkpoint.py CHECKPOINT OUTPUT` before starting
+the server. If WAH startup reports missing Sidecar or LoRA weights, verify the
+export includes all model shards. If WAH fails with missing camera intrinsics,
+depth, wrist extrinsics, or tactile source, fix the UniVTAC sensor output or
+calibration; the runner deliberately rejects fabricated data.
+
 The GR00T server and UniVTAC simulator intentionally run in separate Python environments:
 
 - The SPL server runs `gr00t/eval/run_gr00t_server.py` and owns the checkpoint.

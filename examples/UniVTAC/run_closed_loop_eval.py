@@ -33,6 +33,13 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--univtac-root", type=Path, required=True)
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument(
+        "--checkpoint-identity",
+        help="Server SHA-256 identity when checkpoint weights are remote-only.",
+    )
+    parser.add_argument("--policy", choices=("auto", "rgb", "wah"), default="auto")
+    parser.add_argument("--sensor-contract", type=Path)
+    parser.add_argument("--scene-calibration", type=Path)
     parser.add_argument("--server-host", default="127.0.0.1")
     parser.add_argument("--server-port", type=int, default=5555)
     parser.add_argument("--mode", choices=tuple(MODE_EPISODES), default="smoke")
@@ -202,8 +209,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         args.server_port,
         execution_horizon=args.execution_horizon,
         timeout_ms=round(args.request_timeout_seconds * 1000),
-    ):
-        pass
+        checkpoint=args.checkpoint,
+        expected_checkpoint_identity=getattr(args, "checkpoint_identity", None),
+        policy=getattr(args, "policy", "auto"),
+        sensor_contract=getattr(args, "sensor_contract", None),
+        scene_calibration=getattr(args, "scene_calibration", None),
+    ) as connected_policy:
+        server_info = getattr(connected_policy, "model_info", None)
 
     python_command = shlex.split(args.python_command)
     if not python_command:
@@ -233,6 +245,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             str(args.execution_horizon),
             "--checkpoint",
             args.checkpoint,
+            "--policy",
+            getattr(args, "policy", "auto"),
             "--server-host",
             args.server_host,
             "--server-port",
@@ -246,6 +260,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "--device",
             args.device,
         ]
+        if getattr(args, "checkpoint_identity", None):
+            command.extend(("--checkpoint-identity", args.checkpoint_identity))
+        if getattr(args, "sensor_contract", None) is not None:
+            command.extend(("--sensor-contract", str(args.sensor_contract.resolve())))
+        if getattr(args, "scene_calibration", None) is not None:
+            command.extend(("--scene-calibration", str(args.scene_calibration.resolve())))
         if args.headless:
             command.append("--headless")
         if args.expected_python is not None:
@@ -275,8 +295,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         result_error = ""
         if result_json.is_file():
             try:
-                task_episodes, task_metadata, completed, phase, fatal_error = (
-                    _load_worker_result(result_json)
+                task_episodes, task_metadata, completed, phase, fatal_error = _load_worker_result(
+                    result_json
                 )
             except Exception as exc:
                 result_error = f"Could not read worker result {result_json}: {exc}"
@@ -387,6 +407,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if any(row.success is None for row in all_episodes)
             else "completed",
             "runtime_by_task": runtime_metadata,
+            "model_info": server_info,
         },
     )
     print("\n" + (output_dir / "summary.txt").read_text(encoding="utf-8"))

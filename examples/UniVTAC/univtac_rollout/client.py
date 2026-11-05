@@ -134,6 +134,14 @@ class MinimalPolicyClient:
             raise TypeError(f"Expected modality config dict, got {type(response).__name__}.")
         return response
 
+    def get_model_info(self) -> dict[str, Any]:
+        response = self.call("get_model_info")
+        if not isinstance(response, dict) or "checkpoint_identity" not in response:
+            raise RuntimeError(
+                "GR00T server lacks the required get_model_info checkpoint contract."
+            )
+        return response
+
     def close(self) -> None:
         if self._closed:
             return

@@ -314,7 +314,9 @@ Interpret these offline diagnostics conservatively. Similar normal, black, and s
 
 ## Closed-loop rollout evaluation
 
-For copy-paste commands with the correct working directory for both terminals, see [CLOSED_LOOP_ROLLOUT.md](CLOSED_LOOP_ROLLOUT.md).
+For RGB and WAH Temporal/MoE rollouts in split or local deployment, see
+[CLOSED_LOOP_ROLLOUT.md](CLOSED_LOOP_ROLLOUT.md). Both launchers share the
+existing evaluation entry point and result format.
 
 The offline diagnostic above compares dataset actions with predictions; model actions never affect its next input. The closed-loop evaluator instead runs the decoded action through UniVTAC's official `task.take_action(..., action_type="qpos")` API, observes the resulting simulator state, and reports the task's own `check_success()` / `eval_success` result. Its primary metric is per-task Success Rate and the unweighted macro-average across tasks.
 

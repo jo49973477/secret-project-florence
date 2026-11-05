@@ -56,6 +56,9 @@ def policy():
     mock_model.to = MagicMock(return_value=mock_model)
     mock_model.device = torch.device("cpu")
     mock_model.dtype = torch.bfloat16
+    mock_model.config.use_point_conditioning = False
+    mock_model.config.use_tactile_conditioning = False
+    mock_model.config.temporal_window_size = 0
 
     mock_model.get_action = MagicMock(
         return_value=BatchFeature(data={"action_pred": torch.randn(1, 16, 7)})
@@ -110,8 +113,12 @@ def policy():
         patch("gr00t.policy.gr00t_policy.AutoProcessor") as MockAutoProcessor,
         patch("pathlib.Path.is_dir", return_value=False),
         patch("pathlib.Path.exists", return_value=True),
+        patch(
+            "examples.UniVTAC.univtac_rollout.checkpoint.checkpoint_identity",
+            return_value="sha256:fixture",
+        ),
     ):
-        MockAutoModel.from_pretrained.return_value = mock_model
+        MockAutoModel.from_pretrained.return_value = (mock_model, {"missing_keys": []})
         MockAutoProcessor.from_pretrained.return_value = mock_processor
 
         from gr00t.policy.gr00t_policy import Gr00tPolicy

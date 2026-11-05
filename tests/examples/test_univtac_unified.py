@@ -1,0 +1,483 @@
+"""CPU-only contracts for unified RGB/WAH and deployment orchestration."""
+
+from __future__ import annotations
+
+from pathlib import Path
+import sys
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+
+ROOT = Path(__file__).parents[2]
+sys.path.insert(0, str(ROOT / "examples" / "UniVTAC"))
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from gr00t.policy.gr00t_policy import validate_wah_restoration  # noqa: E402
+from univtac_deployment import build_rollout_command, check_port, wait_ready  # noqa: E402
+from univtac_rollout.checkpoint import checkpoint_identity  # noqa: E402
+from univtac_rollout.multimodal import (  # noqa: E402
+    ObservationHistory,
+    detect_policy,
+    scene_frame,
+    tactile_frame,
+    validate_contract,
+)
+from univtac_rollout.policy import Gr00tUniVTACPolicy  # noqa: E402
+
+
+def configs(temporal: bool = False) -> dict:
+    result = {
+        "video": {"delta_indices": [0], "modality_keys": ["head", "wrist"]},
+        "state": {
+            "delta_indices": [-4, -3, -2, -1, 0] if temporal else [0],
+            "modality_keys": ["joint"],
+        },
+        "action": {"delta_indices": list(range(16)), "modality_keys": ["joint"]},
+        "language": {"delta_indices": [0], "modality_keys": ["annotation.human.task_description"]},
+    }
+    if temporal:
+        result["pointcloud"] = {"delta_indices": [-4, -3, -2, -1, 0], "modality_keys": ["scene"]}
+        result["tactile"] = {"delta_indices": [-5, -4, -3, -2, -1, 0], "modality_keys": ["rgb"]}
+    return result
+
+
+def observation(value: int = 0) -> dict:
+    return {
+        "observation": {
+            "head": {"rgb": np.full((2, 2, 3), value, dtype=np.uint8)},
+            "wrist": {"rgb": np.full((2, 2, 3), value + 1, dtype=np.uint8)},
+            "pointcloud": {
+                "scene": np.full((4, 6), value, dtype=np.float32),
+                "coordinate_frame": "robot_base",
+                "xyz_units": "m",
+                "preprocessing": {"num_points": 4, "voxel_size_m": 0.01, "sampling_seed": 0},
+            },
+        },
+        "embodiment": {"joint": np.full(8, value, dtype=np.float32)},
+        "tactile": {"rgb_marker": np.full((2, 2, 3), value, dtype=np.uint8)},
+    }
+
+
+def contract() -> dict:
+    return {
+        "pointcloud": {
+            "scene": {
+                "num_points": 4,
+                "feature_dim": 6,
+                "voxel_size_m": 0.01,
+                "coordinate_frame": "robot_base",
+                "sampling_seed": 0,
+            }
+        },
+        "tactile": {"rgb": {"source_key": "tactile/rgb_marker"}},
+    }
+
+
+def fake_checkpoint(path: Path, weight: bytes = b"weights") -> Path:
+    path.mkdir()
+    (path / "config.json").write_text("{}")
+    (path / "processor_config.json").write_text("{}")
+    (path / "model.safetensors").write_bytes(weight)
+    return path
+
+
+def test_rgb_baseline_contract_and_observation() -> None:
+    assert validate_contract(configs(), 1, "auto") == "rgb"
+    frame = ObservationHistory(configs(), None).append(observation(), "lift can", 0)
+    assert frame["video"]["head"].shape == (1, 1, 2, 2, 3)
+    assert frame["state"]["joint"].shape == (1, 1, 8)
+
+
+def test_wah_detection_and_explicit_rgb_rejection() -> None:
+    assert detect_policy(configs(True)) == "wah"
+    with pytest.raises(ValueError, match="requires wah"):
+        validate_contract(configs(True), 1, "rgb")
+    incomplete = configs(True)
+    del incomplete["pointcloud"]
+    with pytest.raises(ValueError, match="both pointcloud.scene and tactile.rgb"):
+        validate_contract(incomplete, 1, "auto")
+
+
+def test_history_padding_reset_and_validity() -> None:
+    history = ObservationHistory(configs(True), contract())
+    first = history.append(observation(1), "lift can", 0)
+    assert first["state"]["joint"].shape == (1, 5, 8)
+    assert first["tactile"]["rgb"].shape == (1, 6, 2, 2, 3)
+    assert first["temporal_valid"].tolist() == [[False, False, False, False, True]]
+    history.append(observation(2), "lift can", 1)
+    history.reset()
+    next_episode = history.append(observation(9), "lift can", 0)
+    assert np.all(next_episode["state"]["joint"] == 9)
+    with pytest.raises(ValueError, match="not after"):
+        history.append(observation(), "lift can", 0)
+
+
+def test_scene_projection_uses_robot_base_extrinsics() -> None:
+    obs = observation()
+    obs["observation"].pop("pointcloud")
+    for name in ("head", "wrist"):
+        sensor = obs["observation"][name]
+        sensor.update(
+            depth=np.ones((2, 2), dtype=np.float32),
+            intrinsics=np.array([1, 1, 0, 0]),
+            depth_scale=1.0,
+            T_base_camera=np.eye(4),
+        )
+    obs["observation"]["wrist"]["T_base_camera"][0, 3] = 2.0
+    points = scene_frame(obs, contract(), 0)
+    assert points.shape == (4, 6)
+    assert np.any(points[:, 0] >= 2)
+    assert np.all(points[:, 3:] <= 255)
+
+
+def test_missing_scene_sensor_rejected() -> None:
+    obs = observation()
+    obs["observation"].pop("pointcloud")
+    with pytest.raises(ValueError, match="missing.*depth"):
+        scene_frame(obs, contract(), 0)
+
+
+def test_prebuilt_scene_requires_frame_and_metric_units() -> None:
+    obs = observation()
+    del obs["observation"]["pointcloud"]["xyz_units"]
+    with pytest.raises(ValueError, match="xyz_units='m'"):
+        scene_frame(obs, contract(), 0)
+
+
+def test_tactile_source_and_dtype() -> None:
+    image = tactile_frame(observation(), contract())
+    assert image.shape == (2, 2, 3) and image.dtype == np.uint8
+    wrong = contract()
+    wrong["tactile"]["rgb"]["source_key"] = "tactile/rgb"
+    with pytest.raises(ValueError, match="trained from tactile/rgb"):
+        tactile_frame(observation(), wrong)
+
+
+def test_checkpoint_identity_is_path_independent_and_mismatch(monkeypatch, tmp_path: Path) -> None:
+    first = fake_checkpoint(tmp_path / "a")
+    second = fake_checkpoint(tmp_path / "b", b"different")
+    clone = fake_checkpoint(tmp_path / "c")
+    assert checkpoint_identity(first) == checkpoint_identity(clone)
+    assert checkpoint_identity(first) != checkpoint_identity(second)
+    (clone / "statistics.json").write_text('{"joint": 1}')
+    assert checkpoint_identity(first) != checkpoint_identity(clone)
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def ping(self):
+            return True
+
+        def get_model_info(self):
+            return {"checkpoint_identity": checkpoint_identity(second)}
+
+        def get_modality_config(self):
+            return configs()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("univtac_rollout.policy.MinimalPolicyClient", Client)
+    with pytest.raises(ValueError, match="Checkpoint identity mismatch"):
+        Gr00tUniVTACPolicy("localhost", 5555, checkpoint=str(first))
+
+
+def test_wah_policy_sends_real_multimodal_history(monkeypatch, tmp_path: Path) -> None:
+    import json
+
+    sensor_file = tmp_path / "modality.json"
+    sensor_file.write_text(json.dumps(contract()))
+    expected = "sha256:" + "a" * 64
+
+    class Client:
+        sent = None
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def ping(self):
+            return True
+
+        def get_model_info(self):
+            return {
+                "checkpoint_identity": expected,
+                "action_horizon": 16,
+                "dit_type": "sidecar_conditioned_dit",
+                "sidecar_type": "temporal",
+                "dit_training_mode": "lora",
+                "dit_lora_enabled": True,
+            }
+
+        def get_modality_config(self):
+            return configs(True)
+
+        def reset(self):
+            pass
+
+        def close(self):
+            pass
+
+        def get_action(self, data):
+            self.sent = data
+            return ({"joint": np.zeros((1, 16, 8), dtype=np.float32)}, {})
+
+    monkeypatch.setattr("univtac_rollout.policy.MinimalPolicyClient", Client)
+    with Gr00tUniVTACPolicy(
+        "localhost",
+        5555,
+        checkpoint="/remote/checkpoint",
+        expected_checkpoint_identity=expected,
+        sensor_contract=str(sensor_file),
+    ) as policy:
+        policy.reset()
+        action, formatted = policy.predict_chunk(observation(3), "lift can", timestamp=0)
+        assert action.shape == (1, 8)
+        assert policy.client.sent["pointcloud"]["scene"].shape == (1, 5, 4, 6)
+        assert policy.client.sent["tactile"]["rgb"].shape == (1, 6, 2, 2, 3)
+        assert np.all(formatted["pointcloud"]["scene"] == 3)
+        policy.record_observation(observation(4), "lift can", 1)
+        _, formatted = policy.predict_chunk(observation(4), "lift can", timestamp=1)
+        assert formatted["state"]["joint"][0, -1, 0] == 4
+        policy.reset()
+        _, formatted = policy.predict_chunk(observation(9), "lift can", timestamp=0)
+        assert np.all(formatted["state"]["joint"] == 9)
+
+
+def test_sidecar_lora_missing_weights_rejected() -> None:
+    model = SimpleNamespace(
+        config=SimpleNamespace(dit_type="sidecar_conditioned_dit", dit_training_mode="lora"),
+        state_dict=lambda: {
+            "action_head.model.sidecar_stages.0.weight": 1,
+            "action_head.model.sidecar_pool.weight": 1,
+            "action_head.model.transformer_blocks.0.lora_A": 1,
+        },
+    )
+    validate_wah_restoration(model, {"missing_keys": []})
+    with pytest.raises(RuntimeError, match="did not restore"):
+        validate_wah_restoration(model, {"missing_keys": ["action_head.model.sidecar_pool.weight"]})
+    with pytest.raises(RuntimeError, match="did not restore"):
+        validate_wah_restoration(
+            model, {"missing_keys": ["action_head.model.transformer_blocks.0.lora_A"]}
+        )
+
+
+def test_split_local_rollout_command_parity_and_gpu_argument(tmp_path: Path) -> None:
+    base = dict(
+        checkpoint="checkpoint",
+        policy="auto",
+        server_host="127.0.0.1",
+        server_port=5555,
+        execution_horizon=1,
+        sim_device="cuda:1",
+        sensor_contract=None,
+        scene_calibration=None,
+    )
+    split = SimpleNamespace(**base, deployment="split")
+    local = SimpleNamespace(**base, deployment="local")
+    command = build_rollout_command(split, tmp_path, ["--mode", "smoke"])
+    assert command == build_rollout_command(local, tmp_path, ["--mode", "smoke"])
+    assert command[command.index("--device") + 1] == "cuda:1"
+
+
+def test_local_port_conflict_does_not_kill_service(monkeypatch) -> None:
+    import univtac_deployment as deployment
+
+    calls = []
+
+    class Socket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            calls.append("closed")
+
+        def connect_ex(self, address):
+            return 0
+
+    monkeypatch.setattr(deployment.socket, "socket", Socket)
+    with pytest.raises(RuntimeError, match="occupied"):
+        check_port("127.0.0.1", 5555)
+    assert calls == ["closed"]
+
+
+def test_server_readiness_timeout_and_crash(monkeypatch) -> None:
+    import univtac_deployment as deployment
+
+    args = SimpleNamespace(
+        startup_timeout=0.01,
+        retry_interval=0.001,
+        server_host="127.0.0.1",
+        server_port=1,
+        checkpoint="none",
+        policy="auto",
+        execution_horizon=1,
+    )
+    monkeypatch.setattr(
+        deployment, "probe", lambda *a: (_ for _ in ()).throw(ConnectionError("offline"))
+    )
+    with pytest.raises(TimeoutError, match="readiness timed out"):
+        wait_ready(args, None)
+    crashed = SimpleNamespace(poll=lambda: 9, returncode=9)
+    with pytest.raises(RuntimeError, match="exited before readiness"):
+        wait_ready(args, crashed)
+
+
+def test_local_startup_and_worker_crash_preserve_metadata(monkeypatch, tmp_path: Path) -> None:
+    import univtac_deployment as deployment
+
+    checkpoint = fake_checkpoint(tmp_path / "checkpoint")
+    (tmp_path / "envs").mkdir()
+    (tmp_path / "envs" / "_base_task.py").touch()
+    output = tmp_path / "results"
+    args = SimpleNamespace(
+        deployment="local",
+        checkpoint=str(checkpoint),
+        policy="auto",
+        server_host="127.0.0.1",
+        server_port=5555,
+        model_python=ROOT / ".venv" / "bin" / "python",
+        model_device="cuda:2",
+        sim_device="cuda:1",
+        model_visible_devices="2",
+        sim_visible_devices="1",
+        startup_timeout=1,
+        retry_interval=0.01,
+        output_dir=output,
+        sensor_contract=None,
+        scene_calibration=None,
+        execution_horizon=1,
+    )
+    monkeypatch.setenv("UNIVTAC_EXPECTED_PYTHON", "/usr/bin/python3")
+    monkeypatch.setenv("UNIVTAC_ROOT", str(tmp_path))
+    monkeypatch.setattr(deployment, "validate_python", lambda *a: None)
+    monkeypatch.setattr(deployment, "check_port", lambda *a: None)
+    monkeypatch.setattr(deployment, "gpu_memory", lambda: [])
+    monkeypatch.setattr(
+        deployment,
+        "wait_ready",
+        lambda *a: {"checkpoint_identity": checkpoint_identity(checkpoint), "policy_type": "rgb"},
+    )
+    monkeypatch.setattr(deployment, "git_commit", lambda: "abc123")
+    stopped = []
+    monkeypatch.setattr(deployment, "stop_owned", lambda process: stopped.append(process))
+    spawned = []
+
+    class Process:
+        returncode = None
+
+        def __init__(self, command, **kwargs):
+            self.command = command
+            self.is_server = len(spawned) == 0
+            spawned.append(self)
+
+        def poll(self):
+            return None if self.is_server else 7
+
+        def wait(self):
+            self.returncode = 7
+            return 7
+
+    monkeypatch.setattr(deployment.subprocess, "Popen", Process)
+    assert deployment.run(args, ["--mode", "smoke"]) == 7
+    assert "--device" in spawned[0].command
+    assert spawned[0].command[spawned[0].command.index("--device") + 1] == "cuda:2"
+    assert spawned[1].command[spawned[1].command.index("--device") + 1] == "cuda:1"
+    assert spawned[1].command[-2:] == ["--mode", "smoke"]
+    assert spawned[0] in stopped and spawned[1] in stopped
+    metadata = __import__("json").loads((output / "runtime_metadata.json").read_text())
+    assert metadata["deployment_mode"] == "local"
+    assert metadata["model_visible_devices"] == "2"
+
+
+def test_owned_process_cleanup_uses_only_its_process_group(monkeypatch) -> None:
+    import univtac_deployment as deployment
+
+    signals = []
+    monkeypatch.setattr(deployment.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+
+    class Process:
+        pid = 1234
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return 0
+
+    deployment.stop_owned(Process())
+    assert signals == [(1234, deployment.signal.SIGTERM)]
+
+
+@pytest.mark.parametrize("signum", [__import__("signal").SIGINT, __import__("signal").SIGTERM])
+def test_signal_cleanup_stops_owned_server_and_rollout(monkeypatch, tmp_path: Path, signum) -> None:
+    import univtac_deployment as deployment
+
+    checkpoint = fake_checkpoint(tmp_path / "checkpoint")
+    (tmp_path / "envs").mkdir()
+    (tmp_path / "envs" / "_base_task.py").touch()
+    args = SimpleNamespace(
+        deployment="local",
+        checkpoint=str(checkpoint),
+        policy="auto",
+        server_host="127.0.0.1",
+        server_port=5555,
+        model_python=ROOT / ".venv" / "bin" / "python",
+        model_device="cuda:0",
+        sim_device="cuda:0",
+        model_visible_devices=None,
+        sim_visible_devices=None,
+        startup_timeout=1,
+        retry_interval=0.01,
+        output_dir=tmp_path / "results",
+        sensor_contract=None,
+        scene_calibration=None,
+        execution_horizon=1,
+    )
+    monkeypatch.setenv("UNIVTAC_EXPECTED_PYTHON", "/usr/bin/python3")
+    monkeypatch.setenv("UNIVTAC_ROOT", str(tmp_path))
+    monkeypatch.setattr(deployment, "validate_python", lambda *a: None)
+    monkeypatch.setattr(deployment, "check_port", lambda *a: None)
+    monkeypatch.setattr(deployment, "gpu_memory", lambda: [])
+    monkeypatch.setattr(
+        deployment,
+        "wait_ready",
+        lambda *a: {"checkpoint_identity": checkpoint_identity(checkpoint), "policy_type": "rgb"},
+    )
+    monkeypatch.setattr(deployment, "git_commit", lambda: None)
+    spawned = []
+    stopped = []
+
+    class Process:
+        def __init__(self, command, **kwargs):
+            self.command = command
+            self.returncode = None
+            spawned.append(self)
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self):
+            return self.returncode
+
+    def stop(process):
+        if process is not None:
+            stopped.append(process)
+            process.returncode = -int(signum)
+
+    fired = False
+
+    def fire_signal(seconds):
+        nonlocal fired
+        if not fired:
+            fired = True
+            deployment.signal.getsignal(signum)(signum, None)
+
+    monkeypatch.setattr(deployment.subprocess, "Popen", Process)
+    monkeypatch.setattr(deployment, "stop_owned", stop)
+    monkeypatch.setattr(deployment.time, "sleep", fire_signal)
+    assert deployment.run(args, []) == 130
+    assert spawned[0] in stopped and spawned[1] in stopped
+    assert (args.output_dir / "runtime_metadata.json").is_file()

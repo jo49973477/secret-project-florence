@@ -177,6 +177,14 @@ tmp/
 
 demo_data/
 examples/
+!examples/
+examples/*
+!examples/UniVTAC/
+examples/UniVTAC/*
+!examples/UniVTAC/univtac_rollout/
+examples/UniVTAC/univtac_rollout/*
+!examples/UniVTAC/univtac_rollout/checkpoint.py
+!examples/UniVTAC/univtac_rollout/multimodal.py
 *mp4
 *.parquet
 *.whl

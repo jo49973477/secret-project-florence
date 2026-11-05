@@ -21,6 +21,7 @@ This module provides the core policy classes for running Gr00t models:
 """
 
 from pathlib import Path
+import sys
 from typing import Any
 
 import numpy as np
@@ -65,6 +66,29 @@ def _prepare_policy_model_inputs(collated_inputs: Any, model: Any) -> Any:
         # here would irreversibly quantize XYZ and tactile pixels to BF16.
         return collated_inputs
     return _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
+
+
+def validate_wah_restoration(model: Any, loading_info: dict[str, Any]) -> None:
+    """Reject partially restored Sidecar and DiT LoRA checkpoints."""
+    config = model.config
+    if getattr(config, "dit_type", None) != "sidecar_conditioned_dit":
+        return
+    names = set(model.state_dict())
+    required = ("action_head.model.sidecar_stages", "action_head.model.sidecar_pool")
+    for prefix in required:
+        if not any(name.startswith(prefix) for name in names):
+            raise RuntimeError(f"Sidecar checkpoint model has no {prefix} weights.")
+    missing = loading_info.get("missing_keys", [])
+    unloaded = [name for name in missing if name.startswith("action_head.")]
+    if getattr(config, "dit_training_mode", None) == "lora":
+        if not any("lora_" in name for name in names):
+            raise RuntimeError("Checkpoint declares DiT LoRA but model contains no LoRA weights.")
+        unloaded.extend(name for name in missing if "lora_" in name)
+    if unloaded:
+        raise RuntimeError(
+            "Checkpoint did not restore Sidecar/DiT LoRA weights: "
+            f"{unloaded[:12]}. Export a complete inference checkpoint."
+        )
 
 
 def _sim_language_batch_to_sequence(value: Any) -> Any:
@@ -115,10 +139,18 @@ class Gr00tPolicy(BasePolicy):
         model_dir = Path(model_path)
 
         # Load the pretrained model and move to target device with bfloat16 precision
-        model = AutoModel.from_pretrained(model_dir)
+        model, loading_info = AutoModel.from_pretrained(model_dir, output_loading_info=True)
+        validate_wah_restoration(model, loading_info)
         model.eval()  # Set model to evaluation mode
         model.to(device=device, dtype=torch.bfloat16)
         self.model = model
+        repo_root = str(Path(__file__).resolve().parents[2])
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        from examples.UniVTAC.univtac_rollout.checkpoint import checkpoint_identity
+
+        self.checkpoint_identity = checkpoint_identity(model_dir)
+        self.checkpoint_path = str(model_dir.resolve())
 
         # Load the processor for input/output transformation.
         # Training saves processor files under a "processor/" subdirectory, but
@@ -172,6 +204,31 @@ class Gr00tPolicy(BasePolicy):
             for k, v in all_modality_configs[self.embodiment_tag.value].items()
             if k != "rl_info"
         }
+        for modality, flag in (
+            ("pointcloud", "use_point_conditioning"),
+            ("tactile", "use_tactile_conditioning"),
+        ):
+            model_requires = bool(getattr(model.config, flag, False))
+            processor_has = modality in self.modality_configs
+            if model_requires != processor_has:
+                raise ValueError(
+                    f"Checkpoint model {flag}={model_requires} conflicts with processor "
+                    f"{modality} configured={processor_has}. Refusing mismatched modalities."
+                )
+        window = int(getattr(model.config, "temporal_window_size", 0) or 0)
+        if window:
+            for modality, count in (
+                ("state", window),
+                ("pointcloud", window),
+                ("tactile", window + 1),
+            ):
+                configured = self.modality_configs.get(modality)
+                actual = len(configured.delta_indices) if configured is not None else 0
+                if actual != count:
+                    raise ValueError(
+                        f"Checkpoint temporal_window_size={window} requires {modality} "
+                        f"window {count}, processor declares {actual}."
+                    )
         self.collate_fn = self.processor.collator
 
         # Extract and validate language configuration
@@ -183,6 +240,38 @@ class Gr00tPolicy(BasePolicy):
         assert len(language_delta_indices) == 1, "Only one language delta index is supported"
         self.language_key = language_keys[0]
         self._previous_tactile: dict[str, np.ndarray] = {}
+
+    def get_model_info(self) -> dict[str, Any]:
+        config = self.model.config
+        modalities = {
+            name: {
+                "modality_keys": list(value.modality_keys),
+                "delta_indices": list(value.delta_indices),
+            }
+            for name, value in self.modality_configs.items()
+        }
+        if getattr(config, "dit_type", "") != "sidecar_conditioned_dit":
+            sidecar = "none"
+        elif getattr(config, "temporal_window_size", 0):
+            sidecar = "temporal"
+        elif getattr(config, "contact_input_mode", "none") != "none":
+            sidecar = "moe"
+        else:
+            sidecar = "standard"
+        return {
+            "checkpoint_identity": self.checkpoint_identity,
+            "checkpoint_path": self.checkpoint_path,
+            "architecture": getattr(config, "model_type", type(self.model).__name__),
+            "dit_type": getattr(config, "dit_type", "unknown"),
+            "dit_training_mode": getattr(config, "dit_training_mode", "unknown"),
+            "dit_lora_enabled": getattr(config, "dit_training_mode", None) == "lora",
+            "sidecar_type": sidecar,
+            "temporal_window_size": getattr(config, "temporal_window_size", 0),
+            "required_modalities": list(modalities),
+            "modality_configs": modalities,
+            "action_horizon": len(self.modality_configs["action"].delta_indices),
+            "point_input_dim": getattr(config, "point_input_dim", None),
+        }
 
     def _with_tactile_history(self, observation: dict[str, Any]) -> dict[str, Any]:
         """Expand a current-only tactile observation to training-time history semantics."""
@@ -244,6 +333,8 @@ class Gr00tPolicy(BasePolicy):
                     unbatched_value[modality] = {
                         key: modality_value[i] for key, modality_value in value[modality].items()
                     }
+            if "temporal_valid" in value:
+                unbatched_value["temporal_valid"] = value["temporal_valid"][i]
             unbatched_obs.append(unbatched_value)
         return unbatched_obs
 
@@ -264,6 +355,9 @@ class Gr00tPolicy(BasePolicy):
             embodiment=self.embodiment_tag,
             tactile=observation.get("tactile"),
             pointclouds=observation.get("pointcloud"),
+            metadata={"temporal_valid": observation["temporal_valid"].tolist()}
+            if "temporal_valid" in observation
+            else {},
         )
 
     def check_observation(self, observation: dict[str, Any]) -> None:

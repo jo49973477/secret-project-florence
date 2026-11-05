@@ -53,6 +53,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seed-start", type=int, default=1_000_000)
     parser.add_argument("--execution-horizon", type=int, default=1)
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--checkpoint-identity")
+    parser.add_argument("--policy", choices=("auto", "rgb", "wah"), default="auto")
+    parser.add_argument("--sensor-contract", type=Path)
+    parser.add_argument("--scene-calibration", type=Path)
     parser.add_argument("--server-host", default="127.0.0.1")
     parser.add_argument("--server-port", type=int, default=5555)
     parser.add_argument("--request-timeout-seconds", type=float, default=300.0)
@@ -297,9 +301,7 @@ def _apply_task_config(
         env_cfg.save_frequency = task_config.get("save_frequency", env_cfg.save_frequency)
         env_cfg.video_frequency = task_config.get("video_frequency", env_cfg.video_frequency)
         env_cfg.random_texture = task_config.get("random_texture", False)
-        env_cfg.tactile_sensor_type = task_config.get(
-            "sensor_type", env_cfg.tactile_sensor_type
-        )
+        env_cfg.tactile_sensor_type = task_config.get("sensor_type", env_cfg.tactile_sensor_type)
     else:
         settings = task_config["env_settings"]
         frequencies = settings["frequencies"]
@@ -348,9 +350,7 @@ def _apply_task_config(
             camera_cfg.update_period = env_cfg.sim.dt
         for option_name, option_value in task_config.get("task_overrides", {}).items():
             if not hasattr(env_cfg, option_name):
-                raise ValueError(
-                    f"Unknown task override {option_name!r} for task {task_name!r}."
-                )
+                raise ValueError(f"Unknown task override {option_name!r} for task {task_name!r}.")
             setattr(env_cfg, option_name, option_value)
     return profile, observations
 
@@ -489,8 +489,7 @@ def _finish_video(
     ffmpeg_process = getattr(task.video_handler, "ffmpeg", None)
     _diagnostic(
         "video_finalize",
-        f"tag={tag} frames={monitor['frames']} "
-        f"ffmpeg_pid={getattr(ffmpeg_process, 'pid', None)}",
+        f"tag={tag} frames={monitor['frames']} ffmpeg_pid={getattr(ffmpeg_process, 'pid', None)}",
     )
     task.clean_cache(result=tag)
     if monitor["frames"] < 1:
@@ -684,7 +683,29 @@ def _run(
             args.server_port,
             execution_horizon=args.execution_horizon,
             timeout_ms=round(args.request_timeout_seconds * 1000),
+            checkpoint=args.checkpoint,
+            expected_checkpoint_identity=args.checkpoint_identity,
+            policy=args.policy,
+            sensor_contract=args.sensor_contract,
+            scene_calibration=args.scene_calibration,
         )
+        if policy.policy_type == "wah":
+            camera_types = env_cfg.obs_data_type.setdefault("camera", [])
+            if "depth" not in camera_types:
+                camera_types.append("depth")
+            for camera_cfg in getattr(env_cfg, "cameras", []):
+                if hasattr(camera_cfg, "data_types"):
+                    data_types = list(camera_cfg.data_types)
+                    if "depth" not in data_types:
+                        data_types.append("depth")
+                    camera_cfg.data_types = data_types
+            embodiment_types = env_cfg.obs_data_type.setdefault("embodiment", [])
+            if "ee" not in embodiment_types:
+                embodiment_types.append("ee")
+            source = policy.history.sensor_contract["tactile"]["rgb"]["source_key"].split("/")[-1]
+            tactile_types = env_cfg.obs_data_type.setdefault("tactile", [])
+            if source not in tactile_types:
+                tactile_types.append(source)
         _diagnostic("policy_initialization", "complete")
 
         _write_worker_results(
@@ -741,7 +762,7 @@ def _run(
                 while task.take_action_cnt < task.cfg.step_lim:
                     _diagnostic("gr00t_inference", f"action_index={task.take_action_cnt} starting")
                     action_chunk, formatted = policy.predict_chunk(
-                        observation, task.instruction
+                        observation, task.instruction, timestamp=task.take_action_cnt
                     )
                     _diagnostic(
                         "gr00t_inference",
@@ -776,11 +797,12 @@ def _run(
                             "execute_action",
                             f"index={task.take_action_cnt} qpos={action.tolist()}",
                         )
-                        executed, eval_success = task.take_action(
-                            action_tensor, action_type="qpos"
-                        )
+                        executed, eval_success = task.take_action(action_tensor, action_type="qpos")
                         _diagnostic("observation_post_action", "starting")
                         observation = task._get_observations()
+                        policy.record_observation(
+                            observation, task.instruction, task.take_action_cnt
+                        )
                         post_joint = observation["embodiment"]["joint"]
                         if hasattr(post_joint, "detach"):
                             post_joint = post_joint.detach().cpu().numpy()
