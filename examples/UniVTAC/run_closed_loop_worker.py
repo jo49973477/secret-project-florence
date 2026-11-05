@@ -26,6 +26,7 @@ from univtac_rollout.core import (
     video_output_path,
 )
 from univtac_rollout.policy import Gr00tUniVTACPolicy
+from univtac_rollout.sensors import UniVTACSensorAdapter
 
 
 class UnsupportedRuntimeError(RuntimeError):
@@ -668,6 +669,7 @@ def _run(
 
     task = None
     policy = None
+    sensor_adapter = None
     episodes: list[EpisodeResult] = []
     try:
         _write_worker_results(
@@ -719,6 +721,10 @@ def _run(
         task = task_module.Task(env_cfg, mode="eval")
         _diagnostic("task_construction", "complete")
         metadata.update(_inspect_articulation(task))
+        if policy.policy_type == "wah":
+            sensor_adapter = UniVTACSensorAdapter(task, policy.history.sensor_contract)
+            metadata["wah_sensor_adapter"] = sensor_adapter.metadata
+            _diagnostic("wah_sensor_adapter", json.dumps(sensor_adapter.metadata, sort_keys=True))
         video_monitor = _instrument_video_handler(task)
         limits = _qpos_limits(task)
         if limits is None:
@@ -756,6 +762,12 @@ def _run(
                 _diagnostic("episode_reset", f"index={episode_index} complete")
                 _diagnostic("observation_initial", "starting")
                 observation = task._get_observations()
+                if sensor_adapter is not None:
+                    observation = sensor_adapter.attach(observation)
+                    _diagnostic(
+                        "wah_calibration",
+                        json.dumps(sensor_adapter.metadata, sort_keys=True),
+                    )
                 _diagnostic("observation_initial", "complete")
                 task.video_handler.write(task.get_frame_shot(observation))
 
@@ -800,6 +812,8 @@ def _run(
                         executed, eval_success = task.take_action(action_tensor, action_type="qpos")
                         _diagnostic("observation_post_action", "starting")
                         observation = task._get_observations()
+                        if sensor_adapter is not None:
+                            observation = sensor_adapter.attach(observation)
                         policy.record_observation(
                             observation, task.instruction, task.take_action_cnt
                         )

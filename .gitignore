@@ -185,6 +185,7 @@ examples/UniVTAC/*
 examples/UniVTAC/univtac_rollout/*
 !examples/UniVTAC/univtac_rollout/checkpoint.py
 !examples/UniVTAC/univtac_rollout/multimodal.py
+!examples/UniVTAC/univtac_rollout/sensors.py
 *mp4
 *.parquet
 *.whl

@@ -15,7 +15,11 @@ UNIVTAC_EXAMPLE_ROOT = Path(__file__).parents[2] / "examples" / "UniVTAC"
 sys.path.insert(0, str(UNIVTAC_EXAMPLE_ROOT))
 
 import run_closed_loop_eval as closed_loop_eval  # noqa: E402
-from run_closed_loop_eval import _load_worker_result, _worker_failure_result  # noqa: E402
+from run_closed_loop_eval import (  # noqa: E402
+    _load_worker_result,
+    _worker_failure_result,
+    evaluation_exit_code,  # noqa: E402
+)
 from run_closed_loop_worker import (  # noqa: E402
     _apply_task_config,
     _config_profile,
@@ -216,6 +220,13 @@ def test_aggregation_uses_macro_average_and_excludes_errors() -> None:
     assert aggregate["micro_average_percent"] == pytest.approx(80.0)
     assert aggregate["total_errors"] == 1
     assert aggregate["episode_counts_differ"] is True
+    assert evaluation_exit_code(aggregate) == 1
+
+
+def test_task_failure_is_not_an_evaluation_process_error() -> None:
+    aggregate = aggregate_results([_episode("lift_can", 0, False, "step_limit")], ["lift_can"])
+    assert aggregate["total_failures"] == 1
+    assert evaluation_exit_code(aggregate) == 0
 
 
 def test_macro_average_is_not_reported_when_a_task_has_no_valid_episode() -> None:
@@ -348,9 +359,7 @@ def test_official_isaac_lab_release_identities_are_recognized() -> None:
     assert _isaac_lab_release_matches("main", "0.41.3", "v2.1.1")
     assert _isaac_lab_release_matches("main", "0.41.3", None)
     assert _isaac_lab_release_matches("isaac51", "2.3.0", None)
-    assert not _isaac_lab_release_matches(
-        "main", "12.0.0", "perf-2026-07-06-127-g04c2f318b6"
-    )
+    assert not _isaac_lab_release_matches("main", "12.0.0", "perf-2026-07-06-127-g04c2f318b6")
 
 
 def test_mp4_validation_rejects_empty_artifact(tmp_path: Path) -> None:

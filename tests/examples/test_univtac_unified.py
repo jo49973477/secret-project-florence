@@ -15,16 +15,23 @@ sys.path.insert(0, str(ROOT / "examples" / "UniVTAC"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from gr00t.policy.gr00t_policy import validate_wah_restoration  # noqa: E402
-from univtac_deployment import build_rollout_command, check_port, wait_ready  # noqa: E402
+from univtac_deployment import (  # noqa: E402
+    build_rollout_command,
+    check_port,
+    print_rollout_summary,
+    wait_ready,
+)
 from univtac_rollout.checkpoint import checkpoint_identity  # noqa: E402
 from univtac_rollout.multimodal import (  # noqa: E402
     ObservationHistory,
+    add_scene_calibration,
     detect_policy,
     scene_frame,
     tactile_frame,
     validate_contract,
 )
 from univtac_rollout.policy import Gr00tUniVTACPolicy  # noqa: E402
+from univtac_rollout.sensors import UniVTACSensorAdapter  # noqa: E402
 
 
 def configs(temporal: bool = False) -> dict:
@@ -155,6 +162,98 @@ def test_tactile_source_and_dtype() -> None:
         tactile_frame(observation(), wrong)
 
 
+def test_scene_calibration_json_is_validated_without_static_wrist(tmp_path: Path) -> None:
+    import json
+
+    path = tmp_path / "calibration.json"
+    path.write_text(
+        json.dumps(
+            {
+                "cameras": {
+                    "head": {
+                        "intrinsics": [2.0, 2.0, 1.0, 1.0],
+                        "depth_scale": 1.0,
+                        "T_base_camera": np.eye(4).tolist(),
+                    },
+                    "wrist": {"T_ee_camera": np.eye(4).tolist()},
+                }
+            }
+        )
+    )
+    calibrated = add_scene_calibration(contract(), path)
+    assert calibrated["calibration"]["cameras"]["head"]["depth_scale"] == 1.0
+
+    path.write_text(json.dumps({"cameras": {"wrist": {"T_base_camera": np.eye(4).tolist()}}}))
+    with pytest.raises(ValueError, match="Static wrist"):
+        add_scene_calibration(contract(), path)
+
+
+def test_live_univtac_sensor_adapter_uses_per_frame_optical_camera_poses(monkeypatch) -> None:
+    class CameraData:
+        def __init__(self, position):
+            self.intrinsic_matrices = np.asarray(
+                [[[100.0, 0.0, 1.0], [0.0, 100.0, 1.0], [0.0, 0.0, 1.0]]]
+            )
+            self.pos_w = np.asarray([position], dtype=np.float64)
+            self.quat_w_ros = np.asarray([[1.0, 0.0, 0.0, 0.0]])
+
+    class Camera:
+        def __init__(self, name, position):
+            self.cfg = SimpleNamespace(prim_path=f"/World/{name}")
+            self.data = CameraData(position)
+
+    root_data = SimpleNamespace(
+        root_link_pos_w=np.asarray([[1.0, 0.0, 0.0]]),
+        root_link_quat_w=np.asarray([[1.0, 0.0, 0.0, 0.0]]),
+    )
+    task = SimpleNamespace(
+        cfg=SimpleNamespace(tactile_sensor_type="gsmini"),
+        _robot_manager=SimpleNamespace(robot=SimpleNamespace(data=root_data)),
+        _camera_manager=SimpleNamespace(
+            cameras={
+                "head": Camera("head", [2.0, 0.0, 0.0]),
+                "wrist": Camera("wrist", [1.0, 1.0, 0.0]),
+            }
+        ),
+        _tactile_manager=SimpleNamespace(
+            tactiles={"left_tactile": object(), "right_tactile": object()}
+        ),
+    )
+    sensor_contract = contract()
+    sensor_contract["tactile"]["rgb"]["source_key"] = "tactile/left_gsmini/rgb"
+    monkeypatch.setattr("univtac_rollout.sensors._isaac_depth_scale_to_meters", lambda: 1.0)
+    adapter = UniVTACSensorAdapter(task, sensor_contract)
+
+    def live_observation(value=7):
+        return {
+            "observation": {
+                name: {
+                    "rgb": np.zeros((2, 2, 3), dtype=np.uint8),
+                    "depth": np.ones((2, 2, 1), dtype=np.float32),
+                }
+                for name in ("head", "wrist")
+            },
+            "tactile": {
+                "left_tactile": {"rgb": np.full((2, 2, 3), value, dtype=np.uint8)},
+                "right_tactile": {"rgb": np.zeros((2, 2, 3), dtype=np.uint8)},
+            },
+        }
+
+    first = adapter.attach(live_observation())
+    np.testing.assert_allclose(first["observation"]["head"]["T_base_camera"][:3, 3], [1, 0, 0])
+    np.testing.assert_allclose(first["observation"]["wrist"]["T_base_camera"][:3, 3], [0, 1, 0])
+    assert first["observation"]["wrist"]["depth_scale"] == 1.0
+    assert np.all(tactile_frame(first, sensor_contract) == 7)
+
+    task._camera_manager.cameras["wrist"].data.pos_w[0] = [1.0, 2.0, 0.0]
+    second = adapter.attach(live_observation())
+    np.testing.assert_allclose(second["observation"]["wrist"]["T_base_camera"][:3, 3], [0, 2, 0])
+
+    task._camera_manager.cameras["head"].data.pos_w[0, 0] += 0.1
+    with pytest.raises(RuntimeError, match="fixed head camera moved"):
+        adapter.attach(live_observation())
+
+
 def test_checkpoint_identity_is_path_independent_and_mismatch(monkeypatch, tmp_path: Path) -> None:
     first = fake_checkpoint(tmp_path / "a")
     second = fake_checkpoint(tmp_path / "b", b"different")
@@ -280,6 +379,30 @@ def test_split_local_rollout_command_parity_and_gpu_argument(tmp_path: Path) -> 
     command = build_rollout_command(split, tmp_path, ["--mode", "smoke"])
     assert command == build_rollout_command(local, tmp_path, ["--mode", "smoke"])
     assert command[command.index("--device") + 1] == "cuda:1"
+
+
+def test_deployment_terminal_summary_reports_all_outcomes(tmp_path: Path, capsys) -> None:
+    import json
+
+    output = tmp_path / "output"
+    logs = output / "logs"
+    logs.mkdir(parents=True)
+    (output / "summary.json").write_text(
+        json.dumps(
+            {
+                "summary": {
+                    "total_successes": 2,
+                    "total_failures": 3,
+                    "total_errors": 1,
+                }
+            }
+        )
+    )
+    summary = print_rollout_summary(output, logs)
+    assert summary["total_errors"] == 1
+    terminal = capsys.readouterr().out
+    assert "success=2 failure=3 error=1" in terminal
+    assert f"Logs: {logs}" in terminal
 
 
 def test_local_port_conflict_does_not_kill_service(monkeypatch) -> None:

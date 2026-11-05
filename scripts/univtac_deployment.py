@@ -26,7 +26,10 @@ from univtac_rollout.multimodal import load_sensor_contract, validate_contract  
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        allow_abbrev=False,
+    )
     parser.add_argument("--deployment", choices=("split", "local"), required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument(
@@ -175,6 +178,33 @@ def git_commit() -> str | None:
     return result.stdout.strip() if result.returncode == 0 else None
 
 
+def print_rollout_summary(output: Path, logs: Path) -> dict | None:
+    summary_path = output / "summary.json"
+    if not summary_path.is_file():
+        print(f"Rollout summary unavailable; logs: {logs}", file=sys.stderr, flush=True)
+        return None
+    try:
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+        summary = payload["summary"]
+        counts = (
+            int(summary["total_successes"]),
+            int(summary["total_failures"]),
+            int(summary["total_errors"]),
+        )
+    except (KeyError, TypeError, ValueError, OSError) as exc:
+        print(
+            f"Could not read rollout summary {summary_path}: {exc}; logs: {logs}", file=sys.stderr
+        )
+        return None
+    print(
+        f"Rollout result: success={counts[0]} failure={counts[1]} error={counts[2]}",
+        flush=True,
+    )
+    print(f"Summary: {summary_path}", flush=True)
+    print(f"Logs: {logs}", flush=True)
+    return summary
+
+
 def build_rollout_command(
     args: argparse.Namespace, output: Path, passthrough: list[str]
 ) -> list[str]:
@@ -210,7 +240,7 @@ def run(args: argparse.Namespace, passthrough: list[str]) -> int:
     if args.startup_timeout <= 0 or args.retry_interval <= 0:
         raise ValueError("Startup timeout and retry interval must be positive.")
     args.checkpoint = str(Path(args.checkpoint).expanduser().resolve())
-    args.model_python = args.model_python.expanduser().resolve()
+    args.model_python = args.model_python.expanduser().absolute()
     if args.deployment == "local" or getattr(args, "checkpoint_identity", None) is None:
         local_identity = checkpoint_identity(args.checkpoint)
         if (
@@ -405,6 +435,9 @@ def run(args: argparse.Namespace, passthrough: list[str]) -> int:
         monitor_stop.set()
         monitor_thread.join(timeout=3)
         rollout_log.flush()
+        summary = print_rollout_summary(output, logs)
+        if summary is not None and summary["total_errors"] > 0 and code == 0:
+            code = 1
         if code:
             print((logs / "rollout.log").read_text(encoding="utf-8")[-5000:], file=sys.stderr)
             if "out of memory" in (logs / "rollout.log").read_text(encoding="utf-8").lower():

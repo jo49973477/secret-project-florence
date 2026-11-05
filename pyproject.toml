@@ -59,6 +59,7 @@ dependencies = [
     "tensorrt-cu12-libs>=10.15.1.29; platform_machine == 'x86_64'",
     "tensorrt-cu13-libs>=10.15.1.29; platform_machine == 'aarch64'",
     "h5py>=3.16.0",
+    "addict>=2.4.0",
 ]
 
 [project.optional-dependencies]

@@ -12,6 +12,7 @@ from scene_pointcloud import (
     ScenePreprocessConfig,
     build_scene_frame,
     pose_wxyz_to_matrix,
+    validate_intrinsics,
     validate_transform,
 )
 
@@ -84,11 +85,24 @@ def load_sensor_contract(path: str | Path | None) -> dict[str, Any]:
             raise ValueError(f"Sensor contract pointcloud.scene is missing {key}.")
     if scene["feature_dim"] != 6 or scene["coordinate_frame"] != "robot_base":
         raise ValueError("Scene contract must be robot_base XYZRGB with feature_dim=6.")
+    if not isinstance(scene["num_points"], int) or scene["num_points"] < 1:
+        raise ValueError("Sensor contract pointcloud.scene.num_points must be positive.")
+    if not isinstance(scene["voxel_size_m"], (int, float)) or scene["voxel_size_m"] <= 0:
+        raise ValueError("Sensor contract pointcloud.scene.voxel_size_m must be positive.")
+    source_cameras = scene.get("source_cameras")
+    if source_cameras is not None and source_cameras != ["head", "wrist"]:
+        raise ValueError(
+            "WAH sensor contract source_cameras must be ordered ['head', 'wrist']; "
+            f"got {source_cameras!r}."
+        )
     source_key = tactile.get("source_key")
+    source_parts = source_key.split("/") if isinstance(source_key, str) else []
     if (
         not isinstance(source_key, str)
-        or not source_key.startswith("tactile/")
-        or source_key.split("/")[-1] not in {"rgb", "rgb_marker"}
+        or len(source_parts) not in {2, 3}
+        or source_parts[0] != "tactile"
+        or source_parts[-1] not in {"rgb", "rgb_marker"}
+        or any(not part for part in source_parts)
     ):
         raise ValueError(f"Unsupported tactile training source_key {tactile.get('source_key')!r}.")
     return data
@@ -96,8 +110,36 @@ def load_sensor_contract(path: str | Path | None) -> dict[str, Any]:
 
 def add_scene_calibration(contract: dict[str, Any], path: str | Path | None) -> dict[str, Any]:
     if path is not None:
+        calibration = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(calibration, dict) or not isinstance(calibration.get("cameras"), dict):
+            raise ValueError("Scene calibration JSON must contain a cameras mapping.")
+        cameras = calibration["cameras"]
+        unknown = set(cameras).difference({"head", "wrist"})
+        if unknown:
+            raise ValueError(f"Scene calibration has unknown cameras: {sorted(unknown)}")
+        if "T_base_camera" in cameras.get("wrist", {}):
+            raise ValueError(
+                "Static wrist T_base_camera in scene calibration is invalid. Supply "
+                "T_ee_camera or use the live per-frame camera pose."
+            )
+        for name, camera in cameras.items():
+            if not isinstance(camera, dict):
+                raise ValueError(f"Scene calibration cameras.{name} must be a mapping.")
+            if "intrinsics" in camera:
+                validate_intrinsics(camera["intrinsics"], source=f"scene calibration {name}")
+            for transform_name in ("T_base_camera", "T_ee_camera"):
+                if transform_name in camera:
+                    validate_transform(
+                        camera[transform_name], source=f"scene calibration {name}.{transform_name}"
+                    )
+            if "depth_scale" in camera and (
+                not isinstance(camera["depth_scale"], (int, float))
+                or not np.isfinite(camera["depth_scale"])
+                or camera["depth_scale"] <= 0
+            ):
+                raise ValueError(f"Scene calibration {name}.depth_scale must be positive.")
         contract = dict(contract)
-        contract["calibration"] = json.loads(Path(path).read_text(encoding="utf-8"))
+        contract["calibration"] = calibration
     return contract
 
 
@@ -197,20 +239,30 @@ def scene_frame(
 
 
 def tactile_frame(observation: dict[str, Any], contract: dict[str, Any]) -> np.ndarray:
-    source = contract["tactile"]["rgb"]["source_key"].split("/")[-1]
+    source_key = contract["tactile"]["rgb"]["source_key"]
+    source_parts = source_key.split("/")[1:]
     sensors = observation.get("tactile", {})
-    if source not in sensors:
+    value: Any = sensors
+    for part in source_parts:
+        if not isinstance(value, dict) or part not in value:
+            value = None
+            break
+        value = value[part]
+    if value is None:
+        adapted = sensors.get("_wah_contract_source", {}) if isinstance(sensors, dict) else {}
+        if adapted.get("source_key") == source_key:
+            value = adapted.get("image")
+    if value is None:
         raise ValueError(
-            f"WAH tactile.rgb was trained from tactile/{source}; observation has {sorted(sensors)}. "
-            "Request that exact UniVTAC sensor stream. Camera RGB cannot substitute."
+            f"WAH tactile.rgb was trained from {source_key}; observation has "
+            f"{sorted(sensors) if isinstance(sensors, dict) else type(sensors).__name__}. "
+            "Request that exact UniVTAC tactile sensor stream. Camera RGB cannot substitute."
         )
-    image = _to_numpy(sensors[source], name=f"tactile.{source}")
+    image = _to_numpy(value, name=source_key.replace("/", "."))
     if image.ndim == 4 and image.shape[0] == 1:
         image = image[0]
     if image.ndim != 3 or image.shape[-1] != 3 or image.dtype != np.uint8:
-        raise ValueError(
-            f"tactile.{source} must be uint8 [H,W,3]; got {image.shape} {image.dtype}."
-        )
+        raise ValueError(f"{source_key} must be uint8 [H,W,3]; got {image.shape} {image.dtype}.")
     return np.ascontiguousarray(image)
 
 

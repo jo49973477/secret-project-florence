@@ -415,8 +415,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     return aggregate
 
 
+def evaluation_exit_code(aggregate: dict[str, Any]) -> int:
+    """Errors are infrastructure/evaluation failures; ordinary task failures are valid results."""
+    return 1 if aggregate["total_errors"] > 0 else 0
+
+
 def main() -> None:
-    run(_parser().parse_args())
+    aggregate = run(_parser().parse_args())
+    raise SystemExit(evaluation_exit_code(aggregate))
 
 
 if __name__ == "__main__":
