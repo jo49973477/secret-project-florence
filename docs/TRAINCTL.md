@@ -34,6 +34,89 @@ This pins direct dependencies; use the lockfile for fully reproducible
 transitive dependencies. No training/model/GPU dependency versions were changed
 by this migration.
 
+## Rich dashboard and Discord integration
+
+With trainctl enabled, the interactive parent displays the existing Rich panels
+while rank zero publishes CPU scalar observations to a unique
+`OUTPUT_DIR/logs/dashboard-*.jsonl`. The trainctl supervisor still owns Torchrun.
+No worker is forced to claim a TTY. Nonzero ranks never publish display telemetry.
+Progress, losses, gradients, learning rates, GPU allocation, speed/ETA, Samples
+Seen, Effective Epoch, save status and optional multimodal diagnostics retain the
+existing renderer and measurements. Resume starts at Trainer's restored step.
+
+The parent coordinates worker warnings/tracebacks with Rich. It uses the primary
+screen so important output remains in scrollback when the transient dashboard
+closes. Resize is detected by Rich; normal exit, exceptions, Ctrl+C and SIGTERM
+restore streams and the cursor. The display remains in finalizing state after
+HF train_end until the supervised process, including final saving, actually exits.
+Non-TTY runs retain clean text logging, with no dashboard control sequences.
+
+Discord environment-variable precedence is:
+
+1. `TRAINCTL_DISCORD_WEBHOOK_URL`
+2. `DISCORD_WEBHOOK_URL`
+3. Legacy `DISCORD_WEBHOOK`
+
+WAH normalizes the selected value in the child environment. Conflicting values
+produce a safe warning naming the precedence, never the URLs. An explicit
+`[notifications.discord] enabled = false` in the trainctl TOML remains authoritative.
+Startup prints persona, Discord configuration status, display mode and checkpoint
+notification status. Missing/invalid webhooks and missing httpx produce actionable
+warnings; configured means validated offline, not a claim of remote delivery.
+
+trainctl's original transport reports rejected HTTP 401/403/404, exhausted 429
+rate limits, server errors and network failures, without leaking request URLs or
+interrupting training. These appear in the terminal and `logs/train.log`.
+A missing SDK endpoint produces an explicit worker warning: while training can
+continue, SDK metrics and completed-checkpoint alerts need IPC to work. Filesystem
+polling remains disabled to avoid announcing half-written ZeRO checkpoints.
+
+Default `training.save_steps=500` means Step 100 alone does not produce a
+checkpoint alert. Metrics never trigger chat notifications.
+
+```bash
+export FLORENCE_DATASET=/home/spl_yeongyoo/datasets/univtac_new
+# Set a newly rotated webhook through your private shell/secret manager:
+export TRAINCTL_DISCORD_WEBHOOK_URL="<configured-securely>"
+
+CUDA_VISIBLE_DEVICES=0,1 \
+bash scripts/train_florence_ablations.sh B \
+  hardware=dual_3090_zero3 \
+  hardware.global_batch_size=2 \
+  hardware.gradient_checkpointing=true \
+  training.gradient_accumulation_steps=16 \
+  trainctl.enabled=true \
+  trainctl.message_mode=sopia \
+  training.enable_training_dashboard=true
+```
+
+### Notification smoke test without a model
+
+First inspect the exact WAH environment-variable resolution and TOML enablement
+without network access or creating a trainctl run:
+
+```bash
+.venv/bin/python scripts/smoke_trainctl_notifications.py
+```
+
+After reviewing its safe diagnostics, explicitly send a tiny supervised run:
+
+```bash
+# Sends one start, one completed-checkpoint and one success notification:
+.venv/bin/python scripts/smoke_trainctl_notifications.py --send
+# Sends one start, one completed-checkpoint and one failure notification:
+.venv/bin/python scripts/smoke_trainctl_notifications.py --send --fail
+# Explicit persona override:
+.venv/bin/python scripts/smoke_trainctl_notifications.py --send --message-mode koyori
+```
+
+`--fail` deliberately returns a nonzero status. Neither command loads GR00T,
+starts Torchrun, allocates GPU tensors, or touches existing training artifacts.
+The helper retains a unique `/tmp/wah-trainctl-smoke-*` directory with its own
+SQLite database, completed smoke artifact and trainctl logs. An explicit TOML
+Discord disable is still respected; remove it if you intend to test delivery.
+Do not paste actual webhook values into commands captured by shared logs.
+
 ## Credentials and persona
 
 Set secrets in the launching shell or a private environment file, never in
@@ -53,7 +136,7 @@ are comma-separated. No actual credentials are needed for local tracking.
 ```yaml
 trainctl:
   enabled: true
-  message_mode: koyori
+  message_mode: sopia
   notify_checkpoints: true
 ```
 
@@ -151,7 +234,7 @@ override it). WAH places trainctl's worker logs under
 terminal output is retained in `OUTPUT_DIR/logs/train.log`, including worker
 tracebacks. The launcher relays the public trainctl log because 0.2.0 captures
 worker stdout/stderr without echoing it. Under supervision the console uses the
-existing noninteractive text dashboard; disable trainctl to use the PTY dashboard.
+parent Rich dashboard in an interactive terminal, refreshed from rank-zero JSONL telemetry. Redirected stdout retains the existing clean text dashboard. The worker never needs a TTY and Rich frames never enter either log.
 
 W&B remains enabled according to the existing `training.use_wandb` setting. Its
 callbacks, run identity, project/group, model diagnostics, and step semantics are
@@ -186,7 +269,7 @@ owned by the library. SIGKILL alone is not classified as CUDA OOM.
 
 Minimal upstream improvements that would remove the compatibility bridges:
 
-- Add public CLI worker-output streaming and SIGTERM cancellation support.
+- Add public CLI worker-output streaming and SIGTERM cancellation support (WAH currently bridges both).
 - Add an SDK-only checkpoint mode and silent checkpoint registration.
 - Add periodic resource sampling/history to `run` if desired. In 0.2.0 NVML and
   system resources are queried by the daemon `/gpu` and `/disk`; the supervisor
@@ -234,7 +317,7 @@ TEST_CACHE_PATH=/tmp/wah-test-cache .venv/bin/python -m pytest \
   tests/gr00t/experiment/test_trainctl_trainer.py -q --timeout=60
 ```
 
-## Modified files
+## Modified files (original migration)
 
 - `README.md`
 - `configs/experiment/florence_ablation_base.yaml`
@@ -267,3 +350,61 @@ TEST_CACHE_PATH=/tmp/wah-test-cache .venv/bin/python -m pytest \
 - `tests/gr00t/experiment/test_trainctl_launch.py`
 - `tests/gr00t/experiment/test_trainctl_trainer.py`
 - `uv.lock`
+
+## Rich/Discord follow-up verification
+
+The integration tests use real trainctl 0.2.0 CLI/SDK IPC with tiny CPU worker
+stubs and httpx MockTransport. They do not send real notifications. PTY tests
+exercise parent rendering, resizing, normal completion, worker failure, Ctrl+C,
+SIGTERM, clean log retention and terminal restoration. Rank-zero guards are
+verified for simulated two-rank callbacks; no real two-GPU training is claimed.
+
+```bash
+TEST_CACHE_PATH=/tmp/wah-test-cache .venv/bin/python -m pytest \
+  tests/gr00t/experiment/test_dashboard_terminal.py \
+  tests/gr00t/experiment/test_trainctl_launch.py \
+  tests/gr00t/experiment/test_trainctl_callback.py \
+  tests/gr00t/experiment/test_trainctl_dashboard.py \
+  tests/gr00t/experiment/test_trainctl_discord.py -q --timeout=75
+```
+
+Additional follow-up files: `gr00t/experiment/dashboard_telemetry.py`,
+`scripts/smoke_trainctl_notifications.py`,
+`tests/gr00t/experiment/test_trainctl_dashboard.py`, and
+`tests/gr00t/experiment/test_trainctl_discord.py`. Changes to the launcher,
+existing dashboard, callback selection, startup diagnostics and schema defaults
+leave model/optimizer/ZeRO/checkpoint code intact. Existing `pyproject.toml` and
+`uv.lock` working-tree edits were preserved, not generated by this follow-up.
+
+Follow-up results: 62 focused tests passed across the full 59-test run and three
+additional cases (Trainer telemetry selection, offline-only smoke inspection,
+and a rejected Discord transport preserving successful training exit). The six
+lifecycle delivery variants were rerun together and passed. Another 146 existing
+regression tests passed, with the previously documented checkpoint-default
+assertion deselected. Ruff lint/format and `git diff --check` passed. The exact
+B/two-GPU/Sopia command above passed `dry_run=true`, resolving effective batch
+32; no workers or model weights were loaded by that dry run.
+
+Confirmed integration causes were the explicit interactive-rendering exclusion
+plus captured worker stdout, and missing support for the `DISCORD_WEBHOOK`
+legacy alias. Actual remote webhook validity, permissions, rate limiting and
+network access were not probed. Their failure paths were exercised with mocked
+HTTP and remain visible in trainctl's original safe transport diagnostics.
+
+### Files changed by this follow-up
+
+- `README.md`
+- `configs/trainctl/default.yaml` (existing Sopia edit preserved)
+- `docs/HYDRA_CONFIGURATION.md`
+- `docs/TRAINCTL.md`
+- `docs/florence_ablation_suite.md`
+- `gr00t/configs/hydra_config.py`
+- `gr00t/experiment/dashboard_telemetry.py`
+- `gr00t/experiment/hydra_launch.py`
+- `gr00t/experiment/trainctl_callback.py`
+- `gr00t/experiment/trainctl_launch.py`
+- `gr00t/experiment/trainer.py`
+- `gr00t/experiment/training_dashboard.py`
+- `scripts/smoke_trainctl_notifications.py`
+- `tests/gr00t/experiment/test_trainctl_dashboard.py`
+- `tests/gr00t/experiment/test_trainctl_discord.py`

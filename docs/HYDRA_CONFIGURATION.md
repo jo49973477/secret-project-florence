@@ -166,7 +166,7 @@ through the public tracker SDK. Secrets use environment-only `TRAINCTL_*` variab
 Termination reaches trainctl's cancellation path, which reaps the Torchrun process group;
 child failure codes are returned. Worker output is relayed to the terminal and logs/train.log.
 
-The separate `trainctl` group defaults to `enabled: true`, `message_mode: koyori`, and
+The separate `trainctl` group defaults to `enabled: true`, `message_mode: sopia`, and
 `notify_checkpoints: true`. Change these with ordinary Hydra overrides. Dry runs never
 create trainctl runs. See [the trainctl guide](TRAINCTL.md) for installation, commands,
 configuration migration, and the pinned library's current limits.

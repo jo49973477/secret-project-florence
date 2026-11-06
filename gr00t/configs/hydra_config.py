@@ -110,7 +110,7 @@ class Resume:
 @dataclass
 class Trainctl:
     enabled: bool = True
-    message_mode: str = "koyori"
+    message_mode: str = "sopia"
     notify_checkpoints: bool = True
 
 

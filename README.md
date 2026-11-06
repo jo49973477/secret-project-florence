@@ -505,7 +505,7 @@ Replace `demo_data/cube_to_bowl_5` and `examples/SO100/so100_config.py` with you
 ### Training supervision and notifications
 
 WAH Hydra training uses **trainctl 0.2.0** for process supervision, Discord/Telegram
-notifications, and checkpoint tracking. Koyori is the default message mode. W&B
+notifications, and checkpoint tracking. Sopia is the default message mode. W&B
 continues recording detailed experiments and model diagnostics.
 
 ```bash

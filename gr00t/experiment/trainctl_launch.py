@@ -2,11 +2,60 @@
 
 from contextlib import contextmanager
 from importlib.util import find_spec
+import logging
 from pathlib import Path
 import sys
 import tempfile
 import threading
 import tomllib
+
+
+logger = logging.getLogger(__name__)
+WEBHOOK_VARIABLES = ("TRAINCTL_DISCORD_WEBHOOK_URL", "DISCORD_WEBHOOK_URL", "DISCORD_WEBHOOK")
+
+
+def discord_environment(env, settings):
+    """Resolve aliases without logging, serializing, or probing a credential."""
+    env = dict(env)
+    configured = [(key, env[key].strip()) for key in WEBHOOK_VARIABLES if env.get(key, "").strip()]
+    if configured:
+        env["TRAINCTL_DISCORD_WEBHOOK_URL"] = configured[0][1]
+        if len({value for _, value in configured}) > 1:
+            logger.warning(
+                "Conflicting Discord webhook variables; precedence is "
+                "TRAINCTL_DISCORD_WEBHOOK_URL > DISCORD_WEBHOOK_URL > DISCORD_WEBHOOK. "
+                "Using %s; values withheld.",
+                configured[0][0],
+            )
+    discord = settings.get("notifications", {}).get("discord", {}) or settings.get("discord", {})
+    if discord.get("enabled") is False:
+        logger.warning(
+            "Discord disabled by explicit trainctl TOML enabled=false; "
+            "remove that setting or set enabled=true to receive notifications."
+        )
+        return env, "disabled (explicit trainctl TOML enabled=false)"
+    webhook = env.get("TRAINCTL_DISCORD_WEBHOOK_URL") or discord.get("webhook_url")
+    if not webhook:
+        logger.warning(
+            "Discord webhook missing; set TRAINCTL_DISCORD_WEBHOOK_URL in the launching shell."
+        )
+        return env, "missing"
+    if find_spec("httpx") is None:
+        logger.warning(
+            "Discord unavailable: install trainctl[discord]==0.2.0 in this Python environment (httpx missing)."
+        )
+        return env, "unavailable (httpx missing)"
+    try:
+        # The exported public adapter validates offline; this performs no HTTP request.
+        from trainctl.integrations.discord import DiscordWebhookAdapter
+
+        DiscordWebhookAdapter(webhook)
+    except (ImportError, ValueError, TypeError):
+        logger.warning(
+            "Discord webhook invalid or transport unavailable; configure a valid HTTPS Discord webhook and install trainctl[discord]==0.2.0."
+        )
+        return env, "invalid"
+    return env, "configured (delivery checked by trainctl at lifecycle events)"
 
 
 def check_trainctl():
@@ -68,6 +117,16 @@ def trainctl_run(cfg, output, command, env):
 
     source = Path(env.get("TRAINCTL_CONFIG", "~/.config/trainctl/config.toml")).expanduser()
     settings = tomllib.loads(source.read_text()) if source.exists() else {}
+    env, discord_status = discord_environment(env, settings)
+    interactive = sys.stdout.isatty() and cfg.training.get("enable_training_dashboard") is not False
+    print(
+        "trainctl: enabled\n"
+        f"message mode: {cfg.trainctl.message_mode}\n"
+        f"Discord: {discord_status}\n"
+        f"Dashboard: {'Rich interactive (parent)' if interactive else 'text fallback'}\n"
+        f"Checkpoint notifications: {'enabled' if cfg.trainctl.notify_checkpoints else 'disabled'}",
+        flush=True,
+    )
     # Polling observes directories before HF has finished writing ZeRO partitions.
     # The SDK is the sole checkpoint source; preserve all other user TOML settings.
     settings.setdefault("checkpoints", {})["pattern"] = "(?!)"
@@ -99,6 +158,7 @@ class LogRelay:
         handle = None
         try:
             while True:
+                stopping = self.stop.is_set()
                 if handle is None:
                     paths = list(self.directory.glob("*.log"))
                     if paths:
@@ -109,7 +169,7 @@ class LogRelay:
                         sys.stdout.write(text)
                         sys.stdout.flush()
                         self.log.write(text)
-                if self.stop.is_set():
+                if stopping:
                     break
                 self.stop.wait(0.05)
         finally:

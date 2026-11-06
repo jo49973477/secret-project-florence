@@ -84,6 +84,13 @@ class TrainctlCallback(TrainerCallback):
 
     def on_train_begin(self, args, state, control, **kwargs):
         if self._rank_zero(state):
+            if os.environ.get("GR00T_TRAINCTL_ACTIVE") == "1" and not (
+                os.environ.get("TRAINCTL_RUN_ID") and os.environ.get("TRAINCTL_SOCKET")
+            ):
+                logger.warning(
+                    "trainctl SDK endpoint missing; structured metrics and checkpoint alerts "
+                    "are unavailable. Check trainctl supervisor startup logs. Training will continue."
+                )
             self._call("init", name=self.name, total_steps=self.total_steps)
             self._call(
                 "define_metrics",

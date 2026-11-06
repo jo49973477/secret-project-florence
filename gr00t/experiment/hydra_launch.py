@@ -14,6 +14,7 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 from gr00t.configs.hydra_config import build_gr00t_config, preflight
+from gr00t.experiment.dashboard_telemetry import ParentDashboard
 from gr00t.experiment.trainctl_launch import LogRelay, check_trainctl, trainctl_run
 from gr00t.utils.sensor_dependency_preflight import check_sensor_dependencies
 
@@ -359,83 +360,87 @@ def launch(cfg: DictConfig) -> int:
     ):
         command, env = invocation
         relay = None
-        master = slave = None
-        interactive = (
-            not cfg.trainctl.enabled
-            and sys.stdout.isatty()
-            and config.training.enable_training_dashboard is not False
-        )
-        if interactive:
-            import pty
+        with ParentDashboard(cfg, config, output, env) as dashboard:
+            master = slave = None
+            interactive = (
+                sys.stdout.isatty() and config.training.enable_training_dashboard is not False
+            )
+            worker_pty = interactive and not cfg.trainctl.enabled
+            if worker_pty:
+                import pty
 
-            from gr00t.experiment.console_logging import copy_terminal_size
+                from gr00t.experiment.console_logging import copy_terminal_size
 
-            master, slave = pty.openpty()
-            copy_terminal_size(sys.stdout.fileno(), slave)
-            env["GR00T_LIVE_CONSOLE"] = "1"
-        process = subprocess.Popen(
-            command,
-            env=env,
-            stdout=slave if interactive else subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            start_new_session=True,
-        )
+                master, slave = pty.openpty()
+                copy_terminal_size(sys.stdout.fileno(), slave)
+                env["GR00T_LIVE_CONSOLE"] = "1"
+            process = subprocess.Popen(
+                command,
+                env=env,
+                stdout=slave if worker_pty else subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
+            )
 
-        if cfg.trainctl.enabled:
-            relay = LogRelay(env["TRAINCTL_LOG_DIR"], log)
-            relay.start()
+            if cfg.trainctl.enabled:
+                relay = LogRelay(env["TRAINCTL_LOG_DIR"], log)
+                relay.start()
 
-        if slave is not None:
-            os.close(slave)
+            if slave is not None:
+                os.close(slave)
 
-        def forward(signum, frame):
-            if interactive and signum == signal.SIGWINCH:
-                copy_terminal_size(sys.stdout.fileno(), master)
-                return
-            if process.poll() is None:
-                os.killpg(process.pid, signum)
-
-        signals = (signal.SIGINT, signal.SIGTERM) + ((signal.SIGWINCH,) if interactive else ())
-        previous = {sig: signal.signal(sig, forward) for sig in signals}
-        try:
-            if interactive:
-                import codecs
-                import errno
-
-                decoder = codecs.getincrementaldecoder("utf-8")("replace")
-                while True:
+            def forward(signum, frame):
+                if worker_pty and signum == signal.SIGWINCH:
+                    copy_terminal_size(sys.stdout.fileno(), master)
+                    return
+                if process.poll() is None:
                     try:
-                        chunk = os.read(master, 65536)
-                    except OSError as exc:
-                        if exc.errno != errno.EIO:
-                            raise
-                        break
-                    if not chunk:
-                        break
-                    text = decoder.decode(chunk)
-                    sys.stdout.write(text)
+                        os.killpg(process.pid, signum)
+                    except ProcessLookupError:
+                        pass
+
+            signals = (signal.SIGINT, signal.SIGTERM) + ((signal.SIGWINCH,) if worker_pty else ())
+            previous = {sig: signal.signal(sig, forward) for sig in signals}
+            try:
+                if worker_pty:
+                    import codecs
+                    import errno
+
+                    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+                    while True:
+                        try:
+                            chunk = os.read(master, 65536)
+                        except OSError as exc:
+                            if exc.errno != errno.EIO:
+                                raise
+                            break
+                        if not chunk:
+                            break
+                        text = decoder.decode(chunk)
+                        sys.stdout.write(text)
+                        sys.stdout.flush()
+                        log.write(text)
+                    tail = decoder.decode(b"", final=True)
+                    sys.stdout.write(tail)
+                    log.write(tail)
+                else:
+                    for line in process.stdout:
+                        print(line, end="", flush=True)
+                        log.write(line)
+                code = process.wait()
+                dashboard.result = code
+            finally:
+                if master is not None:
+                    os.close(master)
+                    # Last resort if a worker was killed before Rich's finally cleanup.
+                    sys.stdout.write("\x1b[?1049l\x1b[?25h")
                     sys.stdout.flush()
-                    log.write(text)
-                tail = decoder.decode(b"", final=True)
-                sys.stdout.write(tail)
-                log.write(tail)
-            else:
-                for line in process.stdout:
-                    print(line, end="", flush=True)
-                    log.write(line)
-            code = process.wait()
-        finally:
-            if master is not None:
-                os.close(master)
-                # Last resort if a worker was killed before Rich's finally cleanup.
-                sys.stdout.write("\x1b[?1049l\x1b[?25h")
-                sys.stdout.flush()
-            for sig, handler in previous.items():
-                signal.signal(sig, handler)
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGTERM)
-                process.wait()
-            if relay is not None:
-                relay.close()
+                for sig, handler in previous.items():
+                    signal.signal(sig, handler)
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    process.wait()
+                if relay is not None:
+                    relay.close()
     return code if code >= 0 else 128 - code
