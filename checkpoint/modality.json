@@ -1,0 +1,114 @@
+{
+    "state": {
+        "joint": {
+            "start": 0,
+            "end": 8
+        }
+    },
+    "action": {
+        "joint": {
+            "start": 0,
+            "end": 8
+        }
+    },
+    "video": {
+        "head": {
+            "original_key": "observation.images.head"
+        },
+        "wrist": {
+            "original_key": "observation.images.wrist"
+        }
+    },
+    "annotation": {
+        "human.task_description": {
+            "original_key": "annotation.human.task_description"
+        }
+    },
+    "tactile": {
+        "rgb": {
+            "original_key": "observation.tactile.rgb",
+            "source_key": "tactile/left_gsmini/rgb"
+        }
+    },
+    "pointcloud": {
+        "scene": {
+            "original_key": "observation.pointcloud.scene",
+            "array_key": "scene",
+            "coordinate_frame": "robot_base",
+            "depth_source": "observation/head/depth,observation/wrist/depth",
+            "num_points": 8192,
+            "feature_dim": 6,
+            "source_cameras": [
+                "head",
+                "wrist"
+            ],
+            "rgb_storage_range": [
+                0.0,
+                255.0
+            ],
+            "rgb_model_normalization": "Concerto NormalizeColor: RGB / 255",
+            "voxel_size_m": 0.01,
+            "workspace_min_m": null,
+            "workspace_max_m": null,
+            "sampling": "random cap after voxelization; unbiased repeat for dense fill",
+            "sampling_seed": 0,
+            "camera_calibration_scope": "resolved and validated independently from each source episode",
+            "camera_calibration": {
+                "head": {
+                    "intrinsics_source": "HDF5 dataset camera/head/intrinsic (verified UniVTAC RGB-D v2 metadata)",
+                    "depth_key": "observation/head/depth",
+                    "depth_scale_source": "/observation/head/depth depth metadata",
+                    "transform_source": "HDF5 dataset camera/head/extrinsic: T_world_camera; official UniVTAC robot base coincides with Isaac world"
+                },
+                "wrist": {
+                    "intrinsics_source": "HDF5 dataset camera/wrist/intrinsic (verified UniVTAC RGB-D v2 metadata)",
+                    "depth_key": "observation/wrist/depth",
+                    "depth_scale_source": "/observation/wrist/depth depth metadata",
+                    "transform_source": "HDF5 dataset camera/wrist/extrinsic: T_world_camera; official UniVTAC robot base coincides with Isaac world"
+                }
+            },
+            "provenance_counts": {
+                "head_points_before_merge": {
+                    "min": 51098,
+                    "max": 56457,
+                    "mean": 53678.96428571428
+                },
+                "wrist_points_before_merge": {
+                    "min": 128503,
+                    "max": 128987,
+                    "mean": 128792.94642857143
+                },
+                "points_after_crop": {
+                    "min": 179638,
+                    "max": 185435,
+                    "mean": 182471.9107142857
+                },
+                "points_after_voxel": {
+                    "min": 7066,
+                    "max": 7667,
+                    "mean": 7387.089285714285
+                },
+                "valid_points_before_dense_fill": {
+                    "min": 7066,
+                    "max": 7667,
+                    "mean": 7387.089285714285
+                },
+                "max_abs_coordinate_m": {
+                    "min": 0.6369999647140503,
+                    "max": 0.6389999389648438,
+                    "mean": 0.6377857114587512
+                },
+                "head_wrist_aabb_gap_m": {
+                    "min": 0.0,
+                    "max": 0.0,
+                    "mean": 0.0
+                },
+                "head_wrist_centroid_distance_m": {
+                    "min": 0.05779724940657616,
+                    "max": 0.11006223410367966,
+                    "mean": 0.08117122542379158
+                }
+            }
+        }
+    }
+}

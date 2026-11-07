@@ -328,7 +328,7 @@ UniVTAC / Isaac Sim -> lightweight PolicyClient -> ZeroMQ -> GR00T server
         +---------------- decoded 8-D qpos chunk ------------+
 ```
 
-All checkpoint preprocessing, action decoding, and unnormalization remain inside `Gr00tPolicy`. The UniVTAC adapter only validates and batches `head`/`wrist` uint8 RGB, the first eight float32 joint coordinates, and `task.instruction`. It executes one predicted action by default, then replans from the new observation. `--execution-horizon` can be set to 1, 4, 8, or 16.
+All checkpoint preprocessing, action decoding, and unnormalization remain inside `Gr00tPolicy`. The UniVTAC adapter only validates and batches `head`/`wrist` uint8 RGB, the first eight float32 joint coordinates, and `task.instruction`. It executes one predicted action by default, then replans from the new observation. `--execution-horizon` can be set to 1, 4, 8, or 16. Immediately before execution, both RGB and WAH rollouts apply the same narrow Panda-gripper safety rule: only DOF 7 overshoots within `--gripper-limit-tolerance-m` are moved to the nearest articulation limit. The default is `1e-4` m (0.1 mm); larger gripper violations, every arm-joint violation, and NaN/Inf remain invalid actions. Each correction logs the original action, corrected action, and correction vector.
 
 The Isaac environment needs only the client dependencies, not the GR00T package:
 

@@ -19,6 +19,10 @@ from scene_pointcloud import (
 from .core import _to_numpy, format_univtac_observation
 
 
+UNIVTAC_TACTILE_RGB_ENCODING = "univtac_tactile_rgb"
+UINT8_RGB_ENCODING = "uint8_0_255"
+
+
 def field(config: Any, name: str) -> Any:
     return config.get(name) if isinstance(config, dict) else getattr(config, name, None)
 
@@ -238,6 +242,57 @@ def scene_frame(
     return points
 
 
+def _tactile_encoding(source_key: str, adapted: dict[str, Any]) -> str:
+    """Return an encoding from sensor provenance, never from one frame's extrema."""
+    encoding = adapted.get("encoding")
+    if encoding is not None:
+        if encoding not in {UNIVTAC_TACTILE_RGB_ENCODING, UINT8_RGB_ENCODING}:
+            raise ValueError(f"Unsupported tactile encoding {encoding!r} for {source_key}.")
+        return encoding
+    # UniVTAC's public ``rgb`` buffer is float32. Its reset path receives the optical
+    # simulator's normalized [0, 1] output, while its update path assigns quantized
+    # [0, 255] values back into that same float32 buffer. ``rgb_marker`` is uint8.
+    return UNIVTAC_TACTILE_RGB_ENCODING if source_key.endswith("/rgb") else UINT8_RGB_ENCODING
+
+
+def _tactile_rgb_to_uint8(value: Any, *, source_key: str, encoding: str) -> np.ndarray:
+    """Match the uint8 video frames produced by the UniVTAC training converter."""
+    image = _to_numpy(value, name=source_key.replace("/", "."))
+    if image.ndim == 4 and image.shape[0] == 1:
+        image = image[0]
+    if image.ndim != 3 or image.shape[-1] != 3 or min(image.shape[:2]) < 1:
+        raise ValueError(f"{source_key} must have shape [H,W,3]; got {image.shape}.")
+
+    if image.dtype == np.uint8:
+        return np.ascontiguousarray(image)
+    if not np.issubdtype(image.dtype, np.floating):
+        raise ValueError(
+            f"{source_key} must be uint8 or a documented UniVTAC floating RGB stream; "
+            f"got dtype {image.dtype}."
+        )
+    if encoding != UNIVTAC_TACTILE_RGB_ENCODING:
+        raise ValueError(
+            f"{source_key} uses encoding {encoding!r}, which requires uint8; got {image.dtype}."
+        )
+    if not np.isfinite(image).all():
+        raise ValueError(f"{source_key} contains NaN or Inf.")
+
+    minimum = float(image.min())
+    maximum = float(image.max())
+    if minimum < 0.0 or maximum > 255.0:
+        raise ValueError(
+            f"{source_key} values must be in [0,1] or [0,255]; got min={minimum:.8g}, "
+            f"max={maximum:.8g}."
+        )
+
+    # The encoding is selected from UniVTAC sensor provenance above, not inferred from
+    # arbitrary image statistics. Within that documented dual-range public buffer, values
+    # above one unambiguously identify the update-path [0, 255] representation; otherwise
+    # the official normalized optical-simulator representation is used.
+    scaled = image * 255.0 if maximum <= 1.0 else image
+    return np.ascontiguousarray(np.rint(scaled).astype(np.uint8))
+
+
 def tactile_frame(observation: dict[str, Any], contract: dict[str, Any]) -> np.ndarray:
     source_key = contract["tactile"]["rgb"]["source_key"]
     source_parts = source_key.split("/")[1:]
@@ -248,8 +303,8 @@ def tactile_frame(observation: dict[str, Any], contract: dict[str, Any]) -> np.n
             value = None
             break
         value = value[part]
+    adapted = sensors.get("_wah_contract_source", {}) if isinstance(sensors, dict) else {}
     if value is None:
-        adapted = sensors.get("_wah_contract_source", {}) if isinstance(sensors, dict) else {}
         if adapted.get("source_key") == source_key:
             value = adapted.get("image")
     if value is None:
@@ -258,12 +313,11 @@ def tactile_frame(observation: dict[str, Any], contract: dict[str, Any]) -> np.n
             f"{sorted(sensors) if isinstance(sensors, dict) else type(sensors).__name__}. "
             "Request that exact UniVTAC tactile sensor stream. Camera RGB cannot substitute."
         )
-    image = _to_numpy(value, name=source_key.replace("/", "."))
-    if image.ndim == 4 and image.shape[0] == 1:
-        image = image[0]
-    if image.ndim != 3 or image.shape[-1] != 3 or image.dtype != np.uint8:
-        raise ValueError(f"{source_key} must be uint8 [H,W,3]; got {image.shape} {image.dtype}.")
-    return np.ascontiguousarray(image)
+    encoding = _tactile_encoding(
+        source_key,
+        adapted if adapted.get("source_key") == source_key else {},
+    )
+    return _tactile_rgb_to_uint8(value, source_key=source_key, encoding=encoding)
 
 
 class ObservationHistory:

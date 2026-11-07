@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass
 import json
+import math
 import os
 from pathlib import Path
 import shlex
@@ -15,7 +16,12 @@ import sys
 import time
 from typing import Any
 
-from univtac_rollout.core import EpisodeResult, resolve_tasks, write_results
+from univtac_rollout.core import (
+    DEFAULT_GRIPPER_LIMIT_TOLERANCE_M,
+    EpisodeResult,
+    resolve_tasks,
+    write_results,
+)
 from univtac_rollout.policy import Gr00tUniVTACPolicy
 
 
@@ -51,6 +57,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--instruction-type", choices=("seen", "unseen"), default="seen")
     parser.add_argument("--step-limit", type=int)
     parser.add_argument("--request-timeout-seconds", type=float, default=300.0)
+    parser.add_argument(
+        "--gripper-limit-tolerance-m",
+        type=float,
+        default=DEFAULT_GRIPPER_LIMIT_TOLERANCE_M,
+        help="Maximum Panda gripper DOF 7 limit overshoot corrected at execution time.",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/univtac_rollout_eval"))
     parser.add_argument(
         "--python-command",
@@ -83,6 +95,8 @@ def _validate(args: argparse.Namespace) -> tuple[list[str], int]:
         raise ValueError("--seed-start must be nonnegative.")
     if args.request_timeout_seconds <= 0:
         raise ValueError("--request-timeout-seconds must be positive.")
+    if not math.isfinite(args.gripper_limit_tolerance_m) or args.gripper_limit_tolerance_m < 0:
+        raise ValueError("--gripper-limit-tolerance-m must be finite and nonnegative.")
     if args.expected_python is not None:
         expected = args.expected_python.expanduser().absolute()
         actual = Path(sys.executable).absolute()
@@ -253,6 +267,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             str(args.server_port),
             "--request-timeout-seconds",
             str(args.request_timeout_seconds),
+            "--gripper-limit-tolerance-m",
+            str(args.gripper_limit_tolerance_m),
             "--output-dir",
             str(output_dir),
             "--result-json",
@@ -381,6 +397,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "mode": args.mode,
                 "seed_start": args.seed_start,
                 "server": f"{args.server_host}:{args.server_port}",
+                "gripper_limit_tolerance_m": args.gripper_limit_tolerance_m,
                 "evaluation_status": "incomplete" if run_incomplete else "running",
                 "runtime_by_task": runtime_metadata,
             },
@@ -403,6 +420,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "mode": args.mode,
             "seed_start": args.seed_start,
             "server": f"{args.server_host}:{args.server_port}",
+            "gripper_limit_tolerance_m": args.gripper_limit_tolerance_m,
             "evaluation_status": "completed_with_errors"
             if any(row.success is None for row in all_episodes)
             else "completed",

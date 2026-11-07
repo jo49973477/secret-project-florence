@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import numpy as np
@@ -9,6 +10,10 @@ from scene_pointcloud import validate_intrinsics, validate_transform
 
 
 OPTICAL_FRAME_CONVENTION = "ros_optical_x_right_y_down_z_forward"
+UNIVTAC_TACTILE_RGB_ENCODING = "univtac_tactile_rgb"
+UINT8_RGB_ENCODING = "uint8_0_255"
+
+logger = logging.getLogger(__name__)
 
 
 def _to_numpy(value: Any, *, name: str) -> np.ndarray:
@@ -134,6 +139,10 @@ class UniVTACSensorAdapter:
         self.tactile_runtime_sensor, self.tactile_stream = _tactile_runtime_mapping(
             task, source_key
         )
+        self.tactile_encoding = (
+            UNIVTAC_TACTILE_RGB_ENCODING if self.tactile_stream == "rgb" else UINT8_RGB_ENCODING
+        )
+        self._tactile_diagnostic_logged = False
         self._head_transform: np.ndarray | None = None
         self.metadata = {
             "depth_units": "m",
@@ -144,6 +153,7 @@ class UniVTACSensorAdapter:
             "camera_pose_source": "live TiledCamera.data.pos_w + quat_w_ros",
             "tactile_source_key": source_key,
             "tactile_runtime_sensor": self.tactile_runtime_sensor,
+            "tactile_runtime_encoding": self.tactile_encoding,
             "camera_prim_paths": {
                 name: str(getattr(getattr(camera, "cfg", None), "prim_path", ""))
                 for name, camera in self.cameras.items()
@@ -247,8 +257,30 @@ class UniVTACSensorAdapter:
                 f"Live UniVTAC tactile sensor {self.tactile_runtime_sensor!r} does not expose "
                 f"the trained {self.tactile_stream!r} stream; available={available}."
             )
+        tactile_image = runtime_sensor[self.tactile_stream]
+        if not self._tactile_diagnostic_logged:
+            raw_image = _to_numpy(tactile_image, name=self.tactile_source_key.replace("/", "."))
+            try:
+                raw_min = float(np.min(raw_image))
+                raw_max = float(np.max(raw_image))
+            except (TypeError, ValueError):
+                raw_min = raw_max = float("nan")
+            logger.warning(
+                "UniVTAC tactile first observation: source_key=%s runtime_sensor=%s "
+                "stream=%s shape=%s dtype=%s min=%.8g max=%.8g encoding=%s",
+                self.tactile_source_key,
+                self.tactile_runtime_sensor,
+                self.tactile_stream,
+                raw_image.shape,
+                raw_image.dtype,
+                raw_min,
+                raw_max,
+                self.tactile_encoding,
+            )
+            self._tactile_diagnostic_logged = True
         tactile["_wah_contract_source"] = {
             "source_key": self.tactile_source_key,
-            "image": runtime_sensor[self.tactile_stream],
+            "encoding": self.tactile_encoding,
+            "image": tactile_image,
         }
         return observation

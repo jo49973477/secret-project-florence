@@ -20,6 +20,7 @@ from typing import Any
 
 import numpy as np
 from univtac_rollout.core import (
+    DEFAULT_GRIPPER_LIMIT_TOLERANCE_M,
     EpisodeResult,
     InvalidActionError,
     validate_action_step,
@@ -61,6 +62,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--server-host", default="127.0.0.1")
     parser.add_argument("--server-port", type=int, default=5555)
     parser.add_argument("--request-timeout-seconds", type=float, default=300.0)
+    parser.add_argument(
+        "--gripper-limit-tolerance-m",
+        type=float,
+        default=DEFAULT_GRIPPER_LIMIT_TOLERANCE_M,
+        help="Maximum Panda gripper DOF 7 limit overshoot corrected at execution time.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--result-json", type=Path, required=True)
     parser.add_argument("--expected-python", type=Path)
@@ -600,6 +607,8 @@ def _run(
     task_config_path: Path,
     metadata: dict[str, Any],
 ) -> None:
+    if not np.isfinite(args.gripper_limit_tolerance_m) or args.gripper_limit_tolerance_m < 0:
+        raise ValueError("--gripper-limit-tolerance-m must be finite and nonnegative.")
     _diagnostic("import_torch", "starting")
     import torch
 
@@ -657,6 +666,11 @@ def _run(
             "task_config_profile": profile,
             "task": args.task,
             "device": str(env_cfg.sim.device),
+            "action_safety": {
+                "policy_scope": "rgb_and_wah",
+                "corrected_dof": 7,
+                "gripper_limit_tolerance_m": args.gripper_limit_tolerance_m,
+            },
         }
     )
     try:
@@ -801,7 +815,22 @@ def _run(
 
                     for predicted in action_chunk:
                         lower, upper = limits if limits is not None else (None, None)
-                        action = validate_action_step(predicted, lower=lower, upper=upper)
+                        action = validate_action_step(
+                            predicted,
+                            lower=lower,
+                            upper=upper,
+                            gripper_limit_tolerance_m=args.gripper_limit_tolerance_m,
+                        )
+                        original_action = np.asarray(predicted, dtype=np.float32)
+                        correction = action - original_action
+                        if np.any(correction):
+                            _diagnostic(
+                                "action_safety_postprocess",
+                                f"index={task.take_action_cnt} policy={policy.policy_type} "
+                                f"original={original_action.tolist()} "
+                                f"corrected={action.tolist()} correction={correction.tolist()} "
+                                f"gripper_limit_tolerance_m={args.gripper_limit_tolerance_m}",
+                            )
                         action_tensor = torch.as_tensor(
                             action, dtype=torch.float32, device=task.device
                         )

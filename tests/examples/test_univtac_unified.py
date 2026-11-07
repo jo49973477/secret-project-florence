@@ -15,12 +15,7 @@ sys.path.insert(0, str(ROOT / "examples" / "UniVTAC"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from gr00t.policy.gr00t_policy import validate_wah_restoration  # noqa: E402
-from univtac_deployment import (  # noqa: E402
-    build_rollout_command,
-    check_port,
-    print_rollout_summary,
-    wait_ready,
-)
+from univtac_deployment import build_rollout_command, check_port, print_rollout_summary, wait_ready  # noqa: E402
 from univtac_rollout.checkpoint import checkpoint_identity  # noqa: E402
 from univtac_rollout.multimodal import (  # noqa: E402
     ObservationHistory,
@@ -153,13 +148,61 @@ def test_prebuilt_scene_requires_frame_and_metric_units() -> None:
         scene_frame(obs, contract(), 0)
 
 
-def test_tactile_source_and_dtype() -> None:
+def test_tactile_source_and_uint8_dtype() -> None:
     image = tactile_frame(observation(), contract())
     assert image.shape == (2, 2, 3) and image.dtype == np.uint8
     wrong = contract()
     wrong["tactile"]["rgb"]["source_key"] = "tactile/rgb"
     with pytest.raises(ValueError, match="trained from tactile/rgb"):
         tactile_frame(observation(), wrong)
+
+
+def _gsmini_observation(image: np.ndarray) -> tuple[dict, dict]:
+    obs = observation()
+    obs["tactile"] = {"left_gsmini": {"rgb": image}}
+    sensor_contract = contract()
+    sensor_contract["tactile"]["rgb"]["source_key"] = "tactile/left_gsmini/rgb"
+    return obs, sensor_contract
+
+
+def test_tactile_float32_normalized_is_scaled_and_rounded() -> None:
+    source = np.asarray([[[0.0, 0.5, 1.0], [0.25, 0.75, 0.1]]], dtype=np.float32)
+    obs, sensor_contract = _gsmini_observation(source)
+    converted = tactile_frame(obs, sensor_contract)
+    expected = np.rint(source * 255.0).astype(np.uint8)
+    np.testing.assert_array_equal(converted, expected)
+
+
+def test_tactile_float32_byte_range_is_rounded_without_rescaling() -> None:
+    source = np.asarray([[[0.0, 12.4, 254.6], [1.4, 127.5, 255.0]]], dtype=np.float32)
+    obs, sensor_contract = _gsmini_observation(source)
+    converted = tactile_frame(obs, sensor_contract)
+    np.testing.assert_array_equal(converted, np.rint(source).astype(np.uint8))
+
+
+@pytest.mark.parametrize("bad_value", [np.nan, np.inf, -np.inf])
+def test_tactile_rejects_nan_and_inf(bad_value: float) -> None:
+    source = np.zeros((2, 2, 3), dtype=np.float32)
+    source[0, 0, 0] = bad_value
+    obs, sensor_contract = _gsmini_observation(source)
+    with pytest.raises(ValueError, match="NaN or Inf"):
+        tactile_frame(obs, sensor_contract)
+
+
+@pytest.mark.parametrize("bad_value", [-0.01, 255.01])
+def test_tactile_rejects_out_of_range_values(bad_value: float) -> None:
+    source = np.zeros((2, 2, 3), dtype=np.float32)
+    source[0, 0, 0] = bad_value
+    obs, sensor_contract = _gsmini_observation(source)
+    with pytest.raises(ValueError, match=r"\[0,1\] or \[0,255\]"):
+        tactile_frame(obs, sensor_contract)
+
+
+@pytest.mark.parametrize("shape", [(2, 2), (2, 2, 1), (2, 2, 2, 3)])
+def test_tactile_rejects_wrong_shape(shape: tuple[int, ...]) -> None:
+    obs, sensor_contract = _gsmini_observation(np.zeros(shape, dtype=np.float32))
+    with pytest.raises(ValueError, match=r"shape \[H,W,3\]"):
+        tactile_frame(obs, sensor_contract)
 
 
 def test_scene_calibration_json_is_validated_without_static_wrist(tmp_path: Path) -> None:
@@ -188,7 +231,9 @@ def test_scene_calibration_json_is_validated_without_static_wrist(tmp_path: Path
         add_scene_calibration(contract(), path)
 
 
-def test_live_univtac_sensor_adapter_uses_per_frame_optical_camera_poses(monkeypatch) -> None:
+def test_live_univtac_sensor_adapter_uses_per_frame_optical_camera_poses(
+    monkeypatch, caplog
+) -> None:
     class CameraData:
         def __init__(self, position):
             self.intrinsic_matrices = np.asarray(
@@ -224,7 +269,7 @@ def test_live_univtac_sensor_adapter_uses_per_frame_optical_camera_poses(monkeyp
     monkeypatch.setattr("univtac_rollout.sensors._isaac_depth_scale_to_meters", lambda: 1.0)
     adapter = UniVTACSensorAdapter(task, sensor_contract)
 
-    def live_observation(value=7):
+    def live_observation(value=0.5):
         return {
             "observation": {
                 name: {
@@ -234,7 +279,7 @@ def test_live_univtac_sensor_adapter_uses_per_frame_optical_camera_poses(monkeyp
                 for name in ("head", "wrist")
             },
             "tactile": {
-                "left_tactile": {"rgb": np.full((2, 2, 3), value, dtype=np.uint8)},
+                "left_tactile": {"rgb": np.full((2, 2, 3), value, dtype=np.float32)},
                 "right_tactile": {"rgb": np.zeros((2, 2, 3), dtype=np.uint8)},
             },
         }
@@ -243,11 +288,18 @@ def test_live_univtac_sensor_adapter_uses_per_frame_optical_camera_poses(monkeyp
     np.testing.assert_allclose(first["observation"]["head"]["T_base_camera"][:3, 3], [1, 0, 0])
     np.testing.assert_allclose(first["observation"]["wrist"]["T_base_camera"][:3, 3], [0, 1, 0])
     assert first["observation"]["wrist"]["depth_scale"] == 1.0
-    assert np.all(tactile_frame(first, sensor_contract) == 7)
+    assert np.all(tactile_frame(first, sensor_contract) == 128)
 
     task._camera_manager.cameras["wrist"].data.pos_w[0] = [1.0, 2.0, 0.0]
     second = adapter.attach(live_observation())
     np.testing.assert_allclose(second["observation"]["wrist"]["T_base_camera"][:3, 3], [0, 2, 0])
+    diagnostic_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "UniVTAC tactile first observation" in record.getMessage()
+    ]
+    assert len(diagnostic_messages) == 1
+    assert "shape=(2, 2, 3) dtype=float32 min=0.5 max=0.5" in diagnostic_messages[0]
 
     task._camera_manager.cameras["head"].data.pos_w[0, 0] += 0.1
     with pytest.raises(RuntimeError, match="fixed head camera moved"):

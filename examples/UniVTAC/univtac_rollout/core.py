@@ -37,6 +37,8 @@ TASK_DISPLAY_NAMES = {
 
 ERROR_TERMINATIONS = frozenset({"exception", "invalid_action", "worker_failure"})
 VALID_TERMINATIONS = frozenset({"success", "step_limit", "early_stop"}) | ERROR_TERMINATIONS
+PANDA_GRIPPER_DOF = 7
+DEFAULT_GRIPPER_LIMIT_TOLERANCE_M = 1e-4
 
 
 class InvalidActionError(ValueError):
@@ -169,8 +171,13 @@ def validate_action_step(
     expected_dim: int = 8,
     lower: np.ndarray | None = None,
     upper: np.ndarray | None = None,
+    gripper_limit_tolerance_m: float = DEFAULT_GRIPPER_LIMIT_TOLERANCE_M,
 ) -> np.ndarray:
-    """Validate one qpos command, including simulator limits when available."""
+    """Validate one qpos command and correct tiny Panda-gripper limit overshoots.
+
+    Only qpos DOF 7 is corrected, and only when its overshoot is no larger than
+    ``gripper_limit_tolerance_m``. All other limit violations remain errors.
+    """
     step = np.asarray(action)
     if step.shape != (expected_dim,):
         raise InvalidActionError(
@@ -181,6 +188,13 @@ def validate_action_step(
     if not np.isfinite(step).all():
         raise InvalidActionError("UniVTAC qpos action contains NaN or Inf.")
     step = step.astype(np.float32, copy=False)
+
+    try:
+        gripper_limit_tolerance_m = float(gripper_limit_tolerance_m)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Gripper limit tolerance must be a finite nonnegative float.") from exc
+    if not math.isfinite(gripper_limit_tolerance_m) or gripper_limit_tolerance_m < 0:
+        raise ValueError("Gripper limit tolerance must be a finite nonnegative float.")
 
     if (lower is None) != (upper is None):
         raise ValueError("Both lower and upper joint limits must be supplied together.")
@@ -194,6 +208,25 @@ def validate_action_step(
             )
         below = np.isfinite(lower) & (step < lower)
         above = np.isfinite(upper) & (step > upper)
+
+        # UniVTAC's 8-D qpos contract is seven Panda arm joints followed by the
+        # scalar gripper position. Correct only numerical-scale gripper drift;
+        # arm commands and material gripper violations are never clipped.
+        if expected_dim > PANDA_GRIPPER_DOF:
+            gripper = PANDA_GRIPPER_DOF
+            if below[gripper]:
+                overshoot = float(lower[gripper]) - float(step[gripper])
+                if overshoot <= gripper_limit_tolerance_m:
+                    step = step.copy()
+                    step[gripper] = lower[gripper]
+                    below[gripper] = False
+            elif above[gripper]:
+                overshoot = float(step[gripper]) - float(upper[gripper])
+                if overshoot <= gripper_limit_tolerance_m:
+                    step = step.copy()
+                    step[gripper] = upper[gripper]
+                    above[gripper] = False
+
         if np.any(below | above):
             indices = np.flatnonzero(below | above).tolist()
             details = [

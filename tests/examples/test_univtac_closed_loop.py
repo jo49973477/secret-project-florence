@@ -139,6 +139,84 @@ def test_action_limit_validation_rejects_without_clipping() -> None:
     assert action[6] == pytest.approx(1.1)
 
 
+def test_gripper_action_at_exact_limits_is_unchanged() -> None:
+    lower = np.full(8, -1.0, dtype=np.float32)
+    upper = np.full(8, 1.0, dtype=np.float32)
+    lower[7], upper[7] = 0.0, 0.04
+
+    for boundary in (lower[7], upper[7]):
+        action = np.zeros(8, dtype=np.float32)
+        action[7] = boundary
+        corrected = validate_action_step(action, lower=lower, upper=upper)
+        np.testing.assert_array_equal(corrected, action)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(-2.67964e-5, 0.0), (-1e-4, 0.0), (0.04005, 0.04)],
+)
+def test_tiny_gripper_limit_overshoot_is_corrected(value: float, expected: float) -> None:
+    action = np.zeros(8, dtype=np.float32)
+    action[7] = value
+    original = action.copy()
+    lower = np.full(8, -1.0, dtype=np.float32)
+    upper = np.full(8, 1.0, dtype=np.float32)
+    lower[7], upper[7] = 0.0, 0.04
+
+    corrected = validate_action_step(
+        action,
+        lower=lower,
+        upper=upper,
+        gripper_limit_tolerance_m=1e-4,
+    )
+
+    assert corrected[7] == pytest.approx(expected)
+    np.testing.assert_array_equal(action, original)
+
+
+def test_large_gripper_overshoot_and_other_joint_overshoot_remain_invalid() -> None:
+    lower = np.full(8, -1.0, dtype=np.float32)
+    upper = np.full(8, 1.0, dtype=np.float32)
+    lower[7], upper[7] = 0.0, 0.04
+
+    action = np.zeros(8, dtype=np.float32)
+    action[7] = -1.01e-4
+    with pytest.raises(InvalidActionError, match="dof 7"):
+        validate_action_step(action, lower=lower, upper=upper)
+
+    action = np.zeros(8, dtype=np.float32)
+    action[3] = upper[3] + 1e-5
+    with pytest.raises(InvalidActionError, match="dof 3"):
+        validate_action_step(action, lower=lower, upper=upper)
+
+
+def test_gripper_limit_tolerance_is_configurable() -> None:
+    action = np.zeros(8, dtype=np.float32)
+    action[7] = -2.67964e-5
+    lower = np.full(8, -1.0, dtype=np.float32)
+    upper = np.full(8, 1.0, dtype=np.float32)
+    lower[7], upper[7] = 0.0, 0.04
+
+    with pytest.raises(InvalidActionError, match="dof 7"):
+        validate_action_step(
+            action,
+            lower=lower,
+            upper=upper,
+            gripper_limit_tolerance_m=1e-5,
+        )
+
+
+@pytest.mark.parametrize("invalid", [np.nan, np.inf, -np.inf])
+def test_gripper_nan_and_inf_remain_invalid(invalid: float) -> None:
+    action = np.zeros(8, dtype=np.float32)
+    action[7] = invalid
+    lower = np.full(8, -1.0, dtype=np.float32)
+    upper = np.full(8, 1.0, dtype=np.float32)
+
+    with pytest.raises(InvalidActionError, match="NaN or Inf"):
+        validate_action_step(action, lower=lower, upper=upper)
+
+
 def test_checkpoint_contract_requires_rgb_schema_and_sufficient_horizon() -> None:
     validate_rgb_checkpoint_contract(_modality_configs(), execution_horizon=16)
     with pytest.raises(ValueError, match="exceeds checkpoint action horizon"):
@@ -409,6 +487,7 @@ def test_zero_episode_worker_is_reported_as_incomplete(
         instruction_type="seen",
         step_limit=None,
         request_timeout_seconds=1.0,
+        gripper_limit_tolerance_m=1e-4,
         output_dir=output_dir,
         python_command=sys.executable,
         expected_python=Path(sys.executable),

@@ -135,7 +135,12 @@ collect the required raw tactile stream. Camera RGB cannot replace tactile.
 
 To run all canonical tasks, replace `--mode smoke --episodes-per-task 1 --tasks
 lift_can` with `--mode full --tasks all`. `--seed-start`, `--step-limit`, and
-`--execution-horizon` retain their existing meanings. Every run writes
+`--execution-horizon` retain their existing meanings. Both RGB and WAH execution paths use
+the same Panda gripper safety postprocessing. DOF 7 overshoots no larger than
+`--gripper-limit-tolerance-m` (default `1e-4` m) are corrected to the articulation boundary;
+all arm-joint violations, larger gripper violations, and NaN/Inf are rejected. Every
+correction records the original action, corrected action, and correction vector in the task
+log. Every run writes
 `summary.json`, `summary.csv`, `episodes.csv`, `videos/`, `logs/`, and
 `runtime_metadata.json` under its output directory. By default the launchers
 use `outputs/rollouts/<checkpoint-name>/<timestamp>/`. Supply a fresh
