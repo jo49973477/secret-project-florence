@@ -196,7 +196,7 @@ def main() -> None:
     # DeepSpeed 0.17 takes an OUTPUT DIRECTORY, not a pytorch_model.bin filename.
     # Frozen fragments must be included: most of this model is frozen during training.
     convert_zero_checkpoint_to_fp32_state_dict(
-        str(checkpoint), str(output), safe_serialization=True, exclude_frozen_parameters=False
+        str(checkpoint), str(output), safe_serialization=False, exclude_frozen_parameters=False
     )
     (output / "config.json").write_text(json.dumps(config, indent=2))
     for name, path in artifacts.items():
