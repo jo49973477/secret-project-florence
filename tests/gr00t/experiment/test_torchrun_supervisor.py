@@ -131,3 +131,17 @@ def test_supervisor_omits_ambiguous_exposure_and_preserves_exit_on_webhook_failu
         ]
     )
     assert result == 11
+
+
+def test_trainctl_suppresses_legacy_failure_notification(tmp_path, monkeypatch):
+    monkeypatch.setenv("GR00T_TRAINCTL_ACTIVE", "1")
+    result, notifier = _run(tmp_path, monkeypatch, "sys.exit(7)")
+    assert result == 7
+    notifier.send.assert_not_called()
+
+
+def test_external_trainctl_suppresses_legacy_failure_notification(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRAINCTL_RUN_ID", "outer")
+    result, notifier = _run(tmp_path, monkeypatch, "sys.exit(7)")
+    assert result == 7
+    notifier.send.assert_not_called()

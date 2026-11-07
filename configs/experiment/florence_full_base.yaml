@@ -1,6 +1,7 @@
 # @package _global_
 # Full UniVTAC dataset: no expected_episode_ids and no five-episode overrides.
 defaults:
+- /trainctl: default
 - /model: gr00t_sidecar
 - /data: univtac_multimodal
 - /training: finetune

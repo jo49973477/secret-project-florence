@@ -108,6 +108,13 @@ class Resume:
 
 
 @dataclass
+class Trainctl:
+    enabled: bool = True
+    message_mode: str = "sopia"
+    notify_checkpoints: bool = True
+
+
+@dataclass
 class Experiment:
     name: str = MISSING
     run_id: str = MISSING
@@ -279,6 +286,7 @@ def build_gr00t_config(cfg: DictConfig) -> Config:
             "resume",
             "temporal",
             "dit_training",
+            "trainctl",
         },
         "experiment",
     )
@@ -290,6 +298,10 @@ def build_gr00t_config(cfg: DictConfig) -> Config:
         {k: raw[k] for k in ("name", "run_id", "output_dir", "dry_run") if k in raw},
         "experiment",
     )
+    monitoring = Trainctl(**_typed(Trainctl, raw.get("trainctl", {}), "trainctl"))
+    if monitoring.message_mode not in {"standard", "koyori", "sopia", "roboco", "neuro"}:
+        raise ValueError("trainctl.message_mode must be standard, koyori, sopia, roboco, or neuro")
+    OmegaConf.update(cfg, "trainctl", OmegaConf.structured(monitoring), force_add=True)
     model_input = dict(raw["model"])
     if "temporal" in raw:
         _keys(raw["temporal"], {"window_size"}, "temporal")

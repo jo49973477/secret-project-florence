@@ -28,7 +28,7 @@ telegram_notify_start: true
 telegram_notify_save: true
 telegram_notify_finish: true
 telegram_notify_error: true
-discord_on: true
+discord_on: false
 discord_notify_start: true
 discord_notify_save: true
 discord_notify_finish: true

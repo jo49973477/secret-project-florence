@@ -92,10 +92,15 @@ class TrainingDashboardCallback(TrainerCallback):
         enabled: bool | None = None,
         refresh_seconds: float = 1.0,
         diagnostics_enabled: bool = False,
+        *,
+        experiment_name: str | None = None,
+        screen: bool = True,
     ):
         if not math.isfinite(refresh_seconds) or refresh_seconds <= 0:
             raise ValueError("refresh_seconds must be finite and positive")
         self.enabled = sys.stdout.isatty() and enabled is not False
+        self.experiment_name = experiment_name
+        self.screen = screen
         self.diagnostics_enabled = diagnostics_enabled
         self.refresh_seconds = refresh_seconds
         self._live = None
@@ -140,11 +145,15 @@ class TrainingDashboardCallback(TrainerCallback):
         )
         if not self._is_main(args) or not self.enabled:
             return control
-        self._start_live()
+        if self._live is None:
+            self._start_live()
         total = max(int(getattr(state, "max_steps", 0) or 0), 1)
-        self._task = self._progress.add_task(
-            "Training", total=total, completed=state.global_step, speed="0.00 step/s"
-        )
+        if self._task is None:
+            self._task = self._progress.add_task(
+                "Training", total=total, completed=state.global_step, speed="0.00 step/s"
+            )
+        else:
+            self._progress.reset(self._task, total=total, completed=state.global_step)
         self._refresh(force=True)
         return control
 
@@ -179,7 +188,8 @@ class TrainingDashboardCallback(TrainerCallback):
             self,
             console=self._console,
             refresh_per_second=1 / self.refresh_seconds,
-            screen=True,
+            screen=self.screen,
+            transient=not self.screen,
             vertical_overflow="crop",
             redirect_stdout=True,
             redirect_stderr=True,
@@ -262,7 +272,7 @@ class TrainingDashboardCallback(TrainerCallback):
         )
         panels = [
             Text(
-                f"Florence | {os.environ.get('GR00T_EXPERIMENT_NAME', 'Training')}",
+                f"Florence | {self.experiment_name or os.environ.get('GR00T_EXPERIMENT_NAME', 'Training')}",
                 style="bold cyan",
                 no_wrap=True,
                 overflow="ellipsis",

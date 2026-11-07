@@ -502,93 +502,25 @@ Replace `demo_data/cube_to_bowl_5` and `examples/SO100/so100_config.py` with you
 
 > **Note:** Use `uv run torchrun` (not bare `torchrun`) to ensure the correct virtual environment is used. Add `--use-wandb` to enable Weights & Biases logging. For more extensive configuration, use `gr00t/experiment/launch_train.py`.
 
-### Telegram training notifications
+### Training supervision and notifications
 
-Telegram can send one rank-zero-only message when training starts, after each checkpoint,
-after the final model save succeeds, or when a catchable training exception occurs.
-
-1. Create a bot with Telegram's `@BotFather` and copy its bot token.
-2. Start a conversation with the bot and obtain the numeric chat ID (for example, from the
-   Telegram Bot API `getUpdates` response).
-3. Export both values in the shell that launches training:
+WAH Hydra training uses **trainctl 0.2.0** for process supervision, Discord/Telegram
+notifications, and checkpoint tracking. Sopia is the default message mode. W&B
+continues recording detailed experiments and model diagnostics.
 
 ```bash
-export TELEGRAM_BOT_TOKEN="..."
-export TELEGRAM_CHAT_ID="..."
+uv sync --locked --all-extras
+export TRAINCTL_DISCORD_WEBHOOK_URL='https://discord.com/api/webhooks/REPLACE/REPLACE'
+bash scripts/train_florence_ablations.sh A dry_run=true
+bash scripts/train_florence_ablations.sh A
+uv run --no-sync trainctl status
 ```
 
-4. Test the connection without loading a model:
-
-```bash
-uv run python -m gr00t.experiment.telegram_notifier --test
-```
-
-5. Add `--telegram-on` after the `--` separator used by `examples/finetune.sh`:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,7 NUM_GPUS=2 MAX_STEPS=2000 \
-uv run bash examples/finetune.sh \
-  --base-model-path nvidia/GR00T-N1.7-3B \
-  --dataset-path /path/to/dataset \
-  --embodiment-tag NEW_EMBODIMENT \
-  --output-dir outputs/my_experiment \
-  -- \
-  --telegram-on
-```
-
-`--telegram-chat-id` overrides `TELEGRAM_CHAT_ID`. The token has no CLI option and is never
-stored in training/checkpoint configuration. All four events default to enabled; disable an
-individual event with `--no-telegram-notify-start`, `--no-telegram-notify-save`,
-`--no-telegram-notify-finish`, or `--no-telegram-notify-error`.
-
-> **Security:** Never commit `TELEGRAM_BOT_TOKEN` to Git or put it in commands, logs, W&B
-> configuration, or checked-in examples. Telegram delivery is best-effort and cannot be
-> guaranteed after uncatchable termination such as `SIGKILL`, an external OOM-killer action,
-> kernel panic, machine power loss, or loss of networking after the process has died.
-
-### Discord training notifications
-
-Discord webhooks can receive the same rank-zero-only training start, checkpoint, successful
-finish, and catchable failure messages as Telegram. Telegram and Discord can be enabled
-independently or together.
-
-1. In Discord, open **Server Settings**.
-2. Select **Integrations**.
-3. Select **Webhooks**.
-4. Select **New Webhook**.
-5. Copy the Webhook URL, then export it in the shell that launches training:
-
-```bash
-export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
-```
-
-Test the connection without loading GR00T or a model:
-
-```bash
-uv run python -m gr00t.experiment.discord_notifier --test
-```
-
-Enable Discord after the `--` separator used by `examples/finetune.sh`:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,7 NUM_GPUS=2 MAX_STEPS=2000 \
-uv run bash examples/finetune.sh \
-  --base-model-path nvidia/GR00T-N1.7-3B \
-  --dataset-path /path/to/dataset \
-  --embodiment-tag NEW_EMBODIMENT \
-  --output-dir outputs/my_experiment \
-  -- \
-  --discord-on
-```
-
-All four events default to enabled. Disable an individual event with
-`--no-discord-notify-start`, `--no-discord-notify-save`,
-`--no-discord-notify-finish`, or `--no-discord-notify-error`.
-
-> **Security:** Never commit `DISCORD_WEBHOOK_URL`. Treat it like a password. The URL is read
-> only from the environment and is never a command-line or training-config field. Discord
-> delivery is best-effort and cannot report failures after uncatchable process or server
-> termination such as `SIGKILL`, an external OOM-killer action, kernel panic, or power loss.
+See [the trainctl guide](docs/TRAINCTL.md) for additive installation into an existing
+GPU environment, Telegram, personas, exact A/B/C/D and single/multi-GPU commands,
+resume, logs, and `trainctl.enabled=false`. Credentials belong only in the
+environment. Legacy `training.discord_*` / `training.telegram_*` flags are ignored
+by Hydra and retained only for older entrypoints.
 
 ### Training Tips
 

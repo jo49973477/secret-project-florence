@@ -486,3 +486,43 @@ def test_pretrained_loading_override(enabled, model):
         overrides=[f"model={model}", f"model.optimize_pretrained_loading={str(enabled).lower()}"]
     )
     assert build_gr00t_config(cfg).model.optimize_pretrained_loading is enabled
+
+
+@pytest.mark.parametrize("mode", ["standard", "koyori", "sopia", "roboco", "neuro"])
+def test_trainctl_configuration_is_separate_from_training(mode):
+    cfg = composed(overrides=[f"trainctl.message_mode={mode}"])
+    config = build_gr00t_config(cfg)
+    assert cfg.trainctl.enabled
+    assert cfg.trainctl.message_mode == mode
+    assert not hasattr(config.training, "trainctl")
+    assert config.training.wandb_name == f"{cfg.name}-{cfg.run_id}"
+
+
+def test_trainctl_rejects_secret_configuration_and_invalid_mode():
+    cfg = composed()
+    OmegaConf.update(cfg, "trainctl.webhook_url", "private", force_add=True)
+    with pytest.raises(ValueError, match="unsupported keys"):
+        build_gr00t_config(cfg)
+    cfg = composed(overrides=["trainctl.message_mode=wrong"])
+    with pytest.raises(ValueError, match="trainctl.message_mode"):
+        build_gr00t_config(cfg)
+
+
+def test_notification_changes_preserve_zero3_resume_and_identity(tmp_path):
+    output = tmp_path / "original"
+    cfg = composed(overrides=[f"output_dir={output}"])
+    config = build_gr00t_config(cfg)
+    original_name = config.training.wandb_name
+    write_snapshots(cfg, config)
+    saved = checkpoint(output / "checkpoint-100", ds=True)
+    cfg.resume.enabled = True
+    cfg.resume.auto_find_latest = True
+    cfg.run_id = "ignored-new-id"
+    cfg.trainctl.message_mode = "neuro"
+    cfg.trainctl.notify_checkpoints = False
+    cfg.trainctl.enabled = False
+    cfg.training.max_steps += 100
+    resumed = build_gr00t_config(cfg)
+    assert resolve_resume(cfg, resumed) == saved
+    assert resumed.training.wandb_name == original_name
+    assert resumed.training.resume_from_checkpoint == str(saved)

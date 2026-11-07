@@ -325,7 +325,9 @@ def run(config: Config):
         experiment_name = config.training.experiment_name
 
     telegram_notifier = None
-    if config.training.telegram_on:
+    trainctl_active = os.environ.get("GR00T_TRAINCTL_ACTIVE") == "1"
+    hydra_launch = bool(os.environ.get("GR00T_HYDRA_CONFIG"))
+    if config.training.telegram_on and not (trainctl_active or hydra_launch):
         # The token is resolved only into this runtime object. It is never attached
         # to config, so config/checkpoint/W&B serialization cannot expose it.
         telegram_notifier = TelegramNotifier.from_environment(
@@ -333,7 +335,7 @@ def run(config: Config):
         )
 
     discord_notifier = None
-    if config.training.discord_on:
+    if config.training.discord_on and not (trainctl_active or hydra_launch):
         # The credential-bearing URL exists only in this runtime transport object.
         discord_notifier = DiscordNotifier.from_environment()
 
@@ -659,6 +661,18 @@ def run(config: Config):
     for notification_callback in notification_callbacks:
         trainer.add_callback(notification_callback)
 
+    trainctl_callback = None
+    if trainctl_active:
+        from gr00t.experiment.trainctl_callback import TrainctlCallback
+
+        trainctl_callback = TrainctlCallback(
+            name=config.training.wandb_name or experiment_name,
+            total_steps=config.training.max_steps,
+            sample_exposure=trainer.sample_exposure,
+            notify_checkpoints=os.environ.get("GR00T_TRAINCTL_CHECKPOINTS") == "1",
+        )
+        trainer.add_callback(trainctl_callback)
+
     if config.training.save_best_eval_metric_name != "":
         if deepspeed_config is not None and config.training.deepspeed_stage == 3:
             logging.warning(
@@ -678,8 +692,8 @@ def run(config: Config):
     if hasattr(train_dataset, "get_initial_actions"):
         run_on_rank0(save_initial_actions_artifact, train_dataset, save_cfg_dir)
 
-    # Train and finalize. Catch ordinary Python exceptions only: notifications are
-    # best-effort, then the original failure is re-raised with its traceback.
+    # Train and finalize. Keep the original traceback and nonzero process exit.
+    # trainctl decides completion/failure only after this entire process exits.
     logging.info("🚀 Starting training...")
     zero3_debug = os.environ.get("GR00T_ZERO3_DEBUG", "").lower() in {"1", "true", "yes"}
     if zero3_debug:
@@ -740,6 +754,14 @@ def run(config: Config):
             logging.info(f"Model saved to {output_dir}")
             final_step_checkpoint = output_dir / f"checkpoint-{trainer.state.global_step}"
             final_artifact = final_step_checkpoint if final_step_checkpoint.is_dir() else None
+
+        if trainctl_callback is not None:
+            trainctl_callback.register_checkpoint(
+                final_artifact
+                if deepspeed_config is not None and config.training.deepspeed_stage == 3
+                else output_dir,
+                state=trainer.state,
+            )
 
         if config.training.assert_loss_less_than is not None:
             final_loss = trainer.loss

@@ -252,14 +252,21 @@ class Gr00tTrainer(Trainer):
         self.callback_handler.remove_callback(ProgressCallback)
         if dashboard_enabled is False and sys.stdout.isatty():
             self.add_callback(QuietProgressCallback())
-        self.add_callback(
-            TrainingDashboardCallback(
-                dashboard_enabled,
-                dashboard_refresh_seconds,
-                diagnostics_enabled=self.enable_multimodal_diagnostics
-                and diagnostics_level != "off",
+        from gr00t.experiment.dashboard_telemetry import TELEMETRY_ENV, DashboardTelemetryCallback
+
+        if os.environ.get(TELEMETRY_ENV):
+            self.add_callback(
+                DashboardTelemetryCallback(os.environ[TELEMETRY_ENV], dashboard_refresh_seconds)
             )
-        )
+        else:
+            self.add_callback(
+                TrainingDashboardCallback(
+                    dashboard_enabled,
+                    dashboard_refresh_seconds,
+                    diagnostics_enabled=self.enable_multimodal_diagnostics
+                    and diagnostics_level != "off",
+                )
+            )
         self._forward_diagnostics: dict[str, torch.Tensor] = {}
         self._forward_diagnostics_count = 0
         self._forward_diagnostics_step = None
